@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import type { CanaryReport, CanaryResult } from "../../src/output";
+import { SUMMARY_BYTE_LIMIT, TRUNCATION_NOTICE, renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
 import { report, result } from "./helpers";
 
 describe("renderSummaryMarkdown", () => {
@@ -222,6 +223,322 @@ describe("renderSummaryMarkdown", () => {
 
     expect(markdown).toContain("#### Warnings");
     expect(markdown).not.toContain("#### Failures");
+  });
+});
+
+/**
+ * #334: GitHub rejects an oversized job-summary append outright (HTTP 413),
+ * losing the whole summary rather than degrading it. These tests pin the
+ * bound, the priority order used to stay under it, and the fact that the
+ * result is deterministic.
+ */
+describe("renderSummaryMarkdown size limit (#334)", () => {
+  const utf8 = (text: string): number => Buffer.byteLength(text, "utf8");
+
+  /** A report whose single failing result's summary is `pad` ASCII
+   * characters. The rendered size moves one byte per added character, which
+   * is what lets the boundary tests below land on an exact byte count. */
+  function paddedFailure(pad: number, summaryChar = "x"): CanaryReport {
+    return report({
+      status: "fail",
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 0 },
+      results: [
+        result({
+          testId: "p28-xdr-cap83-001",
+          surface: "xdr",
+          fixtureId: "p28-xdr-cap83-001",
+          status: "fail",
+          summary: summaryChar.repeat(pad),
+        }),
+      ],
+    });
+  }
+
+  /** Padding that makes the rendered Markdown exactly `targetBytes` UTF-8
+   * bytes long, derived from a one-character probe rather than hard-coded so
+   * it survives edits to the surrounding Markdown. */
+  function paddingForExactSize(targetBytes: number): number {
+    const probeBytes = utf8(renderSummaryMarkdown(paddedFailure(1)));
+    expect(probeBytes).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    return 1 + (targetBytes - probeBytes);
+  }
+
+  /** Many large failing results, so the report's rendered size is dominated by
+   * detail the truncation has to cut. */
+  function manyFailures(approximateBytes: number): CanaryResult[] {
+    const perResult = 6144;
+    const count = Math.max(1, Math.ceil(approximateBytes / perResult));
+    return Array.from({ length: count }, (_unused, index) =>
+      result({
+        testId: `p28-xdr-cap${String(index)}-001`,
+        surface: "xdr",
+        fixtureId: `p28-xdr-cap${String(index)}-001`,
+        status: index % 7 === 0 ? "error" : "fail",
+        summary: `mismatch at byte ${String(index)} — ${"x".repeat(4096)}`,
+        details: `diff for check ${String(index)}:\n${"y".repeat(2048)}`,
+      }),
+    );
+  }
+
+  // ---- Normal (under the limit) ------------------------------------------------
+
+  it("leaves an ordinary report untouched and adds no truncation notice", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "fail",
+        counts: { total: 2, passed: 0, failed: 1, warnings: 1, errors: 0, skipped: 1 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", status: "fail", summary: "mismatch" }),
+          result({ testId: "b", surface: "rpc", fixtureId: "b", status: "warning", summary: "slow" }),
+        ],
+        skipped: [{ fixtureId: "p27-xdr-legacy", surface: "xdr", reason: "targets protocol 27" }],
+      }),
+    );
+
+    expect(markdown).not.toContain(TRUNCATION_NOTICE);
+    expect(markdown).toContain("#### Failures");
+    expect(markdown).toContain("#### Warnings");
+    expect(markdown).toContain("Skipped fixtures");
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+  });
+
+  // ---- Exact boundary ----------------------------------------------------------
+
+  it("publishes a report that lands exactly one byte under the limit untruncated", () => {
+    // The limit is inclusive of everything below it: a payload at exactly
+    // SUMMARY_BYTE_LIMIT - 1 must be published whole, with no notice, or the
+    // truncation would trigger a byte early.
+    const markdown = renderSummaryMarkdown(paddedFailure(paddingForExactSize(SUMMARY_BYTE_LIMIT - 1)));
+
+    expect(utf8(markdown)).toBe(SUMMARY_BYTE_LIMIT - 1);
+    expect(markdown).not.toContain(TRUNCATION_NOTICE);
+    expect(markdown).toContain("#### Failures");
+  });
+
+  it("truncates a report that lands exactly on the limit", () => {
+    // The mirror of the case above: one byte over, so the ceiling is not
+    // off-by-one in the permissive direction either.
+    const markdown = renderSummaryMarkdown(paddedFailure(paddingForExactSize(SUMMARY_BYTE_LIMIT)));
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    expect(markdown).toContain(TRUNCATION_NOTICE);
+  });
+
+  // ---- Oversized ---------------------------------------------------------------
+
+  for (const [label, approximateBytes] of [
+    ["2 MiB", 2 * 1024 * 1024],
+    ["5 MiB", 5 * 1024 * 1024],
+  ] as const) {
+    it(`bounds a ${label} report strictly under 1,000,000 bytes while keeping the verdict`, () => {
+      const results = manyFailures(approximateBytes);
+      const markdown = renderSummaryMarkdown(
+        report({
+          status: "fail",
+          counts: { total: results.length, passed: 0, failed: results.length, warnings: 0, errors: 0, skipped: 0 },
+          results,
+        }),
+      );
+
+      // The whole point of the issue: never send an oversized payload.
+      expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+      expect(utf8(markdown)).toBeLessThanOrEqual(1_000_000);
+
+      // The totals and the verdict survive verbatim — a clipped summary still
+      // answers "did it pass, and how much ran".
+      expect(markdown).toContain("### Result");
+      expect(markdown).toContain("❌ **NOT READY**");
+      expect(markdown).toContain(`${String(0)}/${String(results.length)} applicable checks passed.`);
+
+      // As do the high-priority regressions, from the front of the report.
+      expect(markdown).toContain("#### Failures");
+      expect(markdown).toContain("- `p28-xdr-cap0-001` (xdr) — mismatch at byte 0 — ");
+
+      // And the truncation is announced, once, at the end.
+      expect(markdown.split(TRUNCATION_NOTICE)).toHaveLength(2);
+      expect(markdown.endsWith(TRUNCATION_NOTICE)).toBe(true);
+    });
+  }
+
+  it("counts UTF-8 bytes rather than characters", () => {
+    // "→" is three UTF-8 bytes. A summary built from it has far fewer
+    // characters than bytes, so a limit applied to `String.length` would let
+    // this payload through — and GitHub would reject it.
+    const markdown = renderSummaryMarkdown(
+      paddedFailure(Math.ceil((SUMMARY_BYTE_LIMIT + 50_000) / 3), "→"),
+    );
+
+    expect(markdown).toContain(TRUNCATION_NOTICE);
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    // The character count alone is comfortably under the limit, which is the
+    // point: only a byte-based measure could have caught this.
+    expect([...markdown].length).toBeLessThan(SUMMARY_BYTE_LIMIT);
+  });
+
+  it("never cuts an entry in half: every rendered bullet is a verbatim source entry", () => {
+    const results = manyFailures(2 * 1024 * 1024);
+    const markdown = renderSummaryMarkdown(report({ status: "fail", results }));
+
+    const sourceBullets = new Set(
+      results.map((r) => `- \`${r.testId}\` (${r.surface}) — ${r.summary}`),
+    );
+    const renderedBullets = markdown.split("\n").filter((line) => line.startsWith("- `"));
+
+    expect(renderedBullets.length).toBeGreaterThan(0);
+    for (const bullet of renderedBullets) {
+      expect(sourceBullets.has(bullet)).toBe(true);
+    }
+  });
+
+  it("keeps a partially included section well formed, with balanced <details> tags", () => {
+    // Cheap failures plus an enormous skipped-fixture list: the skipped section
+    // is the one that gets clipped, so its collapsible wrapper must still be
+    // opened and closed exactly once each.
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "fail",
+        counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 4000 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", status: "fail", summary: "mismatch" }),
+        ],
+        skipped: Array.from({ length: 4000 }, (_unused, index) => ({
+          fixtureId: `p27-xdr-legacy-${String(index)}`,
+          surface: "xdr",
+          reason: `fixture targets protocol 27 — ${"z".repeat(512)}`,
+        })),
+      }),
+    );
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    expect(markdown.split("<details>")).toHaveLength(2);
+    expect(markdown.split("</details>")).toHaveLength(2);
+    expect(markdown).toContain("<details><summary>Skipped fixtures</summary>");
+    // The whole list cannot have fit, so the section must say how much it lost.
+    expect(markdown).toMatch(/\d+ more skipped fixtures omitted/);
+  });
+
+  it("drops the least actionable section first, keeping failures and warnings", () => {
+    // Priority order: Failures > Warnings > skipped fixtures. With the budget
+    // consumed by a huge skipped list, the two sections a reader acts on must
+    // both survive, and only the skipped list is clipped.
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "fail",
+        counts: { total: 2, passed: 0, failed: 1, warnings: 1, errors: 0, skipped: 5000 },
+        results: [
+          result({ testId: "the-failure", surface: "xdr", fixtureId: "f", status: "fail", summary: "mismatch" }),
+          result({ testId: "a-warning", surface: "rpc", fixtureId: "w", status: "warning", summary: `slow — ${"w".repeat(1024)}` }),
+        ],
+        skipped: Array.from({ length: 5000 }, (_unused, index) => ({
+          fixtureId: `skipped-${String(index)}`,
+          surface: "xdr",
+          reason: "z".repeat(512),
+        })),
+      }),
+    );
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    expect(markdown).toContain("#### Failures");
+    expect(markdown).toContain("- `the-failure` (xdr) — mismatch");
+    expect(markdown).toContain("#### Warnings");
+    expect(markdown).toContain("- `a-warning` (rpc) — slow — ");
+    // Only the skipped list, the lowest-priority section, was clipped.
+    expect(markdown).toMatch(/\d+ more skipped fixtures omitted/);
+    expect(markdown).not.toMatch(/\d+ more (failing checks|warnings) omitted/);
+    expect(markdown).toContain(TRUNCATION_NOTICE);
+  });
+
+  it("drops warnings entirely when the failures alone exhaust the budget", () => {
+    // The mirror case: when the high-priority regressions fill the budget, the
+    // verbose sections must yield rather than push the payload over the
+    // ceiling. The failures are many and small so the leftover slack is under
+    // one entry, and the warning is far larger than that slack.
+    const failures = Array.from({ length: 5000 }, (_unused, index) =>
+      result({
+        testId: `fail-${String(index)}`,
+        surface: "xdr",
+        fixtureId: `fail-${String(index)}`,
+        status: "fail",
+        summary: `mismatch — ${"f".repeat(1000)}`,
+      }),
+    );
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "fail",
+        counts: { total: 5001, passed: 0, failed: 5000, warnings: 1, errors: 0, skipped: 0 },
+        results: [
+          ...failures,
+          result({
+            testId: "a-warning",
+            surface: "rpc",
+            fixtureId: "w",
+            status: "warning",
+            summary: `slow — ${"w".repeat(50_000)}`,
+          }),
+        ],
+      }),
+    );
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    // The failures section kept what it could and accounted for the rest...
+    expect(markdown).toContain("#### Failures");
+    expect(markdown).toContain("- `fail-0` (xdr) — mismatch — ");
+    expect(markdown).toMatch(/\d+ more failing checks omitted/);
+    // ...and the warnings section, having no budget left, was dropped whole
+    // rather than rendered as an empty heading.
+    expect(markdown).not.toContain("#### Warnings");
+    expect(markdown).not.toContain("- `a-warning`");
+    expect(markdown).toContain(TRUNCATION_NOTICE);
+  });
+
+  it("drops an entry larger than the whole budget rather than cutting it", () => {
+    // A single result whose summary exceeds the entire ceiling cannot be kept
+    // whole. Cutting it mid-string would produce exactly the malformed
+    // Markdown the issue asks to avoid, so the section is dropped rather than
+    // clipped; the totals and the verdict still stand.
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "fail",
+        counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({
+            testId: "the-failure",
+            surface: "xdr",
+            fixtureId: "f",
+            status: "fail",
+            summary: `mismatch — ${"f".repeat(SUMMARY_BYTE_LIMIT)}`,
+          }),
+        ],
+      }),
+    );
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    // No fragment of the oversized entry leaks through.
+    expect(markdown).not.toContain("ffff");
+    // A section that could show nothing at all is dropped whole, rather than
+    // left as a heading whose only content is an omission marker.
+    expect(markdown).not.toContain("#### Failures");
+    // The verdict survives regardless.
+    expect(markdown).toContain("0/1 applicable checks passed.");
+    expect(markdown).toContain("❌ **NOT READY**");
+    expect(markdown).toContain(TRUNCATION_NOTICE);
+  });
+
+  it("is deterministic: the same report always renders to the same Markdown", () => {
+    const results = manyFailures(2 * 1024 * 1024);
+    const build = (): CanaryReport => report({ status: "fail", results });
+    expect(renderSummaryMarkdown(build())).toBe(renderSummaryMarkdown(build()));
+  });
+
+  it("still bounds the output when the preamble alone is oversized", () => {
+    // A pathological report (here, a multi-megabyte project name) can blow the
+    // ceiling before a single section is considered. The ceiling is the hard
+    // invariant — a 413 loses everything — so the payload must still fit.
+    const markdown = renderSummaryMarkdown(
+      report({ project: { name: "p".repeat(3 * 1024 * 1024), type: "soroban" } }),
+    );
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
   });
 });
 

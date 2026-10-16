@@ -16,6 +16,19 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Oversized job summaries are truncated deterministically instead of being
+  rejected. GitHub refuses a step-summary append above its payload limit
+  (HTTP 413), which lost the *whole* summary — including the pass/fail
+  verdict — on a run with hundreds of failures. The generated Markdown is
+  now bounded strictly under 1,000,000 UTF-8 bytes, keeping the title,
+  protocol/project/network identity, per-surface table, overall verdict and
+  counts, and then the failures, warnings and skipped-fixture list in that
+  priority order. Detail is dropped whole, so the cut never lands mid-line,
+  mid-entry, or between a `<details>` and its `</details>`; each clipped
+  section reports how many entries it lost, and the summary ends with a
+  warning pointing at the unaffected report artifact. A summary that already
+  fits is published byte-for-byte unchanged, and truncation is measured in
+  UTF-8 bytes rather than characters ([#334]).
 - Execution-failure job summaries no longer break when the raw diagnostic
   (Canary's stderr, a timeout notice) itself contains a ``` sequence, e.g.
   a compiler or panic message quoting a code block: the diagnostic fence is
