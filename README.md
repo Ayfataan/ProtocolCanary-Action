@@ -144,6 +144,19 @@ literals below.
 | `failures` | Number of checks that failed a compatibility assertion. | `"2"` |
 | `errors` | Number of checks that could not complete due to an execution error. | `"0"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `coverage-state` | How completely the fixture set was exercised: `full` (every discovered fixture ran, none skipped), `partial` (something ran, but fixtures were skipped), or `none` (nothing ran — an empty run or an execution failure). | `"full"` |
+
+`coverage-state` is meant for a job that gates a promotion on *coverage*
+rather than on the verdict alone — a `pass` with `coverage-state: partial`
+means Canary only exercised part of the fixture set:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  id: canary
+- name: Require full fixture coverage before promoting
+  if: steps.canary.outputs.coverage-state != 'full'
+  run: echo "Coverage was ${{ steps.canary.outputs.coverage-state }}, not full — see the JSON report artifact."
+```
 
 A concrete consumer, using the outputs to gate a follow-up step:
 
@@ -156,7 +169,7 @@ A concrete consumer, using the outputs to gate a follow-up step:
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts. `coverage-state` is set on that path too, always as `none`, so a consumer never has to distinguish "unset" from "no coverage".
 
 ## How failures appear
 

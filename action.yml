@@ -137,6 +137,16 @@ outputs:
       produced output to parse; empty/unset on an execution failure (when
       status is `execution-failed`), unlike `passed`/`warnings`/`failures`/`errors`,
       which are explicitly set to `0` in that case.
+  coverage-state:
+    description: >-
+      How completely the fixture set was exercised: `full` when every
+      discovered fixture ran and nothing was skipped, `partial` when at
+      least one fixture ran but others were skipped, and `none` when no
+      fixture ran at all (an empty run, or an execution failure). Set on
+      every path, including an execution failure, where it is always
+      `none`. Intended for a downstream job that gates a promotion on
+      coverage rather than on `status` alone; `none` is the conservative
+      default for a run that cannot prove it executed the fixtures.
 
 runs:
   using: node24

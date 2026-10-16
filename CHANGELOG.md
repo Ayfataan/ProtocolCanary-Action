@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `coverage-state` output (`full`, `partial`, or `none`) reporting how completely the
+  fixture set was exercised: `full` when every discovered fixture ran with nothing
+  skipped, `partial` when some ran and others were skipped, `none` when nothing ran
+  (an empty run, or an execution failure, where it is always set to `none`). It lets a
+  downstream job gate a promotion on coverage rather than on `status` alone — a `pass`
+  with `coverage-state: partial` means only part of the fixture set was exercised. The
+  state is derived from the report's executed results and its skip signals, and a
+  report missing any of those fields classifies as `none` rather than throwing
+  ([#333]).
 - `allow-empty` input (default `false`). It forwards `--allow-empty` to Protocol-Canary
   `0.2.0` and newer, which fail a run that executes no checks. With an older `version`
   the flag is not forwarded, because those versions already pass an empty run and would

@@ -201,6 +201,9 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("failures", "0");
     // No report was produced, so no "report" output is set.
     expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+    // #333: coverage-state is still set, and explicitly to `none` — a run that
+    // produced no report cannot claim to have executed any fixture.
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "none");
 
     // The diagnostic (stderr) is carried into the execution-failure summary,
     // which is still written despite the abnormal termination.
@@ -243,5 +246,49 @@ describe("run", () => {
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
     expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  // #333: the coverage-state output is what a downstream promotion job reads,
+  // so run() has to derive it from the parsed report on every successful run —
+  // including one whose fixtures were only partially exercised.
+  it("sets coverage-state from the parsed report on the success path", async () => {
+    const partiallySkipped = {
+      ...PASS_REPORT,
+      status: "fail" as const,
+      results: [result({ testId: "a", surface: "xdr", status: "fail", summary: "mismatch", fixtureId: "a" })],
+      skipped: [{ fixtureId: "b", surface: "xdr", reason: "fixture targets protocol 27" }],
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 1 },
+    };
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      stdout: JSON.stringify(partiallySkipped),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "partial");
+    expect(infoMock).toHaveBeenCalledWith("Coverage: partial");
+  });
+
+  it("sets coverage-state to `full` for a report with no skips and `none` for an empty report", async () => {
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    await run();
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "full");
+
+    setOutputMock.mockClear();
+    infoMock.mockClear();
+
+    const emptyReport = {
+      ...PASS_REPORT,
+      results: [],
+      counts: { total: 0, passed: 0, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+    };
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(emptyReport), stderr: "" });
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "none");
+    expect(infoMock).toHaveBeenCalledWith("Coverage: none");
   });
 });

@@ -9,7 +9,7 @@ import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "./canary";
 import { describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
-import { describeExitCode, parseReport } from "./output";
+import { classifyCoverage, describeExitCode, parseReport } from "./output";
 import { buildCheckArgs, engineSupportsAllowEmpty, runCheck } from "./runner";
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
@@ -58,6 +58,10 @@ async function handleExecutionFailure(reason: string, diagnostic: string, annota
   core.setOutput("warnings", "0");
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
+  // No report was produced, so no fixture can be claimed as executed. #333:
+  // set explicitly so a downstream job reading `coverage-state` sees `none`
+  // rather than an unset (empty) output on the execution-failure path.
+  core.setOutput("coverage-state", "none");
 }
 
 /**
@@ -148,6 +152,8 @@ export async function run(): Promise<void> {
 
   core.info(`${String(report.counts.passed)}/${String(report.counts.total)} applicable checks passed.`);
   core.info(`Status: ${report.status.toUpperCase()}`);
+  const coverageState = classifyCoverage(report);
+  core.info(`Coverage: ${coverageState}`);
 
   if (inputs.annotations) {
     emitAnnotations(report);
@@ -165,6 +171,7 @@ export async function run(): Promise<void> {
   core.setOutput("failures", String(report.counts.failed));
   core.setOutput("errors", String(report.counts.errors));
   core.setOutput("report", reportPath);
+  core.setOutput("coverage-state", coverageState);
 
   if (inputs.uploadReport) {
     await uploadReport(reportPath, artifactDifferentiator(inputs));
