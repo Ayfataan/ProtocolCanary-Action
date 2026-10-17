@@ -88,6 +88,17 @@ inputs:
     required: false
     default: "true"
 
+  diagnostics:
+    description: >-
+      Opt in to a best-effort redacted diagnostics log bundle when Canary
+      cannot produce a usable report (for example an install failure, timeout,
+      or unparseable output). Defaults to `false`: diagnostics artifacts are
+      strictly opt-in because they are downloadable by anyone who can read the
+      repository and their redaction is best effort. The process environment
+      is never included in the bundle.
+    required: false
+    default: "false"
+
   timeout-minutes:
     description: >-
       Maximum time to let the Canary process run before it is terminated
