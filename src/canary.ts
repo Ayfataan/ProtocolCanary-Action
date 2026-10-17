@@ -16,7 +16,7 @@ import {
 import type { CheckExecutionResult } from "./runner";
 import { CARGO_INSTALL_TIMEOUT_FLOOR_MS, runCheck } from "./runner";
 import type { ResolvedVersion } from "./version";
-import { CANARY_API_REPO_URL, CANARY_REPO_URL } from "./version";
+import { assessEngineVersion, CANARY_API_REPO_URL, CANARY_REPO_URL } from "./version";
 
 /**
  * Describes a Canary binary that has been located or restored and verified
@@ -453,6 +453,14 @@ export async function ensureCanaryInstalled(
   resolved: ResolvedVersion,
   installTimeoutMs: number = cargoInstallTimeoutMs(15),
 ): Promise<InstalledCanary> {
+  // Warn once, before any install work, when the requested engine release is
+  // deprecated or from an unvalidated future major line. The default 0.1.1
+  // and every other supported 0.x release produce no warning.
+  const compatibility = assessEngineVersion(resolved.version);
+  if (compatibility.warning !== undefined) {
+    core.warning(compatibility.warning);
+  }
+
   const existing = await findExisting(resolved);
   if (existing !== undefined) {
     await verifyInstalledBinary(existing.binaryPath, resolved);

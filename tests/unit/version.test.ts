@@ -12,7 +12,14 @@ vi.mock("@actions/core", () => ({
 
 import * as core from "@actions/core";
 import * as https from "node:https";
-import { resolveVersion } from "../../src/version";
+import { InvalidInputError } from "../../src/errors";
+import {
+  assessEngineVersion,
+  DEPRECATED_BELOW_ENGINE_VERSION,
+  LATEST_VALIDATED_ENGINE_VERSION,
+  MIN_SUPPORTED_ENGINE_VERSION,
+  resolveVersion,
+} from "../../src/version";
 
 class FakeResponse extends EventEmitter {
   statusCode: number;
@@ -303,5 +310,80 @@ describe("resolveVersion", () => {
     mockHttpsPages([{ body: JSON.stringify(tags) }]);
     const resolved = await resolveVersion("0.1.0");
     expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: undefined });
+  });
+});
+
+/**
+ * #374: supported engine range and deprecation warnings. The default engine
+ * version 0.1.1 is fully supported and must never warn, so a normal run stays
+ * noise-free; only releases strictly older than 0.1.0 (or unvalidated future
+ * majors) produce an annotation.
+ */
+describe("assessEngineVersion", () => {
+  it("accepts the default 0.1.1 version without a warning", () => {
+    expect(assessEngineVersion("0.1.1")).toEqual({
+      version: "0.1.1",
+      supported: true,
+      warning: undefined,
+    });
+  });
+
+  it("accepts a newer release on the supported 0.x line without a warning", () => {
+    expect(assessEngineVersion("0.2.0")).toEqual({
+      version: "0.2.0",
+      supported: true,
+      warning: undefined,
+    });
+  });
+
+  it("reports 0.1.0 as outside the supported range but not deprecated", () => {
+    // 0.1.0 predates the supported >= 0.1.1 range, yet no deprecation
+    // decision covers it, so it must not produce warning noise.
+    const result = assessEngineVersion("0.1.0");
+    expect(result.supported).toBe(false);
+    expect(result.warning).toBeUndefined();
+  });
+
+  it("warns for an engine strictly older than 0.1.0", () => {
+    const result = assessEngineVersion("0.0.9");
+    expect(result.supported).toBe(false);
+    expect(result.warning).toContain("older than 0.1.0");
+    expect(result.warning).toContain("no longer supported");
+    expect(result.warning).toContain(LATEST_VALIDATED_ENGINE_VERSION);
+  });
+
+  it("warns for an unvalidated future major release", () => {
+    const result = assessEngineVersion("1.0.0");
+    expect(result.warning).toContain("not verified");
+    expect(result.warning).toContain(LATEST_VALIDATED_ENGINE_VERSION);
+  });
+
+  it("compares numeric components rather than strings", () => {
+    // A lexicographic comparison would call 0.10.0 "older" than 0.9.0.
+    expect(assessEngineVersion("0.10.0").warning).toBeUndefined();
+    expect(assessEngineVersion("0.10.0").supported).toBe(true);
+    expect(assessEngineVersion("0.0.10").warning).toContain("older than 0.1.0");
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(assessEngineVersion("  0.1.1  ")).toEqual({
+      version: "0.1.1",
+      supported: true,
+      warning: undefined,
+    });
+  });
+
+  it.each(["latest", "main", "1.2", "1.2.3.4", "v0.1.1", "", "0.1.x", "1.2.3-rc.1"])(
+    "rejects the invalid engine version %s with InvalidInputError",
+    (value) => {
+      expect(() => assessEngineVersion(value)).toThrow(InvalidInputError);
+      expect(() => assessEngineVersion(value)).toThrow(/semantic version/);
+    },
+  );
+
+  it("exposes the documented policy constants", () => {
+    expect(MIN_SUPPORTED_ENGINE_VERSION).toBe("0.1.1");
+    expect(DEPRECATED_BELOW_ENGINE_VERSION).toBe("0.1.0");
+    expect(LATEST_VALIDATED_ENGINE_VERSION).toBe("0.1.1");
   });
 });

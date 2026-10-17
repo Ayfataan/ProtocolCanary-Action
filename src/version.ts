@@ -1,6 +1,8 @@
 import * as core from "@actions/core";
 import * as https from "node:https";
 
+import { InvalidInputError } from "./errors";
+
 /**
  * Single point of control for where this Action installs Protocol-Canary from.
  *
@@ -16,6 +18,102 @@ export const CANARY_REPO_URL = `https://github.com/${CANARY_REPO_OWNER}/${CANARY
 
 /** The API base for the Canary repository, shared by every REST call here. */
 export const CANARY_API_REPO_URL = `https://api.github.com/repos/${CANARY_REPO_OWNER}/${CANARY_REPO_NAME}`;
+
+/**
+ * Engine release compatibility policy (issue #374).
+ *
+ * Supported range: `>= 0.1.1` on the current `0.x` release line. `0.1.1` is
+ * the Action's default and is fully supported, so it must never warn. `0.1.0`
+ * sits just below the supported range but has no approved deprecation
+ * decision, so it is reported as unsupported *without* a deprecation warning;
+ * only releases strictly older than `0.1.0` warn. A future major release
+ * (`>= 1.0.0`) also warns: this Action has not been validated against it, and
+ * no deprecation decision covers it either.
+ */
+export const MIN_SUPPORTED_ENGINE_VERSION = "0.1.1";
+/** Legacy releases strictly older than this emit a deprecation warning. */
+export const DEPRECATED_BELOW_ENGINE_VERSION = "0.1.0";
+/** The newest engine release this Action is validated against. */
+export const LATEST_VALIDATED_ENGINE_VERSION = "0.1.1";
+
+export interface EngineVersionCompatibility {
+  /** The version as assessed, trimmed. */
+  readonly version: string;
+  /** Whether the version is inside the supported `>= 0.1.1`, `0.x` range. */
+  readonly supported: boolean;
+  /**
+   * A human-readable warning to emit as a GitHub annotation, or `undefined`
+   * when the version needs no warning (including the default `0.1.1`).
+   */
+  readonly warning: string | undefined;
+}
+
+interface ParsedEngineVersion {
+  readonly major: number;
+  readonly minor: number;
+  readonly patch: number;
+}
+
+const ENGINE_VERSION_PATTERN = /^(\d+)\.(\d+)\.(\d+)$/;
+
+/** Parses a strict `x.y.z` engine version. Unlike the `version` input's
+ * parser this does not accept a leading `v`: by the time a version reaches
+ * here it has already been normalised. Invalid strings throw
+ * {@link InvalidInputError} rather than being treated as "old" or "new". */
+function parseEngineVersion(version: string): ParsedEngineVersion {
+  const value = version.trim();
+  const match = ENGINE_VERSION_PATTERN.exec(value);
+  if (match === null) {
+    throw new InvalidInputError(
+      `Invalid engine version: ${JSON.stringify(version)}. Expected a semantic version, e.g. "${LATEST_VALIDATED_ENGINE_VERSION}".`,
+    );
+  }
+  return {
+    major: Number.parseInt(match[1] ?? "0", 10),
+    minor: Number.parseInt(match[2] ?? "0", 10),
+    patch: Number.parseInt(match[3] ?? "0", 10),
+  };
+}
+
+function compareEngineVersions(left: ParsedEngineVersion, right: ParsedEngineVersion): number {
+  if (left.major !== right.major) {
+    return left.major - right.major;
+  }
+  if (left.minor !== right.minor) {
+    return left.minor - right.minor;
+  }
+  return left.patch - right.patch;
+}
+
+/**
+ * Assesses a requested engine version against the supported release range
+ * and returns any warning the caller should emit. The default `0.1.1` is
+ * fully supported and produces no warning; a version strictly older than
+ * `0.1.0` warns as deprecated, as does an unvalidated future major release.
+ *
+ * Throws {@link InvalidInputError} for a value that is not `x.y.z`, so a
+ * mistyped version fails clearly instead of being misclassified by a
+ * best-effort comparison.
+ */
+export function assessEngineVersion(version: string): EngineVersionCompatibility {
+  const parsed = parseEngineVersion(version);
+  const supported =
+    parsed.major === 0 &&
+    compareEngineVersions(parsed, parseEngineVersion(MIN_SUPPORTED_ENGINE_VERSION)) >= 0;
+
+  let warning: string | undefined;
+  if (compareEngineVersions(parsed, parseEngineVersion(DEPRECATED_BELOW_ENGINE_VERSION)) < 0) {
+    warning =
+      `Protocol-Canary ${version.trim()} is older than ${DEPRECATED_BELOW_ENGINE_VERSION} and is no longer supported by this Action. ` +
+      `Upgrade the \`version\` input to ${LATEST_VALIDATED_ENGINE_VERSION} or newer.`;
+  } else if (parsed.major > 0) {
+    warning =
+      `Protocol-Canary ${version.trim()} is newer than the supported 0.x release line ` +
+      `(latest validated: ${LATEST_VALIDATED_ENGINE_VERSION}); compatibility with this engine release is not verified.`;
+  }
+
+  return { version: version.trim(), supported, warning };
+}
 
 /** GitHub's maximum page size for list endpoints such as `tags`. */
 const TAGS_PER_PAGE = 100;

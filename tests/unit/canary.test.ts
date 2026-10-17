@@ -327,6 +327,25 @@ describe("ensureCanaryInstalled", () => {
     expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
   });
 
+  it("emits a deprecation warning for an engine strictly older than 0.1.0 (#374)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    versionProbeResults = ["0.0.9"];
+
+    await ensureCanaryInstalled({ version: "0.0.9", tag: "v0.0.9", commitSha: "abc123" });
+
+    expect(coreMocks.warningMock).toHaveBeenCalledTimes(1);
+    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("older than 0.1.0"));
+  });
+
+  it("does not warn about the default engine version 0.1.1 (#374)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    versionProbeResults = ["0.1.1"];
+
+    await ensureCanaryInstalled({ version: "0.1.1", tag: "v0.1.1", commitSha: "abc123" });
+
+    expect(coreMocks.warningMock).not.toHaveBeenCalled();
+  });
+
   it("does not reuse an already-installed binary with a different version", async () => {
     fs.writeFileSync(binaryPath(), "binary");
     // The first version probe (the already-installed binary) reports a
