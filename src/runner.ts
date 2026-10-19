@@ -82,6 +82,41 @@ export function engineSupportsAllowEmpty(version: string | undefined): boolean {
 const SIGNALS_TO_FORWARD: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 
 /**
+ * Longest root diagnostic kept from the engine's stderr (#351). Everything
+ * beyond this (full backtraces, repeated retries) is dropped from the
+ * annotation, which is meant to show the one message that explains the
+ * failure, not the whole log — the full stderr still lands in the job log
+ * and in the execution-failure summary.
+ */
+export const MAX_DIAGNOSTIC_LENGTH = 500;
+
+/** Lines that read as the engine's root failure message, in priority order. */
+const ROOT_DIAGNOSTIC = /^(?:error|panic|fatal|failed|failure|no checks ran|invalid|unknown|unsupported|could not|cannot)\b/i;
+
+/**
+ * Extracts the root diagnostic message from the engine's stderr (#351).
+ * Failure exits often bury the one useful line under progress output, so
+ * the first line that reads as a root failure message wins; otherwise the
+ * first non-empty line is used. Returns `""` when stderr carries nothing
+ * actionable, so callers can fall back to the report (or nothing) instead
+ * of annotating an empty diagnostic.
+ */
+export function extractDiagnostic(stderr: string): string {
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (lines.length === 0) {
+    return "";
+  }
+  const root = lines.find((line) => ROOT_DIAGNOSTIC.test(line)) ?? lines[0];
+  if (root === undefined) {
+    return "";
+  }
+  return root.length > MAX_DIAGNOSTIC_LENGTH ? `${root.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…` : root;
+}
+
+/**
  * How long a timed-out Canary process is given to exit after `SIGTERM`
  * before it is forcefully killed with `SIGKILL`. A process that ignores
  * `SIGTERM` (for example one blocked in an uninterruptible network call)

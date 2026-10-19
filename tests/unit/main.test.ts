@@ -101,6 +101,8 @@ const INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 1,
   allowEmpty: false,
+  fixturesPackVersion: undefined,
+  fixturesPackProtocol: undefined,
 };
 
 const PASS_REPORT = report({
@@ -212,6 +214,54 @@ describe("run", () => {
 
     // annotations: true, so the execution-failure annotation is emitted too.
     expect(errorMock).toHaveBeenCalledTimes(1);
+    // No report existed at all, so nothing was replayed (#350).
+    expect(setOutputMock).toHaveBeenCalledWith("replayed-count", "0");
+  });
+
+  // #350: the replayed-count output mirrors how many results the engine
+  // served from its result cache instead of executing in this run.
+  it("sets the replayed-count output from the report (#350)", async () => {
+    const cachedRun = report({
+      status: "pass",
+      counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+      results: [
+        result({ testId: "a", fixtureId: "a", source: "cache" }),
+        result({ testId: "b", fixtureId: "b", source: "live" }),
+      ],
+    });
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(cachedRun), stderr: "" });
+
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith("replayed-count", "1");
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+  });
+
+  // #351: a non-zero engine exit with a usable report gets an annotation
+  // carrying the exit-code classification and the engine's root diagnostic.
+  it("annotates a non-zero engine exit with its classification and diagnostic (#351)", async () => {
+    const failing = report({
+      status: "fail",
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 0 },
+      results: [
+        result({ testId: "p28-xdr-1", surface: "xdr", status: "fail", summary: "decode failed", fixtureId: "p28-xdr-1" }),
+      ],
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      stdout: JSON.stringify(failing),
+      stderr: "stellar-canary 0.2.0\nerror: assertion failed at byte 12\n",
+    });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    expect(setOutputMock).toHaveBeenCalledWith("status", "fail");
+    const messages = errorMock.mock.calls.map((call) => String(call[0]));
+    expect(messages.some((message) => message.includes("exit code 1"))).toBe(true);
+    expect(messages.some((message) => message.includes("Test failures detected"))).toBe(true);
+    expect(messages.some((message) => message.includes("assertion failed at byte 12"))).toBe(true);
   });
 
   // #271, branch 2: writeSummary rejecting on the otherwise-successful path

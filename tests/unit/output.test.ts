@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { InvalidReportError } from "../../src/errors";
 import type { CanaryReport } from "../../src/output";
-import { classifyCoverage, describeExitCode, parseReport } from "../../src/output";
+import { countReplayed, describeExitCode, isReplayed, parseReport } from "../../src/output";
+import { classifyCoverage } from "../../src/output";
 import { report, result } from "./helpers";
 
 const VALID_REPORT = JSON.stringify(
@@ -252,6 +253,109 @@ describe("parseReport", () => {
   it("rejects a skipped field that is present but not an array", () => {
     const report = { ...RESULT_FIXTURE, skipped: "none" };
     expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+  });
+
+  // #349 / CF-01 section 4: a result is identified inside one report by
+  // `(surface, fixtureId)` — `testId` when `fixtureId` is absent — and a
+  // report in which two results share an identity is invalid. Duplicates
+  // could otherwise skew derived counts or hide a failure behind a copy of
+  // a passing result.
+  it("rejects a report with two results sharing the same (surface, fixtureId) identity (#349)", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      results: [
+        { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+        { testId: "b", protocol: 28, surface: "xdr", status: "fail", summary: "bad", durationMs: 1, fixtureId: "dup" },
+      ],
+    };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/duplicate result identity/);
+  });
+
+  it("names the exact duplicate identity and surface in the error message (#349)", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      results: [
+        { testId: "a", protocol: 28, surface: "rpc", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+        { testId: "b", protocol: 28, surface: "rpc", status: "fail", summary: "bad", durationMs: 1, fixtureId: "dup" },
+      ],
+    };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/\("rpc", "dup"\)/);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/results\[1\]/);
+  });
+
+  it("accepts the same fixtureId on different surfaces (identity is per-surface) (#349)", () => {
+    const report = {
+      ...RESULT_FIXTURE,
+      results: [
+        { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+        { testId: "a", protocol: 28, surface: "rpc", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
+      ],
+    };
+    expect(() => parseReport(JSON.stringify(report))).not.toThrow();
+  });
+
+  it("uses testId as the identity when fixtureId is null, rejecting duplicates there too (#349)", () => {
+    const dup = (surface: string): Record<string, unknown> => ({
+      testId: "shared-test",
+      protocol: 28,
+      surface,
+      status: "pass",
+      summary: "ok",
+      durationMs: 1,
+      fixtureId: null,
+    });
+    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, results: [dup("xdr"), dup("xdr")] }))).toThrow(
+      InvalidReportError,
+    );
+    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, results: [dup("xdr"), dup("rpc")] }))).not.toThrow();
+  });
+
+  it("passes cleanly when every result identity is distinct (#349)", () => {
+    const report = JSON.parse(VALID_REPORT) as Record<string, unknown>;
+    expect(() => parseReport(JSON.stringify(report))).not.toThrow();
+  });
+});
+
+describe("isReplayed / countReplayed", () => {
+  // #350 / CF-01 section 6: `source: "cache"` marks a result replayed from
+  // the engine's result cache; engines that predate the cache emit no
+  // `source` at all and every result counts as live.
+  it("counts results whose source is \"cache\" (#350)", () => {
+    expect(countReplayed(report([result({ source: "cache" }), result({ source: "live" })]))).toBe(1);
+    expect(isReplayed(result({ source: "cache" }))).toBe(true);
+    expect(isReplayed(result({ source: "live" }))).toBe(false);
+  });
+
+  it("treats an absent source as not recorded — counted as 0, without throwing (#350)", () => {
+    expect(countReplayed(report([result(), result()]))).toBe(0);
+    expect(isReplayed(result())).toBe(false);
+  });
+
+  it("reads an unknown source value as not recorded, never as replayed (#350)", () => {
+    expect(isReplayed(result({ source: "disk" }))).toBe(false);
+    expect(isReplayed(result({ source: 42 as unknown as string }))).toBe(false);
+  });
+
+  it("honors boolean replayed/cached attributes alongside source (#350)", () => {
+    expect(isReplayed(result({ replayed: true }))).toBe(true);
+    expect(isReplayed(result({ cached: true }))).toBe(true);
+    expect(isReplayed(result({ replayed: false, cached: false }))).toBe(false);
+    // A boolean flag never reclassifies a live result.
+    expect(isReplayed(result({ source: "live", replayed: true }))).toBe(true);
+    expect(isReplayed(result({ source: "live", replayed: false }))).toBe(false);
+  });
+
+  it("parses a report carrying the additive source field without rejecting it (#350)", () => {
+    const parsed = parseReport(
+      JSON.stringify({
+        ...(JSON.parse(VALID_REPORT) as Record<string, unknown>),
+        results: [
+          { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "a", source: "cache" },
+        ],
+      }),
+    );
+    expect(countReplayed(parsed)).toBe(1);
   });
 });
 

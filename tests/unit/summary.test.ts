@@ -223,6 +223,56 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).toContain("#### Warnings");
     expect(markdown).not.toContain("#### Failures");
   });
+
+  // #350: fixtures/results served from the engine's cache must be called out
+  // so a reader can tell cache reuse from fresh execution.
+  it("renders a replayed-from-cache badge with count and percentage (#350)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", source: "cache" }),
+          result({ testId: "b", surface: "xdr", fixtureId: "b", source: "cache" }),
+          result({ testId: "c", surface: "rpc", fixtureId: "c", source: "live" }),
+          result({ testId: "d", surface: "rpc", fixtureId: "d" }),
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("Replayed from cache");
+    expect(markdown).toContain("2/4 checks (50%)");
+    expect(markdown).toContain("♻️");
+  });
+
+  it("renders no cache badge when nothing was replayed (#350)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", source: "live" }),
+          result({ testId: "b", surface: "rpc", fixtureId: "b", source: "live" }),
+        ],
+      }),
+    );
+    expect(markdown).not.toContain("Replayed from cache");
+    expect(markdown).toContain("2/2 applicable checks passed.");
+  });
+
+  it("defaults to zero replayed checks (no badge, no throw) for reports without any replayed field (#350)", () => {
+    // Reports from engines that predate the cache carry no source/replayed
+    // attributes at all; rendering must be unaffected.
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", surface: "xdr", fixtureId: "a" })],
+      }),
+    );
+    expect(markdown).not.toContain("Replayed from cache");
+    expect(markdown).toContain("1/1 applicable checks passed.");
+  });
 });
 
 describe("renderExecutionFailureMarkdown", () => {

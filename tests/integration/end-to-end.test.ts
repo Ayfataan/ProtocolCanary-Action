@@ -206,7 +206,9 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
 
     expect(setFailedMock).toHaveBeenCalledTimes(1);
     expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("fail");
-    expect(errorMock).toHaveBeenCalledTimes(1);
+    // #351: one annotation for the failing result plus one for the engine's
+    // non-zero exit (classification + root diagnostic).
+    expect(errorMock).toHaveBeenCalledTimes(2);
     const outputs = readOutputs(fixture.outputPath);
     expect(outputs.status).toBe("fail");
     expect(outputs.failures).toBe("1");
@@ -325,7 +327,8 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     await run();
 
     expect(setFailedMock).toHaveBeenCalledTimes(1);
-    expect(errorMock).toHaveBeenCalledTimes(60); // all 60 fail results should produce annotations
+    // 60 per-result annotations plus one exit-code annotation (#351).
+    expect(errorMock).toHaveBeenCalledTimes(61); // all 60 fail results should produce annotations
     const outputs = readOutputs(fixture.outputPath);
     expect(outputs.status).toBe("fail");
     expect(outputs.failures).toBe("60");

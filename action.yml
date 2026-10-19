@@ -117,6 +117,29 @@ inputs:
     required: false
     default: "false"
 
+  fixtures-pack-version:
+    description: >-
+      Release tag of the fixture pack to run against, for example `v1.2.0`
+      (the leading `v` is optional). Validated for format when set, and an
+      unpinned value such as `latest` or `main` is rejected outright, the
+      same way `version` refuses to track a moving reference.
+      Currently *not forwarded* to Canary: `stellar-canary check` has no
+      fixture-pack flag — its fixture-loading contract accepts a local path
+      via `fixtures-dir` and defines no other loading mechanism — so pinning a
+      pack still means checking out that pack's tag into `fixtures-dir`.
+      The Action logs a note when this input is set.
+    required: false
+
+  fixtures-pack-protocol:
+    description: >-
+      Protocol version the fixture pack is pinned to, as a positive integer,
+      for example `28`. Zero is rejected, unlike `protocol`, which accepts a
+      non-negative integer.
+      Currently *not forwarded* to Canary, for the same reason as
+      `fixtures-pack-version`; the Action logs a note when it is set. The
+      protocol a run actually checks is controlled by `protocol`.
+    required: false
+
 outputs:
   status:
     description: >-
@@ -131,6 +154,14 @@ outputs:
     description: Number of checks that failed a compatibility assertion.
   errors:
     description: Number of checks that could not complete due to an execution error.
+  replayed-count:
+    description: >-
+      Number of checks whose results were replayed from Protocol Canary's
+      result cache instead of executed in this run (a result with
+      `source: "cache"`, or an equivalent replayed/cached flag). Counts
+      results carrying any replayed marker; engines whose reports predate
+      the cache produce `0`. Explicitly set to `0` on an execution failure,
+      like the other counts.
   report:
     description: >-
       Absolute path to the generated JSON report file. Only set when Canary
