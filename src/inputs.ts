@@ -16,10 +16,29 @@ export interface ActionInputs {
   readonly timeoutMinutes: number;
   /** Pass `--allow-empty` to engines that support it (0.2.0 and newer). */
   readonly allowEmpty: boolean;
+  /** Release tag of the fixture pack to run against, e.g. `v1.2.0`, kept as
+   * written (leading `v` optional). Validated for format only — see
+   * {@link parseFixturesPackVersion} for why it is not forwarded yet. */
+  readonly fixturesPackVersion: string | undefined;
+  /** Protocol version the fixture pack is pinned to, as a positive integer.
+   * Validated for format only — see {@link parseFixturesPackProtocol}. */
+  readonly fixturesPackProtocol: number | undefined;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;
 const PROTOCOL_LIKE = /^\d+$/;
+
+/**
+ * A fixture-pack release tag: semver-shaped, with an optional leading `v` and
+ * the optional SemVer prerelease (`-rc.1`) and build (`+sha.abc`) suffixes a
+ * published release may carry.
+ *
+ * Deliberately does *not* accept `latest`, `main`, or any other moving
+ * reference: this repository pins the engine (`version`) and never tracks an
+ * unpinned build, and a reproducibility-oriented pack pin that silently
+ * followed a branch would defeat its own purpose.
+ */
+const PACK_VERSION_LIKE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 /** Reads and validates every Action input. Throws {@link InvalidInputError} or
  * {@link ConfigNotFoundError} on the first problem found. */
@@ -34,6 +53,21 @@ export function getInputs(): ActionInputs {
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
+  const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
+  const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
+
+  // A validated input that silently does nothing is worse than a missing one:
+  // it reads as "my pack is pinned" when the run used whatever
+  // `--fixtures-dir` happened to contain. Say so explicitly, the same way an
+  // `allow-empty` that cannot apply to the resolved engine is reported.
+  if (fixturesPackVersion !== undefined || fixturesPackProtocol !== undefined) {
+    core.info(
+      `"fixtures-pack-version"/"fixtures-pack-protocol" are accepted and validated, but not ` +
+        "forwarded to Canary: `stellar-canary check` loads fixtures only from a local " +
+        "--fixtures-dir and has no fixture-pack flag. This run used " +
+        `${JSON.stringify(fixturesDir)} as its fixtures directory.`,
+    );
+  }
 
   return {
     protocol,
@@ -46,7 +80,77 @@ export function getInputs(): ActionInputs {
     annotations,
     timeoutMinutes,
     allowEmpty,
+    fixturesPackVersion,
+    fixturesPackProtocol,
   };
+}
+
+/**
+ * Validates the "fixtures-pack-version" input as a published fixture-pack
+ * release tag; `undefined` when unset. Throws {@link InvalidInputError},
+ * naming the input and an accepted example, for anything else.
+ *
+ * The validated value is returned as written (only surrounding whitespace
+ * trimmed) rather than normalized the way `version` is, because it identifies
+ * an already-published pack release: there is no tag to reconstruct from it,
+ * and stripping a leading `v` would lose the caller's exact token.
+ *
+ * **Not forwarded to the CLI.** `stellar-canary check` has no fixture-pack
+ * flag: its fixture-loading contract accepts a local path via `--fixtures-dir`
+ * and states there is "no other loading mechanism — no network fetch, no
+ * package registry, no database", with remote bundles fetched by version
+ * explicitly out of scope upstream for now
+ * (`Protocol-Canary`'s `docs/fixture-contract.md`, sections 1 and 8). Parsing
+ * and validating the input here is what the issue asks for; wiring it to the
+ * invocation has to wait for an upstream flag to forward it to. See the
+ * informational note in {@link getInputs}.
+ */
+function parseFixturesPackVersion(raw: string): string | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!PACK_VERSION_LIKE.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-pack-version" input: ${JSON.stringify(value)}. ` +
+        'Expected a fixture-pack release tag, e.g. "v1.2.0" or "1.2.0" ' +
+        "(an unpinned value such as \"latest\" or \"main\" is not accepted).",
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the "fixtures-pack-protocol" input as a **positive** integer
+ * string; `undefined` when unset. Throws {@link InvalidInputError}, naming the
+ * input and an accepted example, for anything else.
+ *
+ * Unlike the `protocol` input — which accepts `0` because a non-negative
+ * integer is the right shape there — zero is rejected here: a pack pinned to
+ * protocol 0 is not a pack anyone publishes, so accepting it would only defer
+ * the error to somewhere less actionable.
+ *
+ * Not forwarded to the CLI, for the same reason as
+ * {@link parseFixturesPackVersion}.
+ */
+function parseFixturesPackProtocol(raw: string): number | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!PROTOCOL_LIKE.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-pack-protocol" input: ${JSON.stringify(value)}. Expected a positive integer, e.g. "28".`,
+    );
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (parsed <= 0 || !Number.isSafeInteger(parsed)) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-pack-protocol" input: ${JSON.stringify(value)}. ` +
+        "Expected a positive integer that fits in a JavaScript safe integer, e.g. \"28\".",
+    );
+  }
+  return parsed;
 }
 
 /** Normalizes a raw Action input: returns undefined for an empty or

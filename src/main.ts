@@ -4,13 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { uploadReport } from "./artifact";
-import { emitAnnotations, emitExecutionFailureAnnotation } from "./annotations";
+import { emitAnnotations, emitExecutionFailureAnnotation, emitExitFailureAnnotation } from "./annotations";
 import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "./canary";
 import { describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
-import { describeExitCode, parseReport } from "./output";
-import { buildCheckArgs, engineSupportsAllowEmpty, runCheck } from "./runner";
+import { countReplayed, describeExitCode, parseReport } from "./output";
+import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck } from "./runner";
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
 
@@ -46,7 +46,7 @@ function artifactDifferentiator(inputs: ActionInputs): string | undefined {
 async function handleExecutionFailure(reason: string, diagnostic: string, annotate: boolean): Promise<void> {
   core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${reason}`);
   if (annotate) {
-    emitExecutionFailureAnnotation(reason);
+    emitExecutionFailureAnnotation(reason, diagnostic);
   }
   try {
     await writeSummary(renderExecutionFailureMarkdown(reason, diagnostic));
@@ -58,6 +58,7 @@ async function handleExecutionFailure(reason: string, diagnostic: string, annota
   core.setOutput("warnings", "0");
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
+  core.setOutput("replayed-count", "0");
 }
 
 /**
@@ -151,6 +152,17 @@ export async function run(): Promise<void> {
 
   if (inputs.annotations) {
     emitAnnotations(report);
+    if (execution.exitCode !== 0) {
+      // The engine's own exit code failed the run (#351): annotate the root
+      // diagnostic from stderr, falling back to the failing result the
+      // report itself carries (engines report some failures there only),
+      // and finally to nothing — never a fabricated reason.
+      const rootResult =
+        report.results.find((r) => r.status === "fail") ?? report.results.find((r) => r.status === "error");
+      const reportDiagnostic =
+        rootResult !== undefined ? `${rootResult.testId} (${rootResult.surface}): ${rootResult.summary}` : "";
+      emitExitFailureAnnotation(execution.exitCode, extractDiagnostic(execution.stderr) || reportDiagnostic);
+    }
   }
 
   try {
@@ -164,6 +176,7 @@ export async function run(): Promise<void> {
   core.setOutput("warnings", String(report.counts.warnings));
   core.setOutput("failures", String(report.counts.failed));
   core.setOutput("errors", String(report.counts.errors));
+  core.setOutput("replayed-count", String(countReplayed(report)));
   core.setOutput("report", reportPath);
 
   if (inputs.uploadReport) {

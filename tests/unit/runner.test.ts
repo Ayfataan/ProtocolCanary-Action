@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
-import { buildCheckArgs, engineSupportsAllowEmpty, runCheck } from "../../src/runner";
+import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck } from "../../src/runner";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -56,6 +56,8 @@ const BASE_INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 15,
   allowEmpty: false,
+  fixturesPackVersion: undefined,
+  fixturesPackProtocol: undefined,
 };
 
 describe("buildCheckArgs", () => {
@@ -397,5 +399,44 @@ describe("runCheck timeout escalation", () => {
     // cleared when the process closed, or SIGKILL would appear here.
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(child.signals).toEqual(["SIGTERM"]);
+  });
+});
+
+describe("extractDiagnostic", () => {
+  // #351: failure annotations must carry the engine's root message, not a
+  // bare "Process exited with code N" — so the useful line has to be dug
+  // out of stderr that often leads with progress/banner noise.
+  it("prefers the root error line over surrounding noise (#351)", () => {
+    const stderr = [
+      "stellar-canary 0.2.0 (canary-cli)",
+      "loading fixtures from ./fixtures",
+      "error: configuration error: no checks ran: all 7 loaded fixtures were skipped",
+      "stack backtrace: ...",
+    ].join("\n");
+    expect(extractDiagnostic(stderr)).toBe(
+      "error: configuration error: no checks ran: all 7 loaded fixtures were skipped",
+    );
+  });
+
+  it("falls back to the first non-empty line when nothing reads as an error (#351)", () => {
+    expect(extractDiagnostic("\n\n   just context   \nmore detail\n")).toBe("just context");
+  });
+
+  it("honors other root-message prefixes the engine uses (#351)", () => {
+    expect(extractDiagnostic("no checks ran: empty plan")).toBe("no checks ran: empty plan");
+    expect(extractDiagnostic("panic: thread main panicked")).toBe("panic: thread main panicked");
+    expect(extractDiagnostic("Invalid fixture: bad xdr")).toBe("Invalid fixture: bad xdr");
+  });
+
+  it("returns an empty string for empty or whitespace-only stderr (#351)", () => {
+    expect(extractDiagnostic("")).toBe("");
+    expect(extractDiagnostic("  \n \t \n")).toBe("");
+  });
+
+  it("truncates a very long diagnostic to the documented bound (#351)", () => {
+    const long = `error: ${"x".repeat(5_000)}`;
+    const diagnostic = extractDiagnostic(long);
+    expect(diagnostic.length).toBe(500);
+    expect(diagnostic.startsWith("error: ")).toBe(true);
   });
 });

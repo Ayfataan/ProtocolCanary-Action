@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 
 import { SummaryPublishFailedError } from "./errors";
+import { countReplayed } from "./output";
 import type { CanaryReport, OverallStatus, Surface } from "./output";
 
 const SURFACE_HEADINGS: Readonly<Record<Surface, string>> = {
@@ -172,6 +173,15 @@ function summaryPreamble(report: CanaryReport): string[] {
 
   lines.push("### Result", "", OVERALL_LABEL[report.status], "");
   lines.push(`${String(report.counts.passed)}/${String(report.counts.total)} applicable checks passed.`, "");
+  const replayed = countReplayed(report);
+  if (replayed > 0) {
+    const total = report.counts.total;
+    const percent = total > 0 ? Math.round((replayed / total) * 100) : 0;
+    lines.push(
+      `> ♻️ **Replayed from cache:** ${String(replayed)}/${String(total)} checks (${String(percent)}%) came from the engine's result cache rather than being executed in this run.`,
+      "",
+    );
+  }
   return lines;
 }
 
@@ -265,17 +275,20 @@ function renderTruncatedSummary(report: CanaryReport): string {
     if (section.entries.length === 0 || first === undefined) {
       continue;
     }
-    // Admit the section only if its heading, one entry, the omission marker and
-    // the trailer all fit together. A section that cannot show a single entry
-    // is dropped whole rather than rendered as a bare heading whose only
-    // content is an "N omitted" marker — which is also what the untruncated
-    // renderer does with an entryless section.
+    // Prefer showing the first whole entry, but if it cannot fit, retain the
+    // section heading and omission marker whenever those fit. Otherwise the
+    // highest-priority dropped failures could disappear without any count.
     //
     // Entries are then kept as a prefix in report order: the first oversized
     // entry ends the section instead of being skipped over in favour of a
     // smaller later one, which keeps the output predictable.
     const worstCaseMarker = omittedMarker(section.entries.length, section.noun);
     if (!fits([...section.heading, ...first, worstCaseMarker, ...section.trailer])) {
+      if (fits([...section.heading, worstCaseMarker, ...section.trailer])) {
+        push(section.heading);
+        push([worstCaseMarker]);
+        push(section.trailer);
+      }
       continue;
     }
 

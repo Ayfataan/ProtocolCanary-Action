@@ -1,8 +1,21 @@
+import type * as actionsCore from "@actions/core";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// vi.mock is hoisted above the imports, so the spy must be too. Only `info` is
+// replaced: the whole suite reads inputs through the real `core.getInput`, and
+// CONTRIBUTING's partial-mock convention requires spreading the real module so
+// everything else keeps working. `vi.spyOn` cannot be used here because an ESM
+// namespace object is not configurable.
+const { infoMock } = vi.hoisted(() => ({ infoMock: vi.fn() }));
+
+vi.mock("@actions/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof actionsCore>();
+  return { ...actual, info: infoMock };
+});
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
 import { getInputs } from "../../src/inputs";
@@ -18,6 +31,8 @@ const INPUT_KEYS = [
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
+  "INPUT_FIXTURES-PACK-VERSION",
+  "INPUT_FIXTURES-PACK-PROTOCOL",
 ];
 
 function clearInputs(): void {
@@ -43,6 +58,8 @@ describe("getInputs", () => {
       annotations: true,
       timeoutMinutes: 15,
       allowEmpty: false,
+      fixturesPackVersion: undefined,
+      fixturesPackProtocol: undefined,
     });
   });
 
@@ -229,5 +246,161 @@ describe("getInputs", () => {
   it("rejects an undocumented allow-empty form and names the input", () => {
     process.env["INPUT_ALLOW-EMPTY"] = "1";
     expect(() => getInputs()).toThrow(/"allow-empty"/);
+  });
+});
+
+/**
+ * #337: `fixtures-pack-version` / `fixtures-pack-protocol`. They are declared
+ * and validated here; they are deliberately *not* forwarded to Canary, whose
+ * fixture-loading contract has no fixture-pack flag (see the parser's doc
+ * comment), so these tests pin parsing, validation, and the "no silent
+ * no-op" note rather than any CLI argument.
+ */
+describe("getInputs fixtures-pack inputs (#337)", () => {
+  beforeEach(clearInputs);
+  // Reset alongside the inputs so one test's log note cannot satisfy another
+  // test's assertion.
+  afterEach(() => {
+    clearInputs();
+    infoMock.mockReset();
+  });
+
+  it("leaves both inputs undefined when omitted, preserving default behavior", () => {
+    const inputs = getInputs();
+    expect(inputs.fixturesPackVersion).toBeUndefined();
+    expect(inputs.fixturesPackProtocol).toBeUndefined();
+    // Nothing else about the run changes when the new inputs are absent.
+    expect(inputs.fixturesDir).toBe("fixtures");
+    expect(inputs.protocol).toBeUndefined();
+  });
+
+  it("treats a whitespace-only value as unset rather than rejecting it", () => {
+    // Consistent with the other optional inputs: an unset input written as
+    // `fixtures-pack-version: ""` must not fail the run.
+    process.env["INPUT_FIXTURES-PACK-VERSION"] = "   ";
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "   ";
+    const inputs = getInputs();
+    expect(inputs.fixturesPackVersion).toBeUndefined();
+    expect(inputs.fixturesPackProtocol).toBeUndefined();
+  });
+
+  it.each([
+    ["1.2.3", "1.2.3"],
+    ["v1.2.3", "v1.2.3"],
+    ["0.0.1", "0.0.1"],
+    ["v10.20.30", "v10.20.30"],
+    ["v1.2.3-rc.1", "v1.2.3-rc.1"],
+    ["1.2.3+build.5", "1.2.3+build.5"],
+  ])("accepts fixture-pack-version %s", (raw, expected) => {
+    process.env["INPUT_FIXTURES-PACK-VERSION"] = raw;
+    expect(getInputs().fixturesPackVersion).toBe(expected);
+  });
+
+  it("trims surrounding whitespace from fixtures-pack-version", () => {
+    process.env["INPUT_FIXTURES-PACK-VERSION"] = "  v1.2.0  ";
+    expect(getInputs().fixturesPackVersion).toBe("v1.2.0");
+  });
+
+  it.each([
+    "latest",
+    "main",
+    "1.2",
+    "v1",
+    "1.2.3.4",
+    "not-a-version",
+    "v1.2.0 with spaces",
+    "1.2.3; rm -rf /",
+  ])("rejects fixture-pack-version %s and names the input", (raw) => {
+    process.env["INPUT_FIXTURES-PACK-VERSION"] = raw;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"fixtures-pack-version"/);
+  });
+
+  it("rejects a fixture-pack-version that is only a v prefix", () => {
+    process.env["INPUT_FIXTURES-PACK-VERSION"] = "v";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+  });
+
+  it.each([
+    ["28", 28],
+    ["1", 1],
+    ["27", 27],
+  ])("accepts fixtures-pack-protocol %s", (raw, expected) => {
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = raw;
+    expect(getInputs().fixturesPackProtocol).toBe(expected);
+  });
+
+  it("rejects fixtures-pack-protocol 0, unlike the protocol input", () => {
+    // The two inputs differ deliberately: `protocol` accepts 0 because a
+    // non-negative integer is the right shape there, while a pack "pinned to
+    // protocol 0" is not something anyone publishes. Pin that difference so a
+    // future refactor cannot silently unify the two validators.
+    process.env.INPUT_PROTOCOL = "0";
+    expect(getInputs().protocol).toBe(0);
+
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "0";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"fixtures-pack-protocol"/);
+  });
+
+  it.each(["-1", "28.5", "twenty-eight", "28 28", "1e3", "+28", "0x1c"])(
+    "rejects fixtures-pack-protocol %s and names the input",
+    (raw) => {
+      process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"fixtures-pack-protocol"/);
+    },
+  );
+
+  it("treats an empty fixtures-pack-protocol as unset rather than rejecting it", () => {
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "";
+    expect(getInputs().fixturesPackProtocol).toBeUndefined();
+  });
+
+  it("rejects a fixtures-pack-protocol too large to be a safe integer", () => {
+    // Digits-only passes the shape check, so this is the branch that catches a
+    // value which would silently lose precision through parseInt.
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "9".repeat(30);
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/safe integer/);
+  });
+
+  it("reports the offending value in the error so the mistake is actionable", () => {
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "twenty-eight";
+    // The message must quote what was actually received, not just what was
+    // expected, or a user cannot tell which of several inputs is wrong.
+    expect(() => getInputs()).toThrow(/"twenty-eight"/);
+    expect(() => getInputs()).toThrow(/positive integer/);
+  });
+
+  it("logs a note when a pack input is set, so it is not a silent no-op", () => {
+    // These inputs cannot be forwarded to Canary yet. A caller who sets one
+    // must be told that the run did not use it, instead of reading a clean
+    // run as "my pack is pinned".
+    process.env["INPUT_FIXTURES-PACK-VERSION"] = "v1.2.0";
+    getInputs();
+    const note = infoMock.mock.calls
+      .map((call) => String(call[0]))
+      .find((message) => message.includes("fixtures-pack-version"));
+    expect(note).toBeDefined();
+    expect(note).toContain("not forwarded");
+    expect(note).toContain("--fixtures-dir");
+  });
+
+  it("logs the note when only fixtures-pack-protocol is set", () => {
+    process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "28";
+    getInputs();
+    const mentions = infoMock.mock.calls
+      .map((call) => String(call[0]))
+      .filter((message) => message.includes("fixtures-pack"));
+    expect(mentions).toHaveLength(1);
+  });
+
+  it("stays silent when neither pack input is set", () => {
+    getInputs();
+    const mentions = infoMock.mock.calls
+      .map((call) => String(call[0]))
+      .filter((message) => message.includes("fixtures-pack"));
+    expect(mentions).toHaveLength(0);
   });
 });

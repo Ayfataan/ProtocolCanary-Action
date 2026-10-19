@@ -6,6 +6,16 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `fixtures-pack-version` and `fixtures-pack-protocol` inputs, validated when
+  set: the version must be a published pack release tag (`v1.2.0` or
+  `1.2.0`, with an unpinned value such as `latest`/`main` rejected) and the
+  protocol a positive integer, so `0` — which the `protocol` input accepts —
+  is refused here. Both are currently **not forwarded** to Canary: its
+  fixture-loading contract accepts a local path via `--fixtures-dir` and
+  defines no other loading mechanism, with remote bundles fetched by version
+  explicitly out of scope upstream for now. The Action logs a note naming the
+  fixtures directory it actually used, so a set-but-unused input cannot be
+  mistaken for a pinned pack ([#337]).
 - `allow-empty` input (default `false`). It forwards `--allow-empty` to Protocol-Canary
   `0.2.0` and newer, which fail a run that executes no checks. With an older `version`
   the flag is not forwarded, because those versions already pass an empty run and would
@@ -13,6 +23,13 @@ All notable changes to this project are documented in this file.
   so existing workflows behave exactly as before.
 - `tests/integration/real-engine.test.ts` and the manual workflow `engine-compat.yml`
   run the Action against real Protocol-Canary builds instead of the mock engine.
+- `replayed-count` output (#350): how many of the run's results were replayed
+  from Protocol Canary's result cache (`source: "cache"`, or an equivalent
+  `replayed`/`cached` flag) instead of executed in this run. The job summary
+  shows a "Replayed from cache" footnote with the count and percentage when
+  any result was replayed; reports from engines without the cache always
+  report `0`. Like the other counts, it is explicitly set to `0` on an
+  execution failure.
 
 ### Fixed
 
@@ -36,6 +53,23 @@ All notable changes to this project are documented in this file.
   the diagnostic still renders as a single well-formed code block instead of
   closing the fence early and spilling broken markdown into the summary
   ([#269]).
+- Reports containing duplicate result identities — the same
+  `(surface, fixtureId)` pair (`testId` when `fixtureId` is null) appearing
+  twice — are now rejected at parse time with `InvalidReportError`, naming
+  the exact duplicate identity and surface, per CF-01 section 4; such a
+  report can no longer skew derived counts or mask a failure behind a copy
+  of a passing result (#349).
+- Failure annotations now show the engine's root diagnostic (taken from
+  stderr, falling back to the failing result in the report) and classify the
+  exit code accurately: exit code 1 as test failures detected, exit code 2
+  as the regression gate / invalid configuration, exit code 3 as an
+  unexpected runtime crash — never as a regression. The matching
+  `describeExitCode` descriptions were corrected the same way (#351).
+- The weekly live integration workflow was repaired for Protocol 29 and
+  renamed `integration.yml` → `weekly-live.yml`: same weekly cron plus
+  manual dispatch, Testnet/Futurenet RPC endpoints with their documented
+  network passphrases, and a failure notification that fails safely with a
+  clear summary when a remote endpoint is unreachable (#352).
 
 ### Documentation
 

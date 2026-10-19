@@ -224,6 +224,56 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).toContain("#### Warnings");
     expect(markdown).not.toContain("#### Failures");
   });
+
+  // #350: fixtures/results served from the engine's cache must be called out
+  // so a reader can tell cache reuse from fresh execution.
+  it("renders a replayed-from-cache badge with count and percentage (#350)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", source: "cache" }),
+          result({ testId: "b", surface: "xdr", fixtureId: "b", source: "cache" }),
+          result({ testId: "c", surface: "rpc", fixtureId: "c", source: "live" }),
+          result({ testId: "d", surface: "rpc", fixtureId: "d" }),
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("Replayed from cache");
+    expect(markdown).toContain("2/4 checks (50%)");
+    expect(markdown).toContain("♻️");
+  });
+
+  it("renders no cache badge when nothing was replayed (#350)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", source: "live" }),
+          result({ testId: "b", surface: "rpc", fixtureId: "b", source: "live" }),
+        ],
+      }),
+    );
+    expect(markdown).not.toContain("Replayed from cache");
+    expect(markdown).toContain("2/2 applicable checks passed.");
+  });
+
+  it("defaults to zero replayed checks (no badge, no throw) for reports without any replayed field (#350)", () => {
+    // Reports from engines that predate the cache carry no source/replayed
+    // attributes at all; rendering must be unaffected.
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", surface: "xdr", fixtureId: "a" })],
+      }),
+    );
+    expect(markdown).not.toContain("Replayed from cache");
+    expect(markdown).toContain("1/1 applicable checks passed.");
+  });
 });
 
 /**
@@ -448,7 +498,7 @@ describe("renderSummaryMarkdown size limit (#334)", () => {
     expect(markdown).toContain(TRUNCATION_NOTICE);
   });
 
-  it("drops warnings entirely when the failures alone exhaust the budget", () => {
+  it("reports omitted warnings when failures leave no room for warning entries", () => {
     // The mirror case: when the high-priority regressions fill the budget, the
     // verbose sections must yield rather than push the payload over the
     // ceiling. The failures are many and small so the leftover slack is under
@@ -484,14 +534,15 @@ describe("renderSummaryMarkdown size limit (#334)", () => {
     expect(markdown).toContain("#### Failures");
     expect(markdown).toContain("- `fail-0` (xdr) — mismatch — ");
     expect(markdown).toMatch(/\d+ more failing checks omitted/);
-    // ...and the warnings section, having no budget left, was dropped whole
-    // rather than rendered as an empty heading.
-    expect(markdown).not.toContain("#### Warnings");
+    // ...and the warnings section has no room for its first entry, so it
+    // reports the omission without leaking a partial warning.
+    expect(markdown).toContain("#### Warnings");
+    expect(markdown).toMatch(/1 more warnings omitted/);
     expect(markdown).not.toContain("- `a-warning`");
     expect(markdown).toContain(TRUNCATION_NOTICE);
   });
 
-  it("drops an entry larger than the whole budget rather than cutting it", () => {
+  it("reports an omitted count when the first entry cannot fit rather than cutting it", () => {
     // A single result whose summary exceeds the entire ceiling cannot be kept
     // whole. Cutting it mid-string would produce exactly the malformed
     // Markdown the issue asks to avoid, so the section is dropped rather than
@@ -513,11 +564,11 @@ describe("renderSummaryMarkdown size limit (#334)", () => {
     );
 
     expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
-    // No fragment of the oversized entry leaks through.
+    // No fragment of the oversized entry leaks through, but its omission is
+    // still explicit even though it was the first entry in the section.
     expect(markdown).not.toContain("ffff");
-    // A section that could show nothing at all is dropped whole, rather than
-    // left as a heading whose only content is an omission marker.
-    expect(markdown).not.toContain("#### Failures");
+    expect(markdown).toContain("#### Failures");
+    expect(markdown).toContain("1 more failing checks omitted");
     // The verdict survives regardless.
     expect(markdown).toContain("0/1 applicable checks passed.");
     expect(markdown).toContain("❌ **NOT READY**");
