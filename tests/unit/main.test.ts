@@ -121,6 +121,7 @@ const INPUTS: ActionInputs = {
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
   githubToken: undefined,
+  engineEnvPassthrough: [],
   generateReceipt: false,
 };
 
@@ -176,7 +177,12 @@ describe("run", () => {
     await run();
 
     expect(runCheckMock).toHaveBeenCalledTimes(1);
-    expect(runCheckMock).toHaveBeenCalledWith(BINARY_PATH, expect.arrayContaining(["check", "--format", "json"]), 60_000);
+    expect(runCheckMock).toHaveBeenCalledWith(
+      BINARY_PATH,
+      expect.arrayContaining(["check", "--format", "json"]),
+      60_000,
+      { env: expect.any(Object) },
+    );
   });
 
   it("forwards --allow-empty only when the resolved engine supports it", async () => {
@@ -204,7 +210,44 @@ describe("run", () => {
     await run();
 
     expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
-    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined);
+    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined, expect.any(Object));
+  });
+
+  // #433: the same filtered environment reaches both `cargo install` and the
+  // engine, the passthrough adds exactly the requested name, and the only
+  // thing logged is that name — never its value and never another secret.
+  it("passes the filtered engine environment to both cargo install and the engine, logging names only", async () => {
+    const previousLibraryPath = process.env.LD_LIBRARY_PATH;
+    process.env.LD_LIBRARY_PATH = "/opt/private/lib";
+    process.env.MY_SERVICE_TOKEN = "service-secret";
+    try {
+      getInputsMock.mockReturnValue({ ...INPUTS, engineEnvPassthrough: ["LD_LIBRARY_PATH"] });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      const installEnv = ensureCanaryInstalledMock.mock.calls[0]?.[3] as Record<string, string>;
+      const engineEnv = runCheckMock.mock.calls[0]?.[3]?.env as Record<string, string>;
+      for (const env of [installEnv, engineEnv]) {
+        expect(env.LD_LIBRARY_PATH).toBe("/opt/private/lib");
+        expect(env).not.toHaveProperty("MY_SERVICE_TOKEN");
+        expect(env).not.toHaveProperty("GITHUB_TOKEN");
+        expect(env).not.toHaveProperty("ACTIONS_RUNTIME_TOKEN");
+      }
+
+      const forwardedLog = infoMock.mock.calls
+        .map((call) => String(call[0]))
+        .find((message) => message.includes("engine-env-passthrough"));
+      expect(forwardedLog).toContain("LD_LIBRARY_PATH");
+      expect(forwardedLog).not.toContain("/opt/private/lib");
+    } finally {
+      if (previousLibraryPath === undefined) {
+        delete process.env.LD_LIBRARY_PATH;
+      } else {
+        process.env.LD_LIBRARY_PATH = previousLibraryPath;
+      }
+      delete process.env.MY_SERVICE_TOKEN;
+    }
   });
 
   // #271, branch 1: a child killed by a signal closes with a null exit code,
@@ -394,6 +437,7 @@ describe("run", () => {
       expect.anything(),
       60_000,
       "ghp_custom123",
+      expect.any(Object),
     );
   });
 

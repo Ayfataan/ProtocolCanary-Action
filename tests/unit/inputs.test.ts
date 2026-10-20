@@ -38,6 +38,7 @@ const INPUT_KEYS = [
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
+  "INPUT_ENGINE-ENV-PASSTHROUGH",
   "INPUT_GENERATE-RECEIPT",
 ];
 
@@ -70,6 +71,7 @@ describe("getInputs", () => {
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       githubToken: undefined,
+      engineEnvPassthrough: [],
       generateReceipt: false,
     });
   });
@@ -487,5 +489,98 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       expect(inputs.githubToken).toBeUndefined();
       expect(setSecretMock).not.toHaveBeenCalled();
     });
+  });
+});
+
+// Issue #433: `engine-env-passthrough` is a strictly validated, names-only
+// opt-in. Anything denied by the default allow-list's deny rules must fail
+// here, naming the variable and never echoing a value.
+describe("engine-env-passthrough", () => {
+  beforeEach(clearInputs);
+  afterEach(clearInputs);
+
+  function parse(raw: string): readonly string[] {
+    process.env["INPUT_ENGINE-ENV-PASSTHROUGH"] = raw;
+    return getInputs().engineEnvPassthrough;
+  }
+
+  it("defaults to an empty list", () => {
+    expect(getInputs().engineEnvPassthrough).toEqual([]);
+  });
+
+  it("accepts comma- and newline-separated names, trimming whitespace", () => {
+    expect(parse("LD_LIBRARY_PATH, OPENSSL_DIR\nRUSTUP_DIST_SERVER")).toEqual([
+      "LD_LIBRARY_PATH",
+      "OPENSSL_DIR",
+      "RUSTUP_DIST_SERVER",
+    ]);
+  });
+
+  it("ignores an empty list", () => {
+    expect(parse(" , \n ")).toEqual([]);
+  });
+
+  it("accepts exactly 16 names", () => {
+    const names = Array.from({ length: 16 }, (_, i) => `VAR_${String(i)}`);
+    expect(parse(names.join(","))).toEqual(names);
+  });
+
+  it("rejects more than 16 names", () => {
+    const names = Array.from({ length: 17 }, (_, i) => `VAR_${String(i)}`);
+    expect(() => parse(names.join(","))).toThrow(InvalidInputError);
+    expect(() => parse(names.join(","))).toThrow(/at most 16/);
+  });
+
+  it.each([
+    ["wildcard", "X*"],
+    ["space", "HAS SPACE"],
+    ["leading digit", "1LEADING"],
+    ["empty-ish wildcard", "LD_LIBRARY_PATH*"],
+  ])("rejects a %s entry", (_kind, name) => {
+    expect(() => parse(name)).toThrow(InvalidInputError);
+    expect(() => parse(name)).toThrow(name);
+  });
+
+  it("rejects a name/value pair and never echoes the value", () => {
+    let message = "";
+    try {
+      parse("LD_LIBRARY_PATH=/opt/private/lib");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("LD_LIBRARY_PATH");
+    expect(message).not.toContain("/opt/private/lib");
+    expect(message).toContain("names only");
+  });
+
+  it("rejects the same name listed twice", () => {
+    expect(() => parse("LD_LIBRARY_PATH,LD_LIBRARY_PATH")).toThrow(InvalidInputError);
+    expect(() => parse("LD_LIBRARY_PATH\nLD_LIBRARY_PATH")).toThrow(/more than once/);
+  });
+
+  it.each([
+    "GITHUB_TOKEN",
+    "ACTIONS_RUNTIME_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "MY_SECRET",
+    "NPM_TOKEN",
+    "CARGO_REGISTRY_TOKEN",
+    "CARGO_REGISTRIES_FOO_TOKEN",
+  ])("rejects the denied name %s, naming it and never printing a value", (name) => {
+    let message = "";
+    try {
+      parse(name);
+    } catch (error) {
+      expect(error).toBeInstanceOf(InvalidInputError);
+      message = (error as Error).message;
+    }
+    expect(message).toContain(name);
+    expect(message).toContain("never passed");
+    expect(message).not.toContain("=");
+  });
+
+  it("does not let a denied name be restored through a lower-case spelling", () => {
+    expect(() => parse("github_token")).toThrow(InvalidInputError);
+    expect(() => parse("aws_secret_access_key")).toThrow(InvalidInputError);
   });
 });

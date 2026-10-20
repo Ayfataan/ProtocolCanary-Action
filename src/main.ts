@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { uploadReceipt, uploadReport } from "./artifact";
 import { emitAnnotations, emitExecutionFailureAnnotation, emitExitFailureAnnotation } from "./annotations";
 import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "./canary";
+import { buildChildEnvironment } from "./child-env";
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
@@ -96,6 +97,24 @@ export async function run(): Promise<void> {
     return;
   }
 
+  // Both `cargo` and the engine run with an explicit allow-list instead of
+  // the job environment: building a dependency tree executes arbitrary code
+  // from every crate, and the job may hold write permissions and secrets.
+  // `engine-env-passthrough` names are the only additions. Log the *names*
+  // that were forwarded (never their values) so the job log shows what left
+  // the Action.
+  const childEnvironment = buildChildEnvironment(
+    process.env,
+    process.platform,
+    inputs.engineEnvPassthrough,
+  );
+  if (childEnvironment.forwarded.length > 0) {
+    core.info(
+      `engine-env-passthrough: forwarding ${childEnvironment.forwarded.join(", ")} to cargo and ` +
+        "Protocol Canary (names only; values are never logged).",
+    );
+  }
+
   const resolved = await resolveVersion(inputs.version, { token: inputs.githubToken });
   core.info(
     `Stellar Protocol Canary Action\nCanary version: ${resolved.version} (${resolved.tag}${
@@ -109,6 +128,7 @@ export async function run(): Promise<void> {
       resolved,
       cargoInstallTimeoutMs(inputs.timeoutMinutes),
       inputs.githubToken,
+      childEnvironment.env,
     );
   } catch (error) {
     const diagnostic = error instanceof InstallationFailedError && error.diagnostic ? error.diagnostic : "";
@@ -127,7 +147,12 @@ export async function run(): Promise<void> {
 
   let execution;
   try {
-    execution = await runCheck(installed.binaryPath, buildCheckArgs(inputs, resolved.version), inputs.timeoutMinutes * 60_000);
+    execution = await runCheck(
+      installed.binaryPath,
+      buildCheckArgs(inputs, resolved.version),
+      inputs.timeoutMinutes * 60_000,
+      { env: childEnvironment.env },
+    );
   } catch (error) {
     const diagnostic = error instanceof TimeoutError && error.stderr ? error.stderr : "";
     if (error instanceof TimeoutError && error.stderr.trim() !== "") {

@@ -153,6 +153,25 @@ inputs:
     required: false
     default: ${{ github.token }}
 
+  engine-env-passthrough:
+    description: >-
+      Comma- or newline-separated list of exact environment variable names to
+      forward to `cargo install` and the Canary engine in addition to the
+      Action's default allow-list (for example
+      `LD_LIBRARY_PATH,OPENSSL_DIR`). Names only: wildcards and
+      `NAME=value` pairs are rejected, at most 16 names are accepted, and a
+      name that the Action denies (GITHUB_*/ACTIONS_*/RUNNER_*/INPUT_*,
+      cloud and npm credentials, Cargo registry credentials, or any name
+      containing TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, PRIVATE_KEY,
+      API_KEY, ACCESS_KEY, or SESSION) fails the run instead of being
+      forwarded. Each forwarded name is logged at info level — never its
+      value — so the job log shows what left the Action. Empty by default:
+      the child processes never inherit the job environment. See SECURITY.md
+      for the default allow-list and the compatibility and security
+      trade-offs.
+    required: false
+    default: ""
+
   generate-receipt:
     description: >-
       Generate a machine-readable Execution Receipt (`receiptVersion: 1`)

@@ -2,6 +2,7 @@ import * as core from "@actions/core";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { MAX_PASSTHROUGH_NAMES, PASSTHROUGH_NAME_PATTERN, isDeniedEnvName } from "./child-env";
 import { ConfigNotFoundError, InvalidInputError } from "./errors";
 
 export interface ActionInputs {
@@ -25,6 +26,12 @@ export interface ActionInputs {
   readonly fixturesPackProtocol: number | undefined;
   /** GitHub token for authenticating read-only API calls (tag and checksum lookups). */
   readonly githubToken: string | undefined;
+  /**
+   * Exact environment variable names forwarded to `cargo` and the engine in
+   * addition to the default allow-list (`engine-env-passthrough`). Empty
+   * unless the workflow asks for it; never includes a denied name.
+   */
+  readonly engineEnvPassthrough: readonly string[];
   /** Opt in to producing an Execution Receipt (#360) and exporting it as a
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
@@ -80,6 +87,7 @@ export function getInputs(): ActionInputs {
   const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
   const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
   const githubToken = resolveGithubToken(core.getInput("github-token"));
+  const engineEnvPassthrough = parseEngineEnvPassthrough(core.getInput("engine-env-passthrough"));
 
   if (githubToken !== undefined) {
     core.setSecret(githubToken);
@@ -113,8 +121,97 @@ export function getInputs(): ActionInputs {
     fixturesPackVersion,
     fixturesPackProtocol,
     githubToken,
+    engineEnvPassthrough,
     generateReceipt,
   };
+}
+
+/**
+ * Parses the "engine-env-passthrough" input: a comma- or newline-separated
+ * list of exact environment variable names to forward to `cargo` and the
+ * engine on top of the default allow-list.
+ *
+ * Rules (see SECURITY.md and README.md):
+ *
+ * - names only — no wildcards, no `=value` pairs;
+ * - each name matches `^[A-Za-z_][A-Za-z0-9_]*$`;
+ * - at most {@link MAX_PASSTHROUGH_NAMES} names, no duplicates;
+ * - anything denied by {@link isDeniedEnvName} (GITHUB_*, ACTIONS_*,
+ *   RUNNER_*, INPUT_*, cloud/npm credential families, Cargo registry
+ *   credentials, or a name containing TOKEN/SECRET/PASSWORD/… ) is rejected.
+ *
+ * Errors name the offending variable and never print a value. A malformed
+ * entry such as `LD_LIBRARY_PATH=/opt/lib` is reported by its name, with the
+ * value elided, so a secret pasted in the wrong place cannot reach the job
+ * log. An empty or whitespace-only input yields no names.
+ */
+export function parseEngineEnvPassthrough(raw: string): string[] {
+  const value = optional(raw);
+  if (value === undefined) {
+    return [];
+  }
+
+  const names = value
+    .split(/[\n,]/)
+    .map((name) => name.trim())
+    .filter((name) => name !== "");
+
+  if (names.length > MAX_PASSTHROUGH_NAMES) {
+    throw new InvalidInputError(
+      `Invalid "engine-env-passthrough" input: ${String(names.length)} variable names were given, ` +
+        `but at most ${String(MAX_PASSTHROUGH_NAMES)} are accepted.`,
+    );
+  }
+
+  const seen = new Set<string>();
+  const accepted: string[] = [];
+  for (const name of names) {
+    if (!PASSTHROUGH_NAME_PATTERN.test(name)) {
+      throw new InvalidInputError(
+        `Invalid "engine-env-passthrough" input: ${describePassthroughEntry(name)}. Expected an ` +
+          'environment variable name, e.g. "LD_LIBRARY_PATH", not a wildcard or a name/value pair ' +
+          "(names only; values are read from the workflow environment).",
+      );
+    }
+
+    // Windows environment names are case-insensitive, so `PATH,path` is the
+    // same variable twice there.
+    const key = process.platform === "win32" ? name.toUpperCase() : name;
+    if (seen.has(key)) {
+      throw new InvalidInputError(
+        `Invalid "engine-env-passthrough" input: ${JSON.stringify(name)} is listed more than once.`,
+      );
+    }
+    seen.add(key);
+
+    if (isDeniedEnvName(name)) {
+      throw new InvalidInputError(
+        `Invalid "engine-env-passthrough" input: ${JSON.stringify(name)} is never passed to child ` +
+          "processes. GitHub/Actions/runner variables, cloud and npm credentials, Cargo registry " +
+          "credentials, and any name containing TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, " +
+          "PRIVATE_KEY, API_KEY, ACCESS_KEY, or SESSION are denied by default and cannot be " +
+          "restored through this input. Use a different mechanism for a credential the build " +
+          "genuinely needs, and accept the documented risk — this input is not that mechanism.",
+      );
+    }
+
+    accepted.push(name);
+  }
+
+  return accepted;
+}
+
+/**
+ * Renders a rejected passthrough entry for an error message: the name only.
+ * When the entry looks like `NAME=value`, the value is elided so it never
+ * reaches the job log.
+ */
+function describePassthroughEntry(entry: string): string {
+  const separator = entry.indexOf("=");
+  if (separator === -1) {
+    return JSON.stringify(entry);
+  }
+  return `${JSON.stringify(entry.slice(0, separator))} (a value was supplied; this input takes names only)`;
 }
 
 /**

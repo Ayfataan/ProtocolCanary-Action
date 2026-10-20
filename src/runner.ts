@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 
+import type { ChildProcessEnvironment } from "./child-env";
+import { buildChildEnvironment } from "./child-env";
 import type { ActionInputs } from "./inputs";
 import { CanaryExecutionFailedError, TimeoutError } from "./errors";
 
@@ -166,6 +168,23 @@ function sliceTailSafely(str: string, maxBytes: number): string {
  */
 export const CARGO_INSTALL_TIMEOUT_FLOOR_MS = 60_000;
 
+/** Options for {@link runCheck}. */
+export interface RunCheckOptions {
+  /**
+   * How long the child is given to exit after `SIGTERM` before `SIGKILL`.
+   * Defaults to {@link SIGKILL_GRACE_MS}; tests shorten it.
+   */
+  readonly sigkillGraceMs?: number;
+  /**
+   * Environment for the child. Defaults to the default allow-list built from
+   * `process.env` (no passthrough), so a caller that forgets to pass one
+   * still never hands the job environment to the child (see
+   * `src/child-env.ts`). `main.ts` and `cargoInstall` pass the filtered
+   * environment built from `engine-env-passthrough`.
+   */
+  readonly env?: ChildProcessEnvironment;
+}
+
 /**
  * Runs a Canary binary with the given arguments, capturing stdout and
  * stderr separately, enforcing `timeoutMs`, and forwarding cancellation
@@ -178,20 +197,26 @@ export const CARGO_INSTALL_TIMEOUT_FLOOR_MS = 60_000;
  * function. It throws only when the process could not be run at all, or
  * was killed for exceeding its timeout.
  *
- * Takes `args`, `timeoutMs`, and the `sigkillGraceMs` grace period
- * directly (rather than an `ActionInputs`) so it can be exercised in
- * tests without minute-granularity timeouts; `main.ts` is the only caller
- * that derives these from real inputs, and it relies on the default grace
- * period.
+ * Takes `args`, `timeoutMs`, and the runner options directly (rather than
+ * an `ActionInputs`) so it can be exercised in tests without
+ * minute-granularity timeouts; `main.ts` is the only caller that derives
+ * these from real inputs.
+ *
+ * A child environment is *always* passed to `spawn` (never inherited
+ * implicitly): `options.env` when given, otherwise the default allow-list.
+ * Compiling a dependency tree runs arbitrary code from every crate, so the
+ * child must not see the job's secrets by default.
  */
 export function runCheck(
   binaryPath: string,
   args: readonly string[],
   timeoutMs: number,
-  sigkillGraceMs: number = SIGKILL_GRACE_MS,
+  options: RunCheckOptions = {},
 ): Promise<CheckExecutionResult> {
+  const sigkillGraceMs = options.sigkillGraceMs ?? SIGKILL_GRACE_MS;
+  const childEnv = options.env ?? buildChildEnvironment(process.env, process.platform).env;
   return new Promise((resolve, reject) => {
-    const child = spawn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
 
     if (typeof child.stdout?.setEncoding === "function") {
       child.stdout.setEncoding("utf8");

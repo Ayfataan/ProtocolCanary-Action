@@ -87,6 +87,7 @@ import { CANARY_API_REPO_URL, CANARY_REPO_URL } from "../../src/version";
 interface ExecCallOptions {
   readonly ignoreReturnCode?: boolean;
   readonly silent?: boolean;
+  readonly env?: Readonly<Record<string, string>>;
   readonly listeners?: { readonly stdout?: (data: Buffer) => void };
 }
 
@@ -378,6 +379,28 @@ describe("ensureCanaryInstalled", () => {
     // timeout support and is used only for the quick version probes.
     expect(execCalls.some((call) => call.args[0] === "install")).toBe(false);
     expect(coreMocks.warningMock).not.toHaveBeenCalled();
+  });
+
+  // #433: both cargo children (the `--version` probe and the source build)
+  // run with exactly the filtered environment the caller supplies — never
+  // `process.env`. `runCheck`'s own process-level proof lives in
+  // runner.test.ts; this pins the wiring from ensureCanaryInstalled.
+  it("runs the cargo version probe and cargo install with the supplied child environment", async () => {
+    const childEnv = {
+      PATH: process.env.PATH ?? "/usr/bin",
+      CARGO_HOME: tempCargoHome,
+      LD_LIBRARY_PATH: "/opt/lib",
+    };
+
+    await ensureCanaryInstalled(RESOLVED, 60_000, undefined, childEnv);
+
+    const probe = execCalls.find((call) => call.command === "cargo" && call.args[0] === "--version");
+    expect(probe?.options.env).toEqual(childEnv);
+
+    const install = spawnMock.mock.calls.find(
+      (call) => call[0] === "cargo" && (call[1] as string[])[0] === "install",
+    );
+    expect(install?.[2]).toMatchObject({ env: childEnv });
   });
 
   it("installs with `--tag <tag>` and warns when the commit could not be resolved", async () => {

@@ -7,6 +7,8 @@ import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { ChildProcessEnvironment } from "./child-env";
+import { buildChildEnvironment } from "./child-env";
 import {
   CanaryExecutionFailedError,
   CanaryNotFoundError,
@@ -399,13 +401,20 @@ async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersi
  * binary actually match the request?" decision in the install chain.
  * Returns `undefined` when the binary cannot be executed or exits non-zero,
  * which callers treat as "not usable" and fall through to the next step.
+ *
+ * The probe runs with the filtered child environment: it executes the engine
+ * binary, so it must not inherit the job's secrets either.
  */
-async function getInstalledVersion(binaryPath: string): Promise<string | undefined> {
+async function getInstalledVersion(
+  binaryPath: string,
+  env: ChildProcessEnvironment,
+): Promise<string | undefined> {
   try {
     let stdout = "";
     const result = await exec.exec(binaryPath, ["version"], {
       ignoreReturnCode: true,
       silent: true,
+      env,
       listeners: {
         stdout: (data: Buffer) => {
           stdout += data.toString();
@@ -429,12 +438,15 @@ async function getInstalledVersion(binaryPath: string): Promise<string | undefin
  * `undefined` so the caller falls through to the cache/install steps rather
  * than running the wrong Canary.
  */
-async function findExisting(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
+async function findExisting(
+  resolved: ResolvedVersion,
+  env: ChildProcessEnvironment,
+): Promise<InstalledCanary | undefined> {
   const candidatePath = path.join(cargoBinDir(), binaryName());
   if (!fs.existsSync(candidatePath)) {
     return undefined;
   }
-  const version = await getInstalledVersion(candidatePath);
+  const version = await getInstalledVersion(candidatePath, env);
   if (version === resolved.version) {
     core.info(`Found stellar-canary ${version} already installed at ${candidatePath}.`);
     return { binaryPath: candidatePath, version };
@@ -459,7 +471,10 @@ function cacheKeyFor(resolved: ResolvedVersion): string {
  * not match, or the restore throws. Caching is a pure optimization, so a
  * failure here is never surfaced as an error.
  */
-async function restoreFromCache(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
+async function restoreFromCache(
+  resolved: ResolvedVersion,
+  env: ChildProcessEnvironment,
+): Promise<InstalledCanary | undefined> {
   if (!cache.isFeatureAvailable()) {
     return undefined;
   }
@@ -470,7 +485,7 @@ async function restoreFromCache(resolved: ResolvedVersion): Promise<InstalledCan
     if (hit === undefined) {
       return undefined;
     }
-    const version = await getInstalledVersion(binaryPath);
+    const version = await getInstalledVersion(binaryPath, env);
     if (version !== resolved.version) {
       core.debug(`Cache hit for ${key} did not produce a matching stellar-canary version; ignoring.`);
       return undefined;
@@ -523,11 +538,22 @@ async function saveToCache(resolved: ResolvedVersion, binaryPath: string): Promi
  * `.zip`). Throws {@link InstallationFailedError} when `tar` cannot start or
  * exits non-zero.
  */
-async function extractPrebuiltArchive(archivePath: string, destDir: string): Promise<void> {
+async function extractPrebuiltArchive(
+  archivePath: string,
+  destDir: string,
+  env: ChildProcessEnvironment,
+): Promise<void> {
   fs.mkdirSync(destDir, { recursive: true });
   let exitCode: number;
   try {
-    exitCode = await exec.exec("tar", ["-xf", archivePath, "-C", destDir], { silent: true, ignoreReturnCode: true });
+    // `tar` is a child process too: `TAR_OPTIONS` (or any other exported
+    // variable) must not be able to change how a verified archive is
+    // extracted, so it gets the same filtered environment.
+    exitCode = await exec.exec("tar", ["-xf", archivePath, "-C", destDir], {
+      silent: true,
+      ignoreReturnCode: true,
+      env,
+    });
   } catch (error) {
     throw new InstallationFailedError(
       `Failed to start \`tar\` while extracting the prebuilt Protocol-Canary archive ` +
@@ -577,7 +603,10 @@ function findExtractedBinary(dir: string, name: string): string | undefined {
  * extracted directory is prepended to PATH with `core.addPath`, and the
  * binary's own reported version must equal the requested one.
  */
-export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
+export async function installPrebuiltRelease(
+  resolved: ResolvedVersion,
+  env: ChildProcessEnvironment,
+): Promise<InstalledCanary | undefined> {
   let triple: string;
   try {
     triple = prebuiltTargetTriple(process.platform, process.arch);
@@ -666,7 +695,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
     }
 
     try {
-      await extractPrebuiltArchive(archivePath, installDir);
+      await extractPrebuiltArchive(archivePath, installDir, env);
     } catch (error) {
       core.warning(
         `Could not extract the prebuilt Protocol-Canary asset ${assetName}: ` +
@@ -687,7 +716,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
       fs.chmodSync(extracted, 0o755);
     }
 
-    const version = await getInstalledVersion(extracted);
+    const version = await getInstalledVersion(extracted, env);
     if (version !== resolved.version) {
       core.warning(
         `The prebuilt stellar-canary asset ${assetName} reports version ${String(version)}, but ` +
@@ -709,10 +738,13 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
  * install. Throws an {@link InstallationFailedError} with remediation
  * guidance (rather than a generic error) when it is missing, so the failure
  * is reported as an install problem the user can act on.
+ *
+ * Runs with the same filtered environment as `cargo install`: the probe is a
+ * child process too, and there is no reason for it to see the job's secrets.
  */
-async function ensureCargoAvailable(): Promise<void> {
+async function ensureCargoAvailable(env: ChildProcessEnvironment): Promise<void> {
   try {
-    await exec.exec("cargo", ["--version"], { silent: true });
+    await exec.exec("cargo", ["--version"], { silent: true, env });
   } catch (error) {
     throw new InstallationFailedError(
       "The `cargo` command was not found on this runner. This Action installs a prebuilt " +
@@ -741,6 +773,16 @@ function buildInstallArgs(resolved: ResolvedVersion): string[] {
   args.push("canary-cli");
   return args;
 }
+
+/**
+ * Appended to `cargo install` build failures: a custom toolchain variable
+ * that the default allow-list does not include now stops reaching cargo, and
+ * cargo's own error will not say why. Point the user at the opt-in.
+ */
+export const ENGINE_ENV_PASSTHROUGH_HINT =
+  "If the build needs an environment variable that the Action does not pass to child processes " +
+  "by default (for example a custom toolchain or private-mirror setting), list its name in the " +
+  "`engine-env-passthrough` input. See SECURITY.md for the default allow-list and its trade-offs.";
 
 /** Maps a `runCheck` rejection onto the install-failure error taxonomy. */
 function describeInstallFailure(error: unknown, timeoutMs: number, resolved: ResolvedVersion): Error {
@@ -790,7 +832,11 @@ export function cargoInstallTimeoutMs(timeoutMinutes: number): number {
  * blocking the job. Throws an {@link InstallationFailedError} on a non-zero
  * exit code, a timeout, or a `cargo` that cannot be started.
  */
-async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promise<void> {
+async function cargoInstall(
+  resolved: ResolvedVersion,
+  timeoutMs: number,
+  env: ChildProcessEnvironment,
+): Promise<void> {
   const args = buildInstallArgs(resolved);
 
   core.info(`Installing stellar-canary ${resolved.version} with: cargo ${args.join(" ")}`);
@@ -798,10 +844,11 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promi
   // `stellar-canary check` so it can never hang indefinitely: the timeout
   // terminates a hung process (SIGTERM, then SIGKILL after the grace
   // period) instead of leaving the job blocked until GitHub's job-level
-  // timeout (see issue #65).
+  // timeout (see issue #65). The environment is the filtered child
+  // environment, never the job's own (see SECURITY.md).
   let execution: CheckExecutionResult;
   try {
-    execution = await runCheck("cargo", args, timeoutMs);
+    execution = await runCheck("cargo", args, timeoutMs, { env });
   } catch (error) {
     throw describeInstallFailure(error, timeoutMs, resolved);
   }
@@ -815,7 +862,7 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promi
     const diagnosticTail = formatSafeDiagnosticTail(execution.stderr, 40, 8 * 1024);
     const baseMessage =
       `\`cargo install\` exited with code ${String(execution.exitCode)} while installing ` +
-      `Protocol-Canary ${resolved.version}.`;
+      `Protocol-Canary ${resolved.version}. ${ENGINE_ENV_PASSTHROUGH_HINT}`;
     const message = diagnosticTail !== "" ? `${baseMessage}\n\n${diagnosticTail}` : baseMessage;
     throw new InstallationFailedError(message, diagnosticTail !== "" ? diagnosticTail : undefined);
   }
@@ -837,29 +884,36 @@ export async function ensureCanaryInstalled(
   resolved: ResolvedVersion,
   installTimeoutMs: number = cargoInstallTimeoutMs(15),
   token?: string,
+  env?: ChildProcessEnvironment,
 ): Promise<InstalledCanary> {
-  const existing = await findExisting(resolved);
+  // A child environment is always provided, so `cargo` (and the binaries it
+  // runs while building dependency scripts) never inherits the job's
+  // secrets. Callers pass the environment built from
+  // `engine-env-passthrough`; the default allow-list is the fallback.
+  const childEnv = env ?? buildChildEnvironment(process.env, process.platform).env;
+
+  const existing = await findExisting(resolved, childEnv);
   if (existing !== undefined) {
     await verifyInstalledBinary(existing.binaryPath, resolved, token);
     return existing;
   }
 
-  const cached = await restoreFromCache(resolved);
+  const cached = await restoreFromCache(resolved, childEnv);
   if (cached !== undefined) {
     await verifyInstalledBinary(cached.binaryPath, resolved, token);
     return cached;
   }
 
-  const prebuilt = await installPrebuiltRelease(resolved);
+  const prebuilt = await installPrebuiltRelease(resolved, childEnv);
   if (prebuilt !== undefined) {
     return prebuilt;
   }
 
-  await ensureCargoAvailable();
-  await cargoInstall(resolved, installTimeoutMs);
+  await ensureCargoAvailable(childEnv);
+  await cargoInstall(resolved, installTimeoutMs, childEnv);
 
   const binaryPath = path.join(cargoBinDir(), binaryName());
-  const version = await getInstalledVersion(binaryPath);
+  const version = await getInstalledVersion(binaryPath, childEnv);
   if (version === undefined) {
     throw new CanaryNotFoundError(
       `cargo install reported success, but no working stellar-canary binary was found at ${binaryPath}.`,
