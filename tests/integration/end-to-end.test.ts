@@ -1,4 +1,5 @@
 import type * as actionsCore from "@actions/core";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,12 +30,30 @@ vi.mock("@actions/artifact", () => ({
 // must degrade gracefully (see version.test.ts), and this suite only
 // cares about what happens downstream of installation.
 vi.mock("node:https", () => ({
-  get: vi.fn((_url: string, _options: unknown, callback: (response: unknown) => void) => {
+  get: vi.fn((url: string, _options: unknown, callback: (response: unknown) => void) => {
+    const isReleaseLookup = url.endsWith("/releases/tags/v0.1.0");
+    const isChecksumLookup = url === "https://example.test/SHA256SUMS";
+    let body = "";
+    if (isReleaseLookup) {
+      body = JSON.stringify({
+        assets: [{ name: "SHA256SUMS", browser_download_url: "https://example.test/SHA256SUMS" }],
+      });
+    } else if (isChecksumLookup) {
+      const binaryPath = path.join(process.env.CARGO_HOME ?? "", "bin", "stellar-canary");
+      const digest = crypto.createHash("sha256").update(fs.readFileSync(binaryPath)).digest("hex");
+      body = `${digest}  stellar-canary\n`;
+    }
     const response = {
-      statusCode: 500,
+      statusCode: isReleaseLookup || isChecksumLookup ? 200 : 500,
       setEncoding: () => undefined,
       resume: () => undefined,
-      on: () => undefined,
+      on: (event: string, listener: (chunk?: string) => void) => {
+        if (event === "data") {
+          queueMicrotask(() => listener(body));
+        } else if (event === "end") {
+          queueMicrotask(() => listener());
+        }
+      },
     };
     queueMicrotask(() => callback(response));
     return { on: () => undefined, destroy: () => undefined };
@@ -44,6 +63,7 @@ vi.mock("node:https", () => ({
 const MOCK_CANARY_SOURCE = path.join(__dirname, "..", "fixtures", "mock-canary.cjs");
 const ENV_KEYS = [
   "CARGO_HOME",
+  "RUNNER_TOOL_CACHE",
   "RUNNER_TEMP",
   "GITHUB_OUTPUT",
   "GITHUB_STEP_SUMMARY",
@@ -78,6 +98,7 @@ function setUp(scenario: string): Fixture {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-e2e-"));
   const cargoHome = path.join(workDir, "cargo-home");
   fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
+  fs.chmodSync(path.join(cargoHome, "bin"), 0o755);
   fs.copyFileSync(MOCK_CANARY_SOURCE, path.join(cargoHome, "bin", "stellar-canary"));
   fs.chmodSync(path.join(cargoHome, "bin", "stellar-canary"), 0o755);
 

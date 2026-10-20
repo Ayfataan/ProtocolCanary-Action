@@ -71,18 +71,30 @@ which:
 ### Checksum verification
 
 When the requested `Protocol-Canary` release publishes a checksum manifest
-(for example `SHA256SUMS`) as a release asset, this Action downloads it,
-hashes the binary it is about to run, and compares the two. A mismatch
-throws an `InstallationFailed` error and the binary is never executed.
+(for example `SHA256SUMS`) as a release asset, this Action downloads it and
+checks candidate binaries against it. A pre-installed candidate from
+`CARGO_HOME/bin`, the Actions tool cache, or `PATH` is not executed unless its
+checksum matches the requested release. If the checksum is unavailable, the
+candidate is skipped and installation falls back to a verified prebuilt
+release asset or a source build pinned to the requested commit/tag. A
+checksum mismatch on a pre-installed candidate is warned about and skipped;
+a mismatch in a downloaded prebuilt release asset remains a hard
+`InstallationFailed` error.
 
-`Protocol-Canary` does not publish checksums yet, so the lookup normally
-finds nothing and this step is a no-op that logs a debug line. That
-fallback to commit/tag pinning is deliberate and is the documented,
-unchanged behavior: the checksum step only ever *adds* a guarantee when a
-manifest exists, and its absence never weakens the existing pinning.
-A compiled-from-a-pinned-commit build is still a weaker integrity story
-than a checksum published by the artifact's own maintainers, so making
-checksum-verified installs the primary path remains the goal.
+Before any version subprocess, candidate binaries must also be regular files
+with executable permission, and on Unix their file and containing directory
+must be owned by root or the current runner user and not be group/world
+writable. Relative or empty `PATH` entries, symlinks, unsafe permissions,
+and untrusted owners are rejected. Only after these checks and checksum
+verification does the Action invoke the binary's `version` subcommand and
+require an exact match with the requested version.
+
+`Protocol-Canary` does not publish checksums yet, so pre-installed binaries
+are currently skipped. A binary freshly built from a pinned commit remains
+usable under the existing commit/tag integrity mechanism; a downloaded
+prebuilt asset is used only after its archive checksum is verified. As
+maintainers publish checksums, matching pre-installed binaries become a safe
+fast path without weakening the trust boundary.
 
 ## Subprocess isolation
 

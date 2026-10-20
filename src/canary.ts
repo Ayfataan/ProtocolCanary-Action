@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as https from "node:https";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as toolCache from "@actions/tool-cache";
 
 import {
   CanaryExecutionFailedError,
@@ -42,6 +43,79 @@ function cargoBinDir(): string {
 
 function binaryName(): string {
   return process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
+}
+
+function isTrustedExecutable(binaryPath: string): boolean {
+  if (!path.isAbsolute(binaryPath)) {
+    return false;
+  }
+
+  try {
+    const binary = fs.lstatSync(binaryPath);
+    const directory = fs.lstatSync(path.dirname(binaryPath));
+    if (!binary.isFile() || binary.isSymbolicLink() || !directory.isDirectory() || directory.isSymbolicLink()) {
+      return false;
+    }
+
+    if (process.platform !== "win32") {
+      const uid = process.getuid?.();
+      const trustedOwner = (owner: number): boolean => owner === 0 || (uid !== undefined && owner === uid);
+      if (
+        uid === undefined ||
+        !trustedOwner(binary.uid) ||
+        !trustedOwner(directory.uid) ||
+        (binary.mode & 0o111) === 0 ||
+        (binary.mode & 0o7022) !== 0 ||
+        (directory.mode & 0o022) !== 0
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findInPath(): string[] {
+  const candidates: string[] = [];
+  const configuredPath = process.env.PATH ?? "";
+  if (configuredPath === "") {
+    return candidates;
+  }
+
+  for (const section of configuredPath.split(path.delimiter)) {
+    if (section === "" || !path.isAbsolute(section)) {
+      core.warning(`Ignoring invalid PATH entry ${JSON.stringify(section)} while searching for stellar-canary.`);
+      continue;
+    }
+
+    const candidate = path.join(section, binaryName());
+    if (fs.existsSync(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+function findInToolCache(version: string): string[] {
+  if ((process.env.RUNNER_TOOL_CACHE ?? "").trim() === "") {
+    return [];
+  }
+
+  try {
+    const installDir = toolCache.find("stellar-canary", version, process.arch);
+    if (installDir === "") {
+      return [];
+    }
+    return [path.join(installDir, binaryName()), path.join(installDir, "bin", binaryName())].filter((candidate) =>
+      fs.existsSync(candidate),
+    );
+  } catch (error) {
+    core.debug(`Could not search the tool cache for stellar-canary ${version}: ${String(error)}`);
+    return [];
+  }
 }
 
 /**
@@ -297,6 +371,42 @@ function selectExpectedChecksum(entries: Map<string, string>, binary: string): s
   return candidates.length === 1 && only !== undefined ? only[1] : undefined;
 }
 
+async function expectedPublishedBinaryChecksum(
+  binaryPath: string,
+  resolved: ResolvedVersion,
+  token?: string,
+): Promise<string | undefined> {
+  const checksums = await lookupPublishedChecksums(resolved.version, token);
+  if (checksums === undefined) {
+    core.warning(
+      `Refusing to execute the pre-installed stellar-canary at ${binaryPath}: no published checksum is available.`,
+    );
+    return undefined;
+  }
+
+  const expected = selectExpectedChecksum(checksums, binaryName());
+  if (expected === undefined) {
+    core.warning(
+      `Refusing to execute the pre-installed stellar-canary at ${binaryPath}: ` +
+        "the published checksum manifest has no matching binary entry.",
+    );
+  }
+  return expected;
+}
+
+async function matchesPublishedChecksum(binaryPath: string, expected: string): Promise<boolean> {
+  try {
+    const actual = await sha256File(binaryPath);
+    if (actual === expected) {
+      return true;
+    }
+    core.warning(`Ignoring pre-installed stellar-canary at ${binaryPath}: its published checksum does not match.`);
+  } catch (error) {
+    core.warning(`Ignoring pre-installed stellar-canary at ${binaryPath}: could not verify its checksum (${String(error)}).`);
+  }
+  return false;
+}
+
 /** The `GITHUB_TOKEN` value used to authenticate the GitHub REST calls made
  * during installation, normalized the same way as the checksum lookup: a
  * blank or whitespace-only value counts as "no token". */
@@ -360,11 +470,9 @@ async function sha256File(filePath: string): Promise<string> {
 }
 
 /**
- * Verifies an installed or cached binary against the checksum published with
- * its release, when one exists. When Protocol-Canary has not published a
- * checksum (or none applies to this platform) this degrades to a debug log
- * and the existing commit/tag pinning stands — see SECURITY.md. A mismatch
- * always throws, so a tampered binary is never trusted.
+ * Verifies a binary built from a pinned source revision against the checksum
+ * published with its release, when one exists. Without a matching checksum,
+ * the source revision pin remains the trust basis — see SECURITY.md.
  */
 async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersion, token?: string): Promise<void> {
   const checksums = await lookupPublishedChecksums(resolved.version, token);
@@ -400,8 +508,16 @@ async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersi
  * Returns `undefined` when the binary cannot be executed or exits non-zero,
  * which callers treat as "not usable" and fall through to the next step.
  */
-async function getInstalledVersion(binaryPath: string): Promise<string | undefined> {
+async function getInstalledVersion(binaryPath: string, expectedChecksum?: string): Promise<string | undefined> {
+  if (!isTrustedExecutable(binaryPath)) {
+    core.warning(`Refusing to execute stellar-canary at ${binaryPath}: file ownership or permissions are unsafe.`);
+    return undefined;
+  }
+
   try {
+    if (expectedChecksum !== undefined && !(await matchesPublishedChecksum(binaryPath, expectedChecksum))) {
+      return undefined;
+    }
     let stdout = "";
     const result = await exec.exec(binaryPath, ["version"], {
       ignoreReturnCode: true,
@@ -418,7 +534,8 @@ async function getInstalledVersion(binaryPath: string): Promise<string | undefin
     // "stellar-canary 0.1.0"
     const match = /stellar-canary\s+(\S+)/.exec(stdout);
     return match?.[1];
-  } catch {
+  } catch (error) {
+    core.debug(`Could not read the version of stellar-canary at ${binaryPath}: ${String(error)}`);
     return undefined;
   }
 }
@@ -429,15 +546,44 @@ async function getInstalledVersion(binaryPath: string): Promise<string | undefin
  * `undefined` so the caller falls through to the cache/install steps rather
  * than running the wrong Canary.
  */
-async function findExisting(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
-  const candidatePath = path.join(cargoBinDir(), binaryName());
-  if (!fs.existsSync(candidatePath)) {
-    return undefined;
-  }
-  const version = await getInstalledVersion(candidatePath);
-  if (version === resolved.version) {
-    core.info(`Found stellar-canary ${version} already installed at ${candidatePath}.`);
-    return { binaryPath: candidatePath, version };
+async function findExisting(
+  resolved: ResolvedVersion,
+  token?: string,
+): Promise<InstalledCanary | undefined> {
+  const candidates = [
+    path.join(cargoBinDir(), binaryName()),
+    ...findInToolCache(resolved.version),
+    ...findInPath(),
+  ].filter((candidate, index, all) => fs.existsSync(candidate) && all.indexOf(candidate) === index);
+
+  let expectedChecksum: string | undefined;
+  let checksumLookedUp = false;
+  for (const candidatePath of candidates) {
+    if (!isTrustedExecutable(candidatePath)) {
+      core.warning(`Ignoring untrusted stellar-canary candidate at ${candidatePath}.`);
+      continue;
+    }
+
+    if (!checksumLookedUp) {
+      expectedChecksum = await expectedPublishedBinaryChecksum(candidatePath, resolved, token);
+      checksumLookedUp = true;
+    }
+    if (
+      expectedChecksum === undefined ||
+      !(await matchesPublishedChecksum(candidatePath, expectedChecksum))
+    ) {
+      continue;
+    }
+
+    const version = await getInstalledVersion(candidatePath, expectedChecksum);
+    if (version === resolved.version) {
+      core.info(`Found checksum-verified stellar-canary ${version} at ${candidatePath}.`);
+      return { binaryPath: candidatePath, version };
+    }
+    core.warning(
+      `Ignoring pre-installed stellar-canary at ${candidatePath}: it reports version ${String(version)}, ` +
+        `but ${resolved.version} was requested.`,
+    );
   }
   return undefined;
 }
@@ -459,7 +605,7 @@ function cacheKeyFor(resolved: ResolvedVersion): string {
  * not match, or the restore throws. Caching is a pure optimization, so a
  * failure here is never surfaced as an error.
  */
-async function restoreFromCache(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
+async function restoreFromCache(resolved: ResolvedVersion, token?: string): Promise<InstalledCanary | undefined> {
   if (!cache.isFeatureAvailable()) {
     return undefined;
   }
@@ -470,7 +616,18 @@ async function restoreFromCache(resolved: ResolvedVersion): Promise<InstalledCan
     if (hit === undefined) {
       return undefined;
     }
-    const version = await getInstalledVersion(binaryPath);
+    if (!isTrustedExecutable(binaryPath)) {
+      core.warning(`Ignoring Actions cache hit for stellar-canary: file ownership or permissions are unsafe.`);
+      return undefined;
+    }
+    const expectedChecksum = await expectedPublishedBinaryChecksum(binaryPath, resolved, token);
+    if (
+      expectedChecksum === undefined ||
+      !(await matchesPublishedChecksum(binaryPath, expectedChecksum))
+    ) {
+      return undefined;
+    }
+    const version = await getInstalledVersion(binaryPath, expectedChecksum);
     if (version !== resolved.version) {
       core.debug(`Cache hit for ${key} did not produce a matching stellar-canary version; ignoring.`);
       return undefined;
@@ -685,6 +842,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
     }
     if (process.platform !== "win32") {
       fs.chmodSync(extracted, 0o755);
+      fs.chmodSync(path.dirname(extracted), 0o755);
     }
 
     const version = await getInstalledVersion(extracted);
@@ -838,15 +996,13 @@ export async function ensureCanaryInstalled(
   installTimeoutMs: number = cargoInstallTimeoutMs(15),
   token?: string,
 ): Promise<InstalledCanary> {
-  const existing = await findExisting(resolved);
+  const existing = await findExisting(resolved, token);
   if (existing !== undefined) {
-    await verifyInstalledBinary(existing.binaryPath, resolved, token);
     return existing;
   }
 
-  const cached = await restoreFromCache(resolved);
+  const cached = await restoreFromCache(resolved, token);
   if (cached !== undefined) {
-    await verifyInstalledBinary(cached.binaryPath, resolved, token);
     return cached;
   }
 
