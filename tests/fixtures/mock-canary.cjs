@@ -75,8 +75,9 @@ function baseReport(overrides) {
  * @returns {never} Never returns.
  */
 function emit(report, exitCode) {
-  process.stdout.write(JSON.stringify(report) + "\n");
-  process.exit(exitCode);
+  process.stdout.write(JSON.stringify(report) + "\n", () => {
+    process.exit(exitCode);
+  });
 }
 
 /**
@@ -95,8 +96,9 @@ function emit(report, exitCode) {
  * @returns {never} Never returns.
  */
 function fail(exitCode, message) {
-  process.stderr.write(`error: ${message}\n`);
-  process.exit(exitCode);
+  process.stderr.write(`error: ${message}\n`, () => {
+    process.exit(exitCode);
+  });
 }
 
 if (args[0] === "version") {
