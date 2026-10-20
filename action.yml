@@ -80,6 +80,13 @@ inputs:
     required: false
     default: "true"
 
+  report-retention-days:
+    description: >-
+      Duration in days (integer from 1 to 90) to retain the uploaded JSON
+      report artifact. If omitted, GitHub's default retention for the
+      repository is used.
+    required: false
+
   annotations:
     description: >-
       Convert compatibility failures, warnings, and execution errors into
@@ -200,6 +207,16 @@ outputs:
       Absolute path to the generated Execution Receipt JSON. Only set when
       `generate-receipt` is `true` and Canary produced a parseable report;
       unset otherwise, including on an execution failure.
+  artifact-name:
+    description: >-
+      Name of the uploaded report artifact. Empty if upload was disabled
+      or failed, or on an execution failure. Reflects the fallback name
+      if a name collision occurred.
+  artifact-id:
+    description: >-
+      GitHub artifact ID of the uploaded report artifact. Empty if upload
+      was disabled or failed, if the client did not return an ID, or on
+      an execution failure.
 
 runs:
   using: node24

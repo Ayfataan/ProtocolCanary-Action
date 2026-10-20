@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { ArtifactUploadOutcome } from "./artifact";
 import { uploadReceipt, uploadReport } from "./artifact";
 import { emitAnnotations, emitExecutionFailureAnnotation, emitExitFailureAnnotation } from "./annotations";
 import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "./canary";
@@ -68,6 +69,8 @@ async function handleExecutionFailure(reason: string, diagnostic: string, annota
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
   core.setOutput("replayed-count", "0");
+  core.setOutput("artifact-name", "");
+  core.setOutput("artifact-id", "");
 }
 
 /**
@@ -187,8 +190,26 @@ export async function run(): Promise<void> {
     }
   }
 
+  let uploadOutcome: ArtifactUploadOutcome | undefined;
+  if (inputs.uploadReport) {
+    try {
+      uploadOutcome = await uploadReport(
+        reportPath,
+        artifactDifferentiator(inputs),
+        inputs.reportRetentionDays,
+      );
+    } catch (error) {
+      core.warning(`Failed to upload artifact: ${describeError(error)}`);
+      uploadOutcome = { uploaded: false, reason: describeError(error) };
+    }
+  }
+
   try {
-    await writeSummary(renderSummaryMarkdown(report));
+    const summaryMarkdown =
+      uploadOutcome?.uploaded && uploadOutcome.id !== undefined
+        ? renderSummaryMarkdown(report, { id: uploadOutcome.id, name: uploadOutcome.name })
+        : renderSummaryMarkdown(report);
+    await writeSummary(summaryMarkdown);
   } catch (error) {
     core.setFailed(describeError(error));
   }
@@ -200,10 +221,14 @@ export async function run(): Promise<void> {
   core.setOutput("errors", String(report.counts.errors));
   core.setOutput("replayed-count", String(countReplayed(report)));
   core.setOutput("report", reportPath);
-
-  if (inputs.uploadReport) {
-    await uploadReport(reportPath, artifactDifferentiator(inputs));
-  }
+  core.setOutput(
+    "artifact-name",
+    uploadOutcome?.uploaded && uploadOutcome.name ? uploadOutcome.name : "",
+  );
+  core.setOutput(
+    "artifact-id",
+    uploadOutcome?.uploaded && uploadOutcome.id !== undefined ? String(uploadOutcome.id) : "",
+  );
 
   // #362: strictly opt-in, and auxiliary like the report artifact. A receipt
   // is only produced when Canary actually yielded a report (the

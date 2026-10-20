@@ -28,7 +28,11 @@ export interface ArtifactUploadOutcome {
   /** Whether the report artifact was uploaded successfully. */
   readonly uploaded: boolean;
   /** The failure reason, present only when `uploaded` is `false`. */
-  readonly reason?: string;
+  readonly reason?: string | undefined;
+  /** The name of the artifact, present when `uploaded` is `true`. */
+  readonly name?: string | undefined;
+  /** The artifact ID, present when `uploaded` is `true` and returned by the client. */
+  readonly id?: number | undefined;
 }
 
 /**
@@ -89,12 +93,20 @@ export function isArtifactNameCollision(error: unknown): boolean {
 export async function uploadReport(
   reportPath: string,
   differentiator?: string,
+  retentionDays?: number,
 ): Promise<ArtifactUploadOutcome> {
   let name = ARTIFACT_NAME;
   try {
     const client = new DefaultArtifactClient();
+    const options = retentionDays !== undefined ? { retentionDays } : undefined;
+    let response;
     try {
-      await client.uploadArtifact(ARTIFACT_NAME, [reportPath], path.dirname(reportPath));
+      response = await client.uploadArtifact(
+        ARTIFACT_NAME,
+        [reportPath],
+        path.dirname(reportPath),
+        ...(options !== undefined ? [options] : []),
+      );
     } catch (error) {
       if (!isArtifactNameCollision(error)) {
         throw error;
@@ -104,10 +116,19 @@ export async function uploadReport(
         `Artifact name "${ARTIFACT_NAME}" is already used in this workflow run; ` +
           `uploading this report as "${name}" instead.`,
       );
-      await client.uploadArtifact(name, [reportPath], path.dirname(reportPath));
+      response = await client.uploadArtifact(
+        name,
+        [reportPath],
+        path.dirname(reportPath),
+        ...(options !== undefined ? [options] : []),
+      );
     }
     core.info(`Uploaded ${name} artifact.`);
-    return { uploaded: true };
+    return {
+      uploaded: true,
+      name,
+      ...(response?.id !== undefined ? { id: response.id } : {}),
+    };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     core.warning(`Failed to upload ${name} artifact: ${reason}`);

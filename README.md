@@ -121,6 +121,7 @@ jobs:
 | `fixtures-dir` | Path to a directory of fixtures, e.g. a checkout of `ProtocolCanary-Fixtures` (`--fixtures-dir`). | `fixtures` |
 | `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.1.1` |
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
+| `report-retention-days` | Duration in days (integer 1 to 90) to retain the uploaded JSON report artifact. If omitted, the repository's default retention is used. | (repository default) |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
 | `timeout-minutes` | Maximum time to let Canary run before it is terminated. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
@@ -148,6 +149,8 @@ literals below.
 | `errors` | Number of checks that could not complete due to an execution error. | `"0"` |
 | `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. | `"3"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `artifact-name` | Name of the uploaded report artifact. Reflects the fallback name if a collision occurred. Empty string when upload was disabled or failed, or on an execution failure. | `"stellar-protocol-canary-report"` |
+| `artifact-id` | GitHub artifact ID of the uploaded report artifact. Empty string when upload was disabled or failed, if the client did not return an ID, or on an execution failure. | `"12345678"` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
 
@@ -160,7 +163,7 @@ A concrete consumer, using the outputs to gate a follow-up step:
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are all explicitly set to the string `"0"`, and `artifact-name` and `artifact-id` are set to empty strings (`""`). They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 
 ## How failures appear
 
@@ -409,6 +412,14 @@ per invocation instead of silently dropping every upload after the first.
 Downloading a specific report from a multi-invocation run therefore means
 matching the suffix — either the protocol/network/config it checked, or the
 generated unique suffix when the invocations share the same inputs.
+Workflows can also read `steps.<id>.outputs.artifact-name` to get the exact
+artifact name actually used (including any fallback suffix), and
+`steps.<id>.outputs.artifact-id` to get the artifact ID (which is also linked
+directly in the job summary when available).
+
+Retention of the report artifact can be configured using `report-retention-days`
+(an integer between 1 and 90). When omitted, the repository's default artifact
+retention applies.
 
 ## Installation & integrity
 

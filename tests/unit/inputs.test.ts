@@ -39,6 +39,7 @@ const INPUT_KEYS = [
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_REPORT-RETENTION-DAYS",
 ];
 
 function clearInputs(): void {
@@ -71,6 +72,7 @@ describe("getInputs", () => {
       fixturesPackProtocol: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      reportRetentionDays: undefined,
     });
   });
 
@@ -486,6 +488,41 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       const inputs = getInputs();
       expect(inputs.githubToken).toBeUndefined();
       expect(setSecretMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("report-retention-days", () => {
+    it("parses valid report-retention-days integers", () => {
+      process.env["INPUT_REPORT-RETENTION-DAYS"] = "7";
+      expect(getInputs().reportRetentionDays).toBe(7);
+    });
+
+    it("accepts report-retention-days boundary values 1 and 90", () => {
+      process.env["INPUT_REPORT-RETENTION-DAYS"] = "1";
+      expect(getInputs().reportRetentionDays).toBe(1);
+
+      process.env["INPUT_REPORT-RETENTION-DAYS"] = "90";
+      expect(getInputs().reportRetentionDays).toBe(90);
+    });
+
+    it("trims surrounding whitespace", () => {
+      process.env["INPUT_REPORT-RETENTION-DAYS"] = "  14  ";
+      expect(getInputs().reportRetentionDays).toBe(14);
+    });
+
+    it("treats empty or whitespace-only input as undefined", () => {
+      process.env["INPUT_REPORT-RETENTION-DAYS"] = "   ";
+      expect(getInputs().reportRetentionDays).toBeUndefined();
+    });
+
+    it("rejects values outside 1 to 90 or non-integers, naming the input", () => {
+      for (const invalid of ["0", "91", "1.5", "abc", "-5"]) {
+        process.env["INPUT_REPORT-RETENTION-DAYS"] = invalid;
+        expect(() => getInputs()).toThrowError(InvalidInputError);
+        expect(() => getInputs()).toThrowError(
+          `Invalid "report-retention-days" input: "${invalid}". Expected an integer from 1 to 90.`,
+        );
+      }
     });
   });
 });

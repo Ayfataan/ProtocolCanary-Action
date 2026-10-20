@@ -29,6 +29,7 @@ const {
   startGroupMock,
   endGroupMock,
   uploadReceiptMock,
+  uploadReportMock,
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
   ensureCanaryInstalledMock: vi.fn(),
@@ -45,6 +46,7 @@ const {
   startGroupMock: vi.fn(),
   endGroupMock: vi.fn(),
   uploadReceiptMock: vi.fn(),
+  uploadReportMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
@@ -95,12 +97,11 @@ vi.mock("../../src/summary", async (importOriginal) => {
   };
 });
 
-// #362: only `uploadReceipt` is replaced — receipt tests assert the gate
-// (upload when generate-receipt is true, skip when false) without ever
-// touching the artifact service.
+// #362, #415: artifact uploads are replaced — tests assert the gate
+// and output wiring without touching the artifact service.
 vi.mock("../../src/artifact", async (importOriginal) => {
   const actual = await importOriginal<typeof artifactModule>();
-  return { ...actual, uploadReceipt: uploadReceiptMock };
+  return { ...actual, uploadReceipt: uploadReceiptMock, uploadReport: uploadReportMock };
 });
 
 import { run } from "../../src/main";
@@ -122,6 +123,7 @@ const INPUTS: ActionInputs = {
   fixturesPackProtocol: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  reportRetentionDays: undefined,
 };
 
 const PASS_REPORT = report({
@@ -157,6 +159,11 @@ describe("run", () => {
     startGroupMock.mockReset();
     endGroupMock.mockReset();
     uploadReceiptMock.mockReset();
+    uploadReportMock.mockReset().mockResolvedValue({
+      uploaded: true,
+      name: "stellar-protocol-canary-report",
+      id: 100,
+    });
 
     // The success path writes the report under RUNNER_TEMP; give each test a
     // private directory (as the integration suite does) so it neither leaks
@@ -235,6 +242,8 @@ describe("run", () => {
     expect(errorMock).toHaveBeenCalledTimes(1);
     // No report existed at all, so nothing was replayed (#350).
     expect(setOutputMock).toHaveBeenCalledWith("replayed-count", "0");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
   });
 
   // #350: the replayed-count output mirrors how many results the engine
@@ -449,6 +458,123 @@ describe("run", () => {
 
     expect(setOutputMock).not.toHaveBeenCalledWith("receipt-path", expect.anything());
     expect(uploadReceiptMock).not.toHaveBeenCalled();
+  });
+
+  // #415: artifact retention input and artifact outputs
+  it("uploads report, sets artifact outputs, and links artifact in summary when uploadReport is true (#415)", async () => {
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      uploadReport: true,
+      reportRetentionDays: 7,
+    });
+    uploadReportMock.mockResolvedValueOnce({
+      uploaded: true,
+      name: "stellar-protocol-canary-report",
+      id: 1234,
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(uploadReportMock).toHaveBeenCalledWith(
+      expect.stringContaining("stellar-canary-report.json"),
+      "protocol-28-network-testnet",
+      7,
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "stellar-protocol-canary-report");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "1234");
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+      PASS_REPORT,
+      { id: 1234, name: "stellar-protocol-canary-report" },
+    );
+  });
+
+  it("sets artifact-name to the fallback name used after collision (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+    uploadReportMock.mockResolvedValueOnce({
+      uploaded: true,
+      name: "stellar-protocol-canary-report-protocol-28-network-testnet",
+      id: 5678,
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith(
+      "artifact-name",
+      "stellar-protocol-canary-report-protocol-28-network-testnet",
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "5678");
+  });
+
+  it("sets empty artifact outputs when uploadReport is disabled (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: false });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(uploadReportMock).not.toHaveBeenCalled();
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+  });
+
+  it("sets empty artifact outputs when uploadReport fails (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+    uploadReportMock.mockResolvedValueOnce({
+      uploaded: false,
+      reason: "service unavailable",
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+  });
+
+  it("sets empty artifact outputs and logs warning when uploadReport throws (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+    uploadReportMock.mockRejectedValueOnce(new Error("unexpected upload failure"));
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining("unexpected upload failure"),
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
   });
 });
 
