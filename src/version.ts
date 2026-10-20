@@ -1,5 +1,5 @@
 import * as core from "@actions/core";
-import * as https from "node:https";
+import { GitHubRequestError, githubFetch } from "./github";
 
 /**
  * Single point of control for where this Action installs Protocol-Canary from.
@@ -75,6 +75,23 @@ export async function resolveVersion(
       return undefined;
     }
 
+    if (error instanceof GitHubRequestError && error.kind === "rate-limit") {
+      const reset = error.resetAt === undefined ? "reset time unavailable" : `resets at ${error.resetAt.toISOString()}`;
+      core.warning(
+        `Could not resolve ${tag} because the GitHub API rate limit was exhausted (${reset}); ` +
+          `falling back to mutable tag pinning. Set github-token or GITHUB_TOKEN to raise the API limit.`,
+      );
+      return undefined;
+    }
+
+    if (error instanceof GitHubRequestError && error.kind === "timeout") {
+      core.warning(
+        `Could not resolve ${tag} because the GitHub API request timed out; falling back to mutable tag pinning. ` +
+          `Set github-token or GITHUB_TOKEN and retry to improve reliability.`,
+      );
+      return undefined;
+    }
+
     core.debug(`Could not resolve ${tag} to a commit sha, falling back to tag pinning: ${String(error)}`);
     return undefined;
   });
@@ -124,45 +141,13 @@ function parseNextLink(header: string | string[] | undefined): string | undefine
 
 /** Fetches and parses a single page of the `tags` list endpoint. Rejects on
  * a non-200 response, malformed JSON, or an unexpected response shape. */
-function fetchTagsPage(url: string, token: string | undefined): Promise<TagsPage> {
-  return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = {
-      "User-Agent": "ProtocolCanary-Action",
-      Accept: "application/vnd.github+json",
-    };
-    if (token !== undefined) {
-      headers.Authorization = `Bearer ${token}`;
-    }
-
-    const request = https.get(url, { headers, timeout: 10_000 }, (response) => {
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`GitHub API returned status ${String(response.statusCode)} for ${url}`));
-        return;
-      }
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk: string) => {
-        body += chunk;
-      });
-      response.on("end", () => {
-        try {
-          const parsed = JSON.parse(body) as unknown;
-          if (!Array.isArray(parsed)) {
-            reject(new Error("unexpected response shape from GitHub API"));
-            return;
-          }
-          resolve({ tags: parsed as GitHubTag[], next: parseNextLink(response.headers.link) });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      });
-    });
-    request.on("timeout", () => {
-      request.destroy(new Error(`timed out resolving ${url}`));
-    });
-    request.on("error", reject);
-  });
+async function fetchTagsPage(url: string, token: string | undefined): Promise<TagsPage> {
+  const { body, headers } = await githubFetch(url, token);
+  const parsed = JSON.parse(body) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("unexpected response shape from GitHub API");
+  }
+  return { tags: parsed as GitHubTag[], next: parseNextLink(headers.link) };
 }
 
 /**
@@ -194,3 +179,4 @@ async function resolveTagCommit(tag: string, explicitToken: string | undefined):
 
   throw new Error(`tag ${tag} not found in ${CANARY_REPO_OWNER}/${CANARY_REPO_NAME} tags`);
 }
+

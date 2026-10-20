@@ -58,6 +58,9 @@ which:
   that resolution fails (for example, a transient GitHub API error) —
   this Action never silently falls back to an unpinned or different
   version;
+- installs the binary into a private runner-temp root under
+  `$RUNNER_TEMP/stellar-canary-action` rather than the shared Cargo home and
+  never adds that directory to `PATH` for downstream steps;
 - uses `--locked`, so the exact dependency versions in `Protocol-Canary`'s
   own committed `Cargo.lock` are used rather than whatever the latest
   compatible versions happen to be at build time;
@@ -84,6 +87,20 @@ A compiled-from-a-pinned-commit build is still a weaker integrity story
 than a checksum published by the artifact's own maintainers, so making
 checksum-verified installs the primary path remains the goal.
 
+### Cache integrity check
+
+The cached `stellar-canary` binary is accompanied by a sibling SHA-256 sidecar
+file (`stellar-canary.sha256`). On cache restore, this Action recomputes the
+binary's digest and compares it to the sidecar before it is executed. If the
+sidecar is missing, malformed, or the binary hash differs, the Action discards
+that cache entry and falls back to a fresh install instead of trusting the
+restored binary.
+
+This check detects modifications after installation and while restoring a cache
+entry. It does not validate the integrity of the original upstream source or
+artifact publication process; it only verifies that the file on this runner still
+matches the digest captured at install time.
+
 ## Subprocess isolation
 
 Pull request source code is treated as untrusted. This Action:
@@ -109,6 +126,34 @@ workflow's `rpc-url` happens to embed a credential in its query string
 (not a pattern this project recommends), that is echoed only insofar as
 Canary itself might log it — the same as any other CLI argument a workflow
 author chooses to pass.
+
+## Release provenance and attestation
+
+The release workflow emits a build provenance attestation for the committed
+`dist/` bundle before creating the GitHub Release. Consumers can verify that the
+workflow and repository identity match the expected release pipeline with
+`gh attestation verify`.
+
+Example verification commands:
+
+```bash
+# Verify the attestation against the repo identity and the expected release workflow.
+gh attestation verify dist/index.js \
+  --repo StellarCanary/ProtocolCanary-Action \
+  --source-branch main \
+  --workflow-path .github/workflows/release.yml
+
+# Verify the built action bundle or a single artifact in dist/ for a tagged release.
+gh attestation verify dist/index.js \
+  --repo StellarCanary/ProtocolCanary-Action \
+  --predicate-type https://in-toto.io/attestation/v0.1 \
+  --workflow-path .github/workflows/release.yml
+```
+
+These checks confirm that the artifact was produced by this repository's
+release workflow, not that the upstream Rust source itself was signed by a
+trusted maintainer. The provenance attestation is a build-chain guarantee for
+this action bundle; it is not a substitute for upstream project signing.
 
 ## Supported versions
 

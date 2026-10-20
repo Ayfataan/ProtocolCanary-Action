@@ -398,6 +398,12 @@ runner needs an
 enough to bundle Node 24 (v2.328.0 or later), or the step fails to start
 with an opaque runtime error before Canary is ever installed or run.
 
+The actual `stellar-canary` binary is installed into a private sandbox under
+`$RUNNER_TEMP/stellar-canary-action/bin` (or the equivalent temporary directory on
+non-GitHub hosts) and executed by absolute path. The Action does not modify
+`PATH`, does not install into the shared Cargo home, and does not rely on a
+user-visible `cargo` bin directory on the runner.
+
 ## Versioning
 
 This repository follows semver and publishes a floating `v1` tag pointing
