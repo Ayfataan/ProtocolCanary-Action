@@ -123,6 +123,7 @@ const INPUTS: ActionInputs = {
   fixturesPackProtocol: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  strictIntegrity: false,
 };
 
 const PASS_REPORT = report({
@@ -205,7 +206,7 @@ describe("run", () => {
     await run();
 
     expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
-    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined);
+    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined, false);
   });
 
   // #271, branch 1: a child killed by a signal closes with a null exit code,
@@ -311,8 +312,10 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("report", reportPath);
 
     // The success-path summary rendering was attempted exactly once, and a
-    // passing report emits no annotations.
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+    // passing report emits no annotations. The second argument is the
+    // provenance metadata plumbed into the summary (#373): the mocked
+    // binary path does not exist, so only the engine version is reported.
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, { engineVersion: "0.1.0" });
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
     expect(warningMock).not.toHaveBeenCalled();
@@ -395,6 +398,7 @@ describe("run", () => {
       expect.anything(),
       60_000,
       "ghp_custom123",
+      false,
     );
   });
 

@@ -73,6 +73,7 @@ describe("getInputs", () => {
       fixturesPackProtocol: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      strictIntegrity: false,
     });
   });
 

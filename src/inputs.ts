@@ -33,6 +33,9 @@ export interface ActionInputs {
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
   readonly generateReceipt: boolean;
+  /** Fail closed whenever binary integrity cannot be proven (issue #372).
+   * Default `false` preserves the historical degrade-to-pinning behaviour. */
+  readonly strictIntegrity: boolean;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;
@@ -91,6 +94,8 @@ export function getInputs(): ActionInputs {
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
 
+  const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
+
   // A validated input that silently does nothing is worse than a missing one:
   // it reads as "my pack is pinned" when the run used whatever
   // `--fixtures-dir` happened to contain. Say so explicitly, the same way an
@@ -120,6 +125,7 @@ export function getInputs(): ActionInputs {
     fixturesPackProtocol,
     githubToken,
     generateReceipt,
+    strictIntegrity,
   };
 }
 
