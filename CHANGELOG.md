@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `rpc-timeout-seconds`, `max-concurrency`, `no-cache` and
+  `live-cache-ttl-seconds` inputs forward the engine's check options
+  (`--rpc-timeout`, `--max-concurrency`, `--no-cache`, `--live-cache-ttl`)
+  to Protocol-Canary. None has a default: an omitted input keeps the
+  engine's own default, and each flag is only passed when the resolved
+  `version` is 0.2.0 or newer — with an older engine the flag is skipped
+  and a `core.info` note names the input and the required version, the same
+  way `allow-empty` already behaves (the one-off version check is now a
+  table where every gated flag declares its first supporting release). The
+  numeric inputs are parsed strictly (digits only, no `parseInt` leniency)
+  and bounded: `rpc-timeout-seconds` 1–600, `max-concurrency` 1–64,
+  `live-cache-ttl-seconds` 1–604800 (7 days); invalid values fail with an
+  `InvalidInput` error naming the input. `no-cache: true` together with
+  `live-cache-ttl-seconds` is rejected during validation, because the
+  engine declares the two flags conflicting (`no-cache: false` with a TTL
+  is accepted) ([#413]).
+
 - `fixtures-pack-version` and `fixtures-pack-protocol` inputs, validated when
   set: the version must be a published pack release tag (`v1.2.0` or
   `1.2.0`, with an unpinned value such as `latest`/`main` rejected) and the
