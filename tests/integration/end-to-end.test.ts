@@ -16,6 +16,40 @@ vi.mock("@actions/core", async (importOriginal) => {
   return { ...actual, setFailed: setFailedMock, error: errorMock, warning: warningMock, info: infoMock };
 });
 
+// Mock ensureCanaryInstalled to use the fixture's mock binary without
+// making real network calls. The fixture places the mock at
+// cargoHome/bin/stellar-canary; this mock intercepts the install so the
+// real install chain (downloading from GitHub / prebuilt assets) is avoided.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+vi.mock("../../src/canary", async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/canary')>();
+  return {
+    ...actual,
+    ensureCanaryInstalled: vi.fn().mockImplementation(() => {
+      const cargoHome = process.env.CARGO_HOME ?? "";
+      const binaryDir = path.join(cargoHome, "bin");
+      const binaryPath = path.join(binaryDir, "stellar-canary");
+
+      try {
+        fs.mkdirSync(binaryDir, { recursive: true });
+        // The fixture copies the mock binary; ensure it exists for the test.
+        if (!fs.existsSync(binaryPath)) {
+          const mockSource = path.join(__dirname, "..", "fixtures", "mock-canary.cjs");
+          fs.copyFileSync(mockSource, binaryPath);
+          fs.chmodSync(binaryPath, 0o755);
+        }
+      } catch (_error) {
+        // Best-effort: don't block the test if we can't create the directory.
+      }
+
+      return {
+        binaryPath,
+        version: "0.1.0",
+      };
+    }),
+  };
+});
+
 // #278: the upload-report=true scenario asserts against the artifact client's
 // upload method, mocked here exactly the way tests/unit/artifact.test.ts does.
 const { uploadArtifactMock } = vi.hoisted(() => ({ uploadArtifactMock: vi.fn() }));

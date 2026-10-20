@@ -58,9 +58,6 @@ which:
   that resolution fails (for example, a transient GitHub API error) —
   this Action never silently falls back to an unpinned or different
   version;
-- installs the binary into a private runner-temp root under
-  `$RUNNER_TEMP/stellar-canary-action` rather than the shared Cargo home and
-  never adds that directory to `PATH` for downstream steps;
 - uses `--locked`, so the exact dependency versions in `Protocol-Canary`'s
   own committed `Cargo.lock` are used rather than whatever the latest
   compatible versions happen to be at build time;
@@ -87,7 +84,7 @@ A compiled-from-a-pinned-commit build is still a weaker integrity story
 than a checksum published by the artifact's own maintainers, so making
 checksum-verified installs the primary path remains the goal.
 
-### Cache integrity check
+## Cache integrity check
 
 The cached `stellar-canary` binary is accompanied by a sibling SHA-256 sidecar
 file (`stellar-canary.sha256`). On cache restore, this Action recomputes the
@@ -96,10 +93,10 @@ sidecar is missing, malformed, or the binary hash differs, the Action discards
 that cache entry and falls back to a fresh install instead of trusting the
 restored binary.
 
-This check detects modifications after installation and while restoring a cache
-entry. It does not validate the integrity of the original upstream source or
-artifact publication process; it only verifies that the file on this runner still
-matches the digest captured at install time.
+This check detects modifications after installation and while restoring a
+cache entry. It does not validate the integrity of the original upstream source
+or artifact publication process; it only verifies that the file on this runner
+still matches the digest captured at install time.
 
 ## Subprocess isolation
 
@@ -112,16 +109,55 @@ Pull request source code is treated as untrusted. This Action:
   see `src/runner.ts`;
 - enforces a configurable timeout and forwards workflow cancellation
   signals to the child process, so a hung or malicious process cannot
-  outlive the job.
+  outlive the job;
+- decodes child process streams statefully as UTF-8, bounding stdout to
+  64 MiB (terminating the process if exceeded) and stderr capture to 1 MiB
+  (retaining the tail with a notice).
+
+## External diagnostics and output safety
+
+Diagnostics printed by external tools (`cargo install` build errors and
+`stellar-canary check` engine stderr) are untrusted text: they can quote
+arbitrary text from dependency source, environment variables, or third-party
+fixtures. Before external text is printed in job logs, annotations, or the
+execution-failure summary:
+
+- **Redacted:** Passed through `redact` from `src/redact.ts`. Recognised secrets
+  (GitHub tokens like `ghp_` or `github_pat_`, Stellar secret seeds like `S...`,
+  sensitive environment variable values, and URLs with embedded credentials) are
+  masked with `[REDACTED]`.
+- **ANSI & Control Character Stripping:** ANSI escape sequences and colors are
+  removed. ASCII control characters other than newline (`\n`) and tab (`\t`) are
+  stripped (including `\r`).
+- **Command-safe log blocks:** To prevent workflow command injection (a line
+  beginning with `::` being parsed by the GitHub Actions runner as a workflow
+  command such as `::add-mask::` or `::set-env::`), external logs are wrapped in
+  collapsed log groups (`core.startGroup` / `core.endGroup`) preceded by
+  `::stop-commands::<token>` and closed by `::<token>::`, using a fresh 128-bit
+  cryptographically random token generated per block. In annotations and error
+  messages, `::` sequences are escaped to `\:\:`.
+- **Bounded:** Error message diagnostics are capped at 40 lines and 8 KiB. Log
+  blocks are capped at 200 lines and 64 KiB, with explicit truncation notices
+  shown when either limit is hit.
 
 ## Secret handling
 
-This Action never dumps the process environment and never prints a GitHub
-token. When `GITHUB_TOKEN` is present it is used only as a bearer
-credential for read-only requests to the public
-`StellarCanary/Protocol-Canary` API, and is never echoed to logs,
-outputs, or the job summary. The Action does not require any secret for
-its core function. If a
+This Action never dumps the process environment and never prints secrets to
+logs. The `github-token` input (default `${{ github.token }}`) is registered
+with `core.setSecret` upon receipt so that the GitHub Actions runner will mask
+any accidental appearance.
+
+The token is used strictly as a bearer credential for read-only requests to the
+GitHub REST API at `api.github.com` (for version resolution and checksum
+manifest lookup) to raise API rate limits. It is:
+
+- strictly restricted to `api.github.com` — the `Authorization` header is never
+  sent to arbitrary hosts or to release asset download URLs (such as `github.com`);
+- never forwarded to child processes or echoed to logs, outputs, or summaries;
+- operable with minimal read-only permissions (`contents: read`), making it safe
+  for pull requests from forks without granting write access.
+
+The Action does not require any secret for its core function. If a
 workflow's `rpc-url` happens to embed a credential in its query string
 (not a pattern this project recommends), that is echoed only insofar as
 Canary itself might log it — the same as any other CLI argument a workflow
@@ -155,6 +191,14 @@ release workflow, not that the upstream Rust source itself was signed by a
 trusted maintainer. The provenance attestation is a build-chain guarantee for
 this action bundle; it is not a substitute for upstream project signing.
 
+## Full integrity model
+
+The full integrity model — trust boundaries, the optional
+`strict-integrity` fail-closed policy, the D-07 (checksums are data
+integrity, not author authenticity) and D-11 (redirect policy unresolved,
+so no redirect is followed) decision boundaries, and the threat model — is
+documented in [`docs/integrity-model.md`](docs/integrity-model.md).
+
 ## Supported versions
 
 | Version | Supported |
@@ -187,10 +231,3 @@ filing a public issue. Include:
 We aim to acknowledge new reports within **5 business days**. After
 acknowledging a report, we will work with you on a fix and disclosure
 timeline before any public write-up.
-
-This is a single-maintainer, pre-1.0 project, so the 5-business-day target
-is for the initial acknowledgement only, not for a fix: a fix and its
-release depend on the severity and complexity of the issue. If you have
-not received an acknowledgement within 5 business days, please follow up
-on your existing private report thread rather than opening a public issue,
-so the report is not lost or unintentionally disclosed.

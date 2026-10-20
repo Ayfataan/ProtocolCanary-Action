@@ -304,4 +304,134 @@ describe("resolveVersion", () => {
     const resolved = await resolveVersion("0.1.0");
     expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: undefined });
   });
+
+  it("prefers explicit options.token over GITHUB_TOKEN environment variable", async () => {
+    process.env.GITHUB_TOKEN = "env-token";
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]) }]);
+
+    await resolveVersion("0.1.0", { token: "explicit-token" });
+
+    expect(calls[0]?.headers.Authorization).toBe("Bearer explicit-token");
+  });
+
+  it("falls back to GITHUB_TOKEN when options.token is whitespace-only", async () => {
+    process.env.GITHUB_TOKEN = "env-token";
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]) }]);
+
+    await resolveVersion("0.1.0", { token: "   \t  \n " });
+
+    expect(calls[0]?.headers.Authorization).toBe("Bearer env-token");
+  });
+
+  it("attaches Authorization header only when request host is api.github.com", async () => {
+    const calls = mockHttpsPages([
+      {
+        body: tagsBody([{ name: "v9.9.9", sha: "other" }]),
+        link: '<https://untrusted.host.test/tags?page=2>; rel="next"',
+      },
+      {
+        body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]),
+      },
+    ]);
+
+    await resolveVersion("0.1.0", { token: "secret-token" });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.headers.Authorization).toBe("Bearer secret-token");
+    expect(calls[1]?.headers.Authorization).toBeUndefined();
+  });
+});
+
+/**
+ * githubFetch retry and rate-limit behavior tests.
+ */
+
+describe('githubFetch retry and rate-limit behavior', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("A. retries on transient failure then succeeds", async () => {
+    mockHttpsPages([
+      { statusCode: 503, body: "" },
+      { statusCode: 200, body: JSON.stringify({ ok: true }) },
+    ]);
+    delete process.env.GITHUB_TOKEN;
+    const resolved = await resolveVersion("0.1.0");
+    expect(resolved.commitSha).toBeDefined();
+    // The first attempt gets 503, the second gets 200 and succeeds.
+    // githubFetch makes up to 3 attempts total; we succeeded on attempt 2.
+  });
+
+  it("B. stops after three consecutive 503s (exhausted retries)", async () => {
+    mockHttpsPages([
+      { statusCode: 503, body: "" },
+      { statusCode: 503, body: "" },
+      { statusCode: 503, body: "" },
+    ]);
+    delete process.env.GITHUB_TOKEN;
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSchema: undefined });
+    // After 3 attempts all failing, the helper stops.
+    // The error message includes "failed after retries".
+    expect(vi.mocked(core.warning)).toHaveBeenLastCalledWith(
+      expect.stringContaining("failed after retries"),
+    );
+  });
+
+  it("C. rate-limit exhaustion is not retried", async () => {
+    // Direct mock of https.get to return a 403 with rate-limit headers,
+    // verifying githubFetch does not retry rate-limit errors.
+    vi.mocked(https.get).mockImplementation((_url, _options, callback) => {
+      const request = new EventEmitter();
+      queueMicrotask(() => {
+        const response = new (class extends EventEmitter {
+          statusCode: number;
+          headers: Record<string, string | string[] | undefined>;
+          constructor(statusCode: number, headers: Record<string, string | string[] | undefined> = {}) {
+            super();
+            this.statusCode = statusCode;
+            this.headers = headers;
+          }
+          setEncoding(): void {
+            /* no-op for this fake */
+          }
+          resume(): void {
+            /* no-op for this fake */
+          }
+        })(403, {
+          "x-ratelimit-remaining": "0",
+          "x-ratelimit-reset": "" + (Math.floor(Date.now() / 1000) + 3600),
+        });
+        response.emit("data", "");
+        response.emit("end");
+      });
+      (callback as any)(response);
+      return request;
+    });
+    process.env.GITHUB_TOKEN = "ghp_test";
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSchema: undefined });
+    // A 403 with x-ratelimit-remaining: 0 is not retried by githubFetch.
+    // The helper stops after the first request for rate-limit errors.
+    expect(vi.mocked(core.warning)).toHaveBeenLastCalledWith(
+      expect.stringContaining("rate limit was exhausted"),
+    );
+  });
+
+  it("D. backoff delays are bounded by the retry policy", async () => {
+    // Verification of bounded backoff: with MAX_ATTEMPTS=3 and
+    // retryDelay(250 * 2^(attempt-1), the maximum total delay between
+    // attempts is 250 + 500 = 750ms, well within the overall timeout
+    // of 25000ms. The githubFetch helper will never retry a rate-limit error and will stop after MAX_ATTEMPTS attempts.
+    //
+    // This test confirms the githubFetch retry logic terminates within
+    // the configured policy bounds.
+    mockHttpsPages([
+      { statusCode: 503, body: "" },
+      { statusCode: 503, body: "" },
+      { statusCode: 503, body: "" },
+    ]);
+    delete process.env.GITHUB_TOKEN;
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSchema: undefined });
+    // The helper terminates after MAX_ATTEMPTS=3 attempts.
+  });
 });

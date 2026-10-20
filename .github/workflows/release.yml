@@ -49,7 +49,7 @@ jobs:
           fi
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@fb234f5dcb66b52be4a7d3d1f2dba11e1a7d18c9 # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/**
 
@@ -57,6 +57,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
+          files: dist/index.js dist/index.js.map
 
       # Keep the floating major tag (v1) pointing at the latest release in
       # that major line. This used to be a manual step maintainers had to
