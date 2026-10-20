@@ -162,7 +162,7 @@ annotations), and never invokes Canary twice to get a second format.
 ## Outputs
 
 All values are strings, as GitHub Actions outputs always are. The counts
-(`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are decimal-string integers
+(`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are decimal-string integers
 (rendered with `String(n)`), and `status` is one of the five fixed
 literals below.
 
@@ -173,7 +173,11 @@ literals below.
 | `warnings` | Number of checks that produced a warning. | `"1"` |
 | `failures` | Number of checks that failed a compatibility assertion. | `"2"` |
 | `errors` | Number of checks that could not complete due to an execution error. | `"0"` |
-| `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. | `"3"` |
+| `total` | Total number of checks in the report counts. Explicitly set to `0` on an execution failure, like the other counts. | `"15"` |
+| `skipped` | Number of checks skipped. Explicitly set to `0` on an execution failure, like the other counts. | `"0"` |
+| `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. Explicitly set to `0` on an execution failure, like the other counts. | `"3"` |
+| `engine-version` | Protocol Canary engine version that produced the result, read from the installed binary. On an execution failure, set to the resolved version if installation succeeded, or an empty string if installation failed. | `"0.1.1"` |
+| `observed-protocol` | Stellar protocol version reported by the network during live checks (`network.observedProtocol`), or an empty string when the report has no network object. Explicitly set to an empty string on an execution failure. | `"28"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
 | `receipt-path` | Absolute path to the generated Execution Receipt JSON. Set only when `generate-receipt` is `true` and Canary produced a parseable report; unset otherwise, including on an execution failure. | `/home/runner/work/_temp/stellar-canary-receipt.json` |
 
@@ -187,8 +191,9 @@ A concrete consumer, using the outputs to gate a follow-up step:
 - name: React to the result
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
+```
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol` is set to an empty string `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 
 ## How failures appear
 

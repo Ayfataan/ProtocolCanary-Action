@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Enforce coverage thresholds in CI on Ubuntu runs and report the text coverage
+  summary to the workflow job summary (`$GITHUB_STEP_SUMMARY`) inside a fenced
+  code block (#410).
 - `fixtures-pack-version` and `fixtures-pack-protocol` inputs, validated when
   set: the version must be a published pack release tag (`v1.2.0` or
   `1.2.0`, with an unpinned value such as `latest`/`main` rejected) and the

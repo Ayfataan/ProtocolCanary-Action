@@ -198,6 +198,14 @@ outputs:
     description: Number of checks that failed a compatibility assertion.
   errors:
     description: Number of checks that could not complete due to an execution error.
+  total:
+    description: >-
+      Total number of checks in the report counts. Explicitly set to `0` on
+      an execution failure, like the other counts.
+  skipped:
+    description: >-
+      Number of checks skipped. Explicitly set to `0` on an execution failure,
+      like the other counts.
   replayed-count:
     description: >-
       Number of checks whose results were replayed from Protocol Canary's
@@ -206,6 +214,16 @@ outputs:
       results carrying any replayed marker; engines whose reports predate
       the cache produce `0`. Explicitly set to `0` on an execution failure,
       like the other counts.
+  engine-version:
+    description: >-
+      Protocol Canary engine version that produced the result, read from the
+      installed binary. On an execution failure, set to the resolved version if
+      installation succeeded, or an empty string if installation failed.
+  observed-protocol:
+    description: >-
+      Stellar protocol version reported by the network during live checks
+      (`network.observedProtocol`), or an empty string when the report has no
+      network object. Explicitly set to an empty string on an execution failure.
   report:
     description: >-
       Absolute path to the generated JSON report file. Only set when Canary
