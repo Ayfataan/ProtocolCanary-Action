@@ -13,6 +13,15 @@ name: Weekly live integration (Protocol 29)
 # pull requests, so this runs only on the weekly schedule and on manual
 # dispatch.
 #
+# The Fixtures checkout is pinned to the immutable `protocol-28` pack tag
+# (recorded as a full commit SHA on the checkout step) so the scheduled run
+# changes only when the network or the pinned inputs change: a fixture
+# merged into ProtocolCanary-Fixtures on Sunday cannot move Monday's result
+# (#419). Each run prints the commit it actually tested in the step
+# summary. Scheduled runs always use the pin; a manual dispatch may
+# override it with the `fixtures_ref` input. Moving the pin is documented
+# in CONTRIBUTING.md ("Pinning the fixtures pack").
+#
 # Network configuration (the current Protocol 29 test networks):
 #   testnet  — passphrase "Test SDF Network ; September 2015",
 #              RPC https://soroban-testnet.stellar.org
@@ -25,6 +34,11 @@ name: Weekly live integration (Protocol 29)
 
 on:
   workflow_dispatch:
+    inputs:
+      fixtures_ref:
+        description: ProtocolCanary-Fixtures tag, branch or commit to test instead of the pinned protocol-28 pack (empty = the pin)
+        required: false
+        default: ""
   schedule:
     - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
 
@@ -57,19 +71,53 @@ jobs:
     steps:
       - name: Checkout this Action
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Checkout ProtocolCanary-Fixtures
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: StellarCanary/ProtocolCanary-Fixtures
           path: fixtures
+          # Immutable pin (#419): the full commit SHA behind the `protocol-28`
+          # tag (tag object 285d7fc → commit 75ec2c2), recorded here so the
+          # scheduled run tests exactly that pack. Move the pin only when the
+          # fixtures repository publishes a new pack release, in its own PR —
+          # see "Pinning the fixtures pack" in CONTRIBUTING.md. A manual run
+          # overrides this with the `fixtures_ref` workflow input; a ref that
+          # does not exist fails the job at this step.
+          ref: ${{ inputs.fixtures_ref || '75ec2c293a44f09d9c8c1f76722a24a2334ac20a' }}
+          persist-credentials: false
+
+      - name: Record the fixtures pack under test
+        shell: bash
+        env:
+          REQUESTED_FIXTURES_REF: ${{ inputs.fixtures_ref }}
+        run: |
+          set -euo pipefail
+          commit=$(git -C fixtures rev-parse HEAD)
+          echo "fixtures commit tested: ${commit}"
+          if [ -n "${REQUESTED_FIXTURES_REF:-}" ]; then
+            requested="${REQUESTED_FIXTURES_REF} (manual fixtures_ref override)"
+          else
+            requested="pinned protocol-28 tag (workflow pin)"
+          fi
+          {
+            echo "### Fixtures pack under test"
+            echo ""
+            echo "- Requested ref: \`${requested}\`"
+            echo "- Resolved commit: \`${commit}\`"
+            echo "- Pack directory: \`fixtures/protocol-28\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run Stellar Protocol Canary (this Action, from source)
         uses: ./
         with:
           protocol: "29"
-          # Newest published pack; the Protocol 29 pack replaces this path as
-          # soon as ProtocolCanary-Fixtures ships it.
+          # Pack from the pinned fixtures ref above (`protocol-28`); when
+          # ProtocolCanary-Fixtures ships a Protocol 29 pack, move the pin
+          # and this path in the same PR (CONTRIBUTING.md, "Pinning the
+          # fixtures pack").
           fixtures-dir: fixtures/protocol-28
           network: ${{ matrix.network }}
           rpc-url: ${{ matrix.rpc-url }}

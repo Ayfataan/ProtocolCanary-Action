@@ -7,7 +7,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
-import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck } from "../../src/runner";
+import {
+  MAX_STDERR_CAPTURE_BYTES,
+  STDERR_DROPPED_NOTICE,
+  buildCheckArgs,
+  engineSupportsAllowEmpty,
+  extractDiagnostic,
+  runCheck,
+} from "../../src/runner";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -58,6 +65,8 @@ const BASE_INPUTS: ActionInputs = {
   allowEmpty: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  githubToken: undefined,
+  generateReceipt: false,
 };
 
 describe("buildCheckArgs", () => {
@@ -438,5 +447,118 @@ describe("extractDiagnostic", () => {
     const diagnostic = extractDiagnostic(long);
     expect(diagnostic.length).toBe(500);
     expect(diagnostic.startsWith("error: ")).toBe(true);
+  });
+});
+
+describe("UTF-8 stream decoding and bounded capture (issue #427)", () => {
+  it("survives 2, 3 and 4 byte characters being split at every possible byte offset across child writes", async () => {
+    // 2-byte: é (0xC3 0xA9)
+    // 3-byte: € (0xE2 0x82 0xAC)
+    // 4-byte: 🎉 (0xF0 0x9F 0x8E 0x89)
+    const script = `
+      const e2 = Buffer.from("é", "utf8");
+      const e3 = Buffer.from("€", "utf8");
+      const e4 = Buffer.from("🎉", "utf8");
+
+      // Split 2-byte at offset 1
+      process.stdout.write(e2.subarray(0, 1));
+      process.stdout.write(e2.subarray(1));
+
+      // Split 3-byte at offset 1 and 2
+      process.stdout.write(e3.subarray(0, 1));
+      process.stdout.write(e3.subarray(1));
+      process.stdout.write(e3.subarray(0, 2));
+      process.stdout.write(e3.subarray(2));
+
+      // Split 4-byte at offset 1, 2, 3
+      process.stdout.write(e4.subarray(0, 1));
+      process.stdout.write(e4.subarray(1));
+      process.stdout.write(e4.subarray(0, 2));
+      process.stdout.write(e4.subarray(2));
+      process.stdout.write(e4.subarray(0, 3));
+      process.stdout.write(e4.subarray(3));
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("é€€🎉🎉🎉");
+    expect(result.stdout).not.toContain("\uFFFD");
+  });
+
+  it("handles one-byte chunks without corrupting text", async () => {
+    const script = `
+      const buf = Buffer.from("Stellar Protocol Canary 🚀 € 28", "utf8");
+      for (const b of buf) {
+        process.stdout.write(Buffer.from([b]));
+      }
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("Stellar Protocol Canary 🚀 € 28");
+  });
+
+  it("replaces invalid byte sequences and lone continuation bytes without damaging surrounding valid text", async () => {
+    const script = `
+      process.stdout.write(Buffer.from([0x61, 0xFF, 0x62])); // 'a', 0xFF, 'b'
+      process.stdout.write(Buffer.from([0x63, 0x80, 0x64])); // 'c', 0x80, 'd'
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("a\uFFFDb\nc\uFFFDd".replace("\n", ""));
+  });
+
+  it("handles an empty stream cleanly", async () => {
+    const result = await runCheck(process.execPath, ["-e", ""], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+  });
+
+  it("terminates child and fails with CanaryExecutionFailedError when stdout exceeds 64 MiB", async () => {
+    // 65 MiB in stdout
+    const script = `
+      process.stdout.write(Buffer.alloc(65 * 1024 * 1024, "a"));
+    `;
+
+    await expect(runCheck(process.execPath, ["-e", script], 10_000)).rejects.toThrow(
+      CanaryExecutionFailedError,
+    );
+
+    try {
+      await runCheck(process.execPath, ["-e", script], 10_000);
+    } catch (err) {
+      expect(err).toBeInstanceOf(CanaryExecutionFailedError);
+      const message = (err as CanaryExecutionFailedError).message;
+      expect(message).toContain("64 MiB");
+      expect(message).toContain("output was truncated");
+      expect(message).toContain("process terminated");
+    }
+  });
+
+  it("terminates a child that writes stdout without ever exiting", async () => {
+    const script = `
+      setInterval(() => {
+        process.stdout.write(Buffer.alloc(1024 * 1024, "x"));
+      }, 5);
+    `;
+
+    await expect(runCheck(process.execPath, ["-e", script], 10_000)).rejects.toThrow(
+      CanaryExecutionFailedError,
+    );
+  });
+
+  it("keeps bounded tail and prepends notice when stderr exceeds 1 MiB", async () => {
+    const script = `
+      process.stderr.write(Buffer.alloc(2 * 1024 * 1024, "e"));
+      process.stderr.write("FINAL ROOT DIAGNOSTIC ERROR\\n");
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 10_000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
+    expect(result.stderr).toContain("FINAL ROOT DIAGNOSTIC ERROR");
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_STDERR_CAPTURE_BYTES);
   });
 });

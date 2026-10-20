@@ -126,6 +126,35 @@ export function extractDiagnostic(stderr: string): string {
 export const SIGKILL_GRACE_MS = 5000;
 
 /**
+ * Maximum stdout captured from `stellar-canary check` (64 MiB).
+ * If the engine emits more than this limit, the process is terminated and the run
+ * fails with a `CanaryExecutionFailedError` rather than exhausting runner memory.
+ */
+export const MAX_STDOUT_CAPTURE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Maximum stderr captured from `stellar-canary check` (1 MiB).
+ * If stderr exceeds this limit, earlier output is dropped and the tail is retained
+ * with a notice so that root diagnostics remain visible without unbounded memory growth.
+ */
+export const MAX_STDERR_CAPTURE_BYTES = 1 * 1024 * 1024;
+
+/** Notice prepended to stderr when earlier output was dropped due to exceeding capture limits. */
+export const STDERR_DROPPED_NOTICE = "[... earlier output dropped ...]\n";
+
+function sliceTailSafely(str: string, maxBytes: number): string {
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= maxBytes) {
+    return str;
+  }
+  let start = buf.length - maxBytes;
+  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) {
+    start++;
+  }
+  return buf.subarray(start).toString("utf8");
+}
+
+/**
  * Floor for the `cargo install` time bound derived from `timeout-minutes`.
  *
  * `timeout-minutes` is documented as bounding the `stellar-canary check`
@@ -164,8 +193,19 @@ export function runCheck(
   return new Promise((resolve, reject) => {
     const child = spawn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 
+    if (typeof child.stdout?.setEncoding === "function") {
+      child.stdout.setEncoding("utf8");
+    }
+    if (typeof child.stderr?.setEncoding === "function") {
+      child.stderr.setEncoding("utf8");
+    }
+
     let stdout = "";
+    let stdoutBytes = 0;
+    let stdoutExceeded = false;
     let stderr = "";
+    let stderrBytes = 0;
+    let stderrTruncated = false;
     let settled = false;
     let timedOut = false;
     let sigkillHandle: NodeJS.Timeout | undefined;
@@ -198,11 +238,40 @@ export function runCheck(
       }
     };
 
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+    child.stdout.on("data", (chunk: string | Buffer) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (stdoutExceeded) {
+        return;
+      }
+      const chunkBytes = Buffer.byteLength(text, "utf8");
+      if (stdoutBytes + chunkBytes > MAX_STDOUT_CAPTURE_BYTES) {
+        stdoutExceeded = true;
+        child.stdout.pause();
+        child.stdout.destroy();
+        if (sigkillHandle === undefined) {
+          sigkillHandle = setTimeout(() => {
+            child.kill("SIGKILL");
+          }, sigkillGraceMs);
+        }
+        child.kill("SIGTERM");
+        return;
+      }
+      stdout += text;
+      stdoutBytes += chunkBytes;
     });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+
+    child.stderr.on("data", (chunk: string | Buffer) => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const chunkBytes = Buffer.byteLength(text, "utf8");
+      stderrBytes += chunkBytes;
+      stderr += text;
+
+      if (stderrBytes > MAX_STDERR_CAPTURE_BYTES) {
+        stderrTruncated = true;
+        if (stderr.length > MAX_STDERR_CAPTURE_BYTES * 1.5) {
+          stderr = sliceTailSafely(stderr, MAX_STDERR_CAPTURE_BYTES);
+        }
+      }
     });
 
     child.on("error", (error) => {
@@ -217,16 +286,35 @@ export function runCheck(
       settled = true;
       cleanup();
 
-      if (timedOut) {
+      let finalStderr = stderr;
+      if (stderrTruncated) {
+        const noticeBuf = Buffer.from(STDERR_DROPPED_NOTICE, "utf8");
+        const targetBytes = Math.max(0, MAX_STDERR_CAPTURE_BYTES - noticeBuf.length);
+        const tail = sliceTailSafely(stderr, targetBytes);
+        finalStderr = `${STDERR_DROPPED_NOTICE}${tail}`;
+      }
+
+      if (stdoutExceeded) {
         reject(
-          new TimeoutError(
-            `Stellar Protocol Canary timed out after ${String(Math.round(timeoutMs / 1000))}s and was terminated.`,
+          new CanaryExecutionFailedError(
+            `Canary stdout exceeded limit of ${String(MAX_STDOUT_CAPTURE_BYTES / (1024 * 1024))} MiB and output was truncated; process terminated.`,
           ),
         );
         return;
       }
 
-      resolve({ exitCode, signal, stdout, stderr });
+      if (timedOut) {
+        reject(
+          new TimeoutError(
+            `Stellar Protocol Canary timed out after ${String(Math.round(timeoutMs / 1000))}s and was terminated.`,
+            stdout,
+            finalStderr,
+          ),
+        );
+        return;
+      }
+
+      resolve({ exitCode, signal, stdout, stderr: finalStderr });
     });
   });
 }
