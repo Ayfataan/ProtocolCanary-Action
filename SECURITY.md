@@ -84,6 +84,12 @@ A compiled-from-a-pinned-commit build is still a weaker integrity story
 than a checksum published by the artifact's own maintainers, so making
 checksum-verified installs the primary path remains the goal.
 
+The full integrity model — trust boundaries, the optional
+`strict-integrity` fail-closed policy, the D-07 (checksums are data
+integrity, not author authenticity) and D-11 (redirect policy unresolved,
+so no redirect is followed) decision boundaries, and the threat model — is
+documented in [`docs/integrity-model.md`](docs/integrity-model.md).
+
 ## Subprocess isolation
 
 Pull request source code is treated as untrusted. This Action:

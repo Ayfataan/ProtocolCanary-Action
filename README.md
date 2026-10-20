@@ -542,6 +542,7 @@ Repositories that want a single-declaration compatibility check can call the
 maintained reusable workflow; its inputs, outputs, and matrix, monorepo, and
 PR-gating examples are documented in
 [`docs/reusable-workflow.md`](docs/reusable-workflow.md).
+The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail-closed policy are documented in [`docs/integrity-model.md`](docs/integrity-model.md).
 
 ## License
 
