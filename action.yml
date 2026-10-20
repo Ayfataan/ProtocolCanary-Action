@@ -140,6 +140,33 @@ inputs:
       protocol a run actually checks is controlled by `protocol`.
     required: false
 
+  github-token:
+    description: >-
+      GitHub token used to authenticate read-only GitHub REST API requests
+      to the public `StellarCanary/Protocol-Canary` repository (tag and release
+      lookups). Defaults to `${{ github.token }}`. If set to a non-empty value,
+      it takes precedence over the `GITHUB_TOKEN` environment variable. If empty
+      or unset, the `GITHUB_TOKEN` environment variable is used if present;
+      otherwise unauthenticated requests are made. Requires only `contents: read`
+      permission, which works even in fork pull requests. Set to an empty string
+      (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
+    required: false
+    default: ${{ github.token }}
+
+  generate-receipt:
+    description: >-
+      Generate a machine-readable Execution Receipt (`receiptVersion: 1`)
+      recording the provenance of this run — engine version, engine build
+      commit, fixture-pack digest, target protocol, observed protocol, and
+      timestamp — write it to the runner temp directory, and upload it as
+      the workflow artifact `stellar-canary-receipt-<run-id>`. Defaults to
+      `false`; set to `true` to opt in. The receipt is a lightweight
+      provenance record, not a signed cryptographic attestation. Fields the
+      engine's report does not carry (for example older releases without
+      `engineCommit`/`packDigest`) are recorded as `unknown`.
+    required: false
+    default: "false"
+
 outputs:
   status:
     description: >-
@@ -178,6 +205,11 @@ outputs:
       `none`. Intended for a downstream job that gates a promotion on
       coverage rather than on `status` alone; `none` is the conservative
       default for a run that cannot prove it executed the fixtures.
+  receipt-path:
+    description: >-
+      Absolute path to the generated Execution Receipt JSON. Only set when
+      `generate-receipt` is `true` and Canary produced a parseable report;
+      unset otherwise, including on an execution failure.
 
 runs:
   using: node24

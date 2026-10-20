@@ -1,0 +1,11 @@
+# Sample project consumed by .github/workflows/test-reusable-workflow.yml
+# (#370) and by tests/unit/reusable-workflow-conformance.test.ts. It gives the
+# reusable workflow an unambiguous `project-root` whose config and fixture
+# discovery resolve inside the repository's own test suite.
+version = 1
+protocol = 28
+
+[tests]
+xdr = true
+rpc = false
+soroban = false

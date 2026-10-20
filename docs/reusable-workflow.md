@@ -103,3 +103,95 @@ jobs:
   `stellar-protocol-canary-report`, the Action's stable artifact name. A
   caller running the workflow twice in one workflow run gets the Action's
   documented suffixed fallback name for the second artifact.
+
+## Matrix checks
+
+One verdict per protocol version, in a single job. Matrix legs of a reusable
+workflow call are independent, so pin `fail-fast: false` to collect every
+verdict instead of stopping at the first failure.
+
+```yaml
+name: Protocol matrix
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        protocol: [27, 28]
+    uses: StellarCanary/ProtocolCanary-Action/.github/workflows/reusable-canary-check.yml@v1
+    with:
+      protocol: ${{ matrix.protocol }}
+```
+
+A matrix fans the call out into one job per combination, so its outputs are
+addressed per leg and cannot be consumed through a plain `needs:` reference.
+Gate on the matrix result with job-level status checks, and reserve the
+output-consuming pattern below for a single (non-matrix) call.
+
+## Monorepo configurations
+
+`project-root` scopes configuration and fixture discovery to one package, so a
+monorepo can check every package that owns a `.stellar-canary.toml` with the
+same declared contract. Listing the packages explicitly in the matrix keeps
+the set reviewable; a generated `matrix.include` from a path-detection job
+works the same way.
+
+```yaml
+name: Monorepo compatibility
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - packages/core
+          - services/ledger
+    uses: StellarCanary/ProtocolCanary-Action/.github/workflows/reusable-canary-check.yml@v1
+    with:
+      project-root: ${{ matrix.project }}
+      protocol: 28
+```
+
+## PR gating patterns
+
+The `exit-code` output survives a failed job, so a downstream job can react
+without duplicating the verdict logic — the reusable workflow is called once
+and the gate is expressed in plain job dependencies:
+
+```yaml
+name: Compatibility gate
+on:
+  pull_request:
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  canary:
+    uses: StellarCanary/ProtocolCanary-Action/.github/workflows/reusable-canary-check.yml@v1
+    with:
+      fail-on-warning: true
+  require-green:
+    needs: canary
+    runs-on: ubuntu-latest
+    if: needs.canary.outputs.exit-code == '0'
+    steps:
+      - run: echo "Protocol Canary passed; the change is safe to merge."
+```
+
+For required status checks, pin the check to the `canary` job's name
+(`Protocol Canary (28)`) rather than to the downstream job; `fail-on-warning`
+already converts a `warning` verdict into a failed job, and the downstream
+pattern is for reactions beyond blocking (summaries, notifications).
+
+When a baseline comparison is requested (`baseline-report`), gate on
+`diff-verdict` as well: while the engine's diff command is unreleased the
+output is `unavailable`, and a policy that "the diff must show no regressions"
+must not silently pass on that value.

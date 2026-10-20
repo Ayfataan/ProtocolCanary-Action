@@ -18,6 +18,8 @@ const coreMocks = vi.hoisted(() => ({
   infoMock: vi.fn(),
   debugMock: vi.fn(),
   warningMock: vi.fn(),
+  startGroupMock: vi.fn(),
+  endGroupMock: vi.fn(),
 }));
 
 const { execMock } = vi.hoisted(() => ({ execMock: vi.fn() }));
@@ -47,6 +49,8 @@ vi.mock("@actions/core", () => ({
   info: coreMocks.infoMock,
   debug: coreMocks.debugMock,
   warning: coreMocks.warningMock,
+  startGroup: coreMocks.startGroupMock,
+  endGroup: coreMocks.endGroupMock,
 }));
 
 vi.mock("@actions/exec", () => ({
@@ -74,6 +78,7 @@ vi.mock("node:os", async (importOriginal) => {
 import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "../../src/canary";
 import { CARGO_INSTALL_TIMEOUT_FLOOR_MS } from "../../src/runner";
 import { CanaryNotFoundError, InstallationFailedError } from "../../src/errors";
+import { REDACTED } from "../../src/redact";
 import type { ResolvedVersion } from "../../src/version";
 import { CANARY_REPO_URL } from "../../src/version";
 
@@ -96,9 +101,17 @@ class ImmediateChild extends EventEmitter {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
 
-  constructor(exitCode: number) {
+  constructor(exitCode: number, stdoutText = "", stderrText = "") {
     super();
-    queueMicrotask(() => this.emit("close", exitCode, null));
+    if (stdoutText !== "") {
+      this.stdout.write(stdoutText);
+    }
+    this.stdout.end();
+    if (stderrText !== "") {
+      this.stderr.write(stderrText);
+    }
+    this.stderr.end();
+    setImmediate(() => this.emit("close", exitCode, null));
   }
 
   kill(): boolean {
@@ -113,14 +126,22 @@ class HungChild extends EventEmitter {
   readonly signals: NodeJS.Signals[] = [];
 
   /** Whether the fake process exits in response to `SIGTERM` (rather than ignoring it). */
-  constructor(private readonly exitsOnSigterm: boolean) {
+  constructor(private readonly exitsOnSigterm: boolean, stdoutText = "", stderrText = "") {
     super();
+    if (stdoutText !== "") {
+      this.stdout.write(stdoutText);
+    }
+    if (stderrText !== "") {
+      this.stderr.write(stderrText);
+    }
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
     this.signals.push(signal);
     const exits = this.exitsOnSigterm ? signal === "SIGTERM" : signal === "SIGKILL";
     if (exits) {
+      this.stdout.end();
+      this.stderr.end();
       this.emit("close", null, signal);
     }
     return true;
@@ -448,10 +469,88 @@ describe("ensureCanaryInstalled", () => {
     }
   });
 
-  it("rejects when `cargo install` exits non-zero", async () => {
-    spawnMock.mockImplementation(() => new ImmediateChild(7) as unknown as ChildProcess);
+  it("rejects when `cargo install` exits non-zero and includes stderr diagnostics in the error and log group", async () => {
+    const stderrLines = Array.from({ length: 50 }, (_, i) => `cargo error line ${i + 1}`).join("\n");
+    spawnMock.mockImplementation(() => new ImmediateChild(101, "compiling deps", stderrLines) as unknown as ChildProcess);
 
-    await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(InstallationFailedError);
+    let caughtError: InstallationFailedError | undefined;
+    try {
+      await ensureCanaryInstalled(RESOLVED);
+    } catch (err) {
+      caughtError = err as InstallationFailedError;
+    }
+
+    expect(caughtError).toBeInstanceOf(InstallationFailedError);
+    expect(caughtError?.message).toContain("`cargo install` exited with code 101");
+    // Bounded to last 40 lines
+    expect(caughtError?.message).toContain("cargo error line 50");
+    expect(caughtError?.message).toContain("cargo error line 11");
+    expect(caughtError?.message).not.toContain("cargo error line 10\n");
+    expect(caughtError?.message).toContain("[... earlier output truncated ...]");
+    expect(caughtError?.diagnostic).toBeDefined();
+
+    // Checked that log blocks were printed
+    expect(coreMocks.startGroupMock).toHaveBeenCalledWith("Cargo stdout");
+    expect(coreMocks.startGroupMock).toHaveBeenCalledWith("Cargo stderr");
+    expect(coreMocks.endGroupMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("redacts secrets and removes ANSI escape sequences and control characters from cargo diagnostics", async () => {
+    const dirtyStderr = [
+      "\x1B[31;1merror[E0425]:\x1B[0m cannot find value `foo`\r",
+      "failed with secret seed: SB3W52UQNPILTKJE752GYUDO7PXFYS7PBY4CL5NZW5DXRBG5G3EK7R3N\r",
+      "attempted workflow command: ::error::malicious annotation\r",
+    ].join("\n");
+    spawnMock.mockImplementation(() => new ImmediateChild(101, "", dirtyStderr) as unknown as ChildProcess);
+
+    let caughtError: InstallationFailedError | undefined;
+    try {
+      await ensureCanaryInstalled(RESOLVED);
+    } catch (err) {
+      caughtError = err as InstallationFailedError;
+    }
+
+    expect(caughtError).toBeInstanceOf(InstallationFailedError);
+    const msg = caughtError!.message;
+
+    // ANSI stripped
+    expect(msg).not.toContain("\x1B[31;1m");
+    expect(msg).toContain("error[E0425]: cannot find value \\`foo\\`");
+    // \r removed
+    expect(msg).not.toContain("\r");
+    // Seed redacted
+    expect(msg).not.toContain("SB3W52UQNPILTKJE752GYUDO7PXFYS7PBY4CL5NZW5DXRBG5G3EK7R3N");
+    expect(msg).toContain(REDACTED);
+    // Command neutralized
+    expect(msg).not.toContain("::error::");
+    expect(msg).toContain("\\:\\:error\\:\\:");
+  });
+
+  it("caps cargo error diagnostic at 8 KiB and includes truncation notice", async () => {
+    const hugeStderr = "error: " + "a".repeat(20_000);
+    spawnMock.mockImplementation(() => new ImmediateChild(101, "", hugeStderr) as unknown as ChildProcess);
+
+    let caughtError: InstallationFailedError | undefined;
+    try {
+      await ensureCanaryInstalled(RESOLVED);
+    } catch (err) {
+      caughtError = err as InstallationFailedError;
+    }
+
+    expect(caughtError).toBeInstanceOf(InstallationFailedError);
+    expect(caughtError?.diagnostic).toBeDefined();
+    expect(Buffer.byteLength(caughtError!.diagnostic!, "utf8")).toBeLessThanOrEqual(8 * 1024);
+    expect(caughtError!.diagnostic).toContain("[... earlier output truncated ...]");
+  });
+
+  it("prints nothing new to log groups on successful cargo install", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    spawnMock.mockImplementation(() => new ImmediateChild(0) as unknown as ChildProcess);
+
+    await ensureCanaryInstalled(RESOLVED);
+
+    expect(coreMocks.startGroupMock).not.toHaveBeenCalled();
+    expect(coreMocks.endGroupMock).not.toHaveBeenCalled();
   });
 
   it("rejects with CanaryNotFoundError when no working binary appears after install", async () => {
@@ -555,6 +654,36 @@ describe("ensureCanaryInstalled", () => {
     expect(httpsGetMock).toHaveBeenCalledTimes(2);
     expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("No published checksum manifest"));
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("attaches Authorization header only to api.github.com and not to release asset downloads", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    httpsGetMock
+      .mockImplementationOnce(
+        respond(
+          200,
+          JSON.stringify({
+            assets: [
+              {
+                name: "SHA256SUMS",
+                browser_download_url: "https://github.com/StellarCanary/Protocol-Canary/releases/download/v0.1.0/SHA256SUMS",
+              },
+            ],
+          }),
+        ),
+      )
+      .mockImplementationOnce(
+        respond(200, `9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd  ${platformBinaryName()}\n`),
+      );
+
+    await ensureCanaryInstalled(RESOLVED, undefined, "my-secret-token");
+
+    expect(httpsGetMock).toHaveBeenCalledTimes(2);
+    const call1Headers = (httpsGetMock.mock.calls[0] as unknown[])[1] as { headers: Record<string, string> };
+    const call2Headers = (httpsGetMock.mock.calls[1] as unknown[])[1] as { headers: Record<string, string> };
+
+    expect(call1Headers.headers.Authorization).toBe("Bearer my-secret-token");
+    expect(call2Headers.headers.Authorization).toBeUndefined();
   });
 
   // #273: selectExpectedChecksum filters to stellar-canary-named entries,

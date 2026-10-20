@@ -66,6 +66,14 @@ All notable changes to this project are documented in this file.
   manual dispatch, Testnet/Futurenet RPC endpoints with their documented
   network passphrases, and a failure notification that fails safely with a
   clear summary when a remote endpoint is unreachable (#352).
+- The weekly live workflow's `ProtocolCanary-Fixtures` checkout is pinned to
+  the immutable `protocol-28` pack (the full commit SHA behind the tag) and
+  the run summary now records the resolved commit, so a scheduled canary
+  changes only when the network or the pinned inputs change — a fixture
+  merged into the fixtures repository on Sunday can no longer move Monday's
+  result. A new optional `fixtures_ref` `workflow_dispatch` input overrides
+  the pin for manual runs; scheduled runs always use it. Both checkouts now
+  also set `persist-credentials: false` (#419).
 
 ### Documentation
 
@@ -89,6 +97,10 @@ All notable changes to this project are documented in this file.
   (`true`, matching the input's `default` key) and that setting it to
   `false` skips the artifact upload, so the documented contract spells out
   the default instead of leaving it to the `default` key alone.
+- CONTRIBUTING.md documents the weekly live workflow's fixtures pin: when it
+  moves (only on a new `ProtocolCanary-Fixtures` pack release), who approves
+  the move (the CODEOWNERS maintainer), and how to resolve and update the
+  SHA (#419).
 
 ### Added
 
