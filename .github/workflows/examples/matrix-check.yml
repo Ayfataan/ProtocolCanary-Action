@@ -1,0 +1,97 @@
+# Example workflow for issue #367: run Protocol Canary checks across several
+# contracts/services of a monorepo in PARALLEL without filesystem collisions or
+# artifact overwrites.
+#
+# Why the shape below is collision-safe:
+#   * every leg gets its own `project-root`, and fixtures/config are resolved
+#     beneath it, so parallel jobs never read or write the same paths;
+#   * the Action's own report artifact is disabled (`upload-report: false`) —
+#     its fixed name (`stellar-protocol-canary-report`) would collide across
+#     parallel legs — and each leg instead uploads its report itself under a
+#     target-unique artifact name `report-${{ matrix.target }}`;
+#   * a per-leg status file travels inside the same artifact, so the leg's
+#     verdict survives even when no JSON report was produced.
+#
+# This file lives under .github/workflows/examples/ and is never executed by
+# GitHub (only files directly in .github/workflows/ are). Copy it into your
+# repository's .github/workflows/, replace the matrix entries with your own
+# targets, and see examples/matrix-aggregation.yml for the matching
+# consolidated-report job (issue #368).
+name: Example - Parallel Multi-Target Matrix Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary-matrix:
+    name: canary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One project failing its compatibility check must not cancel the
+      # other legs; each report is needed for the aggregate summary.
+      fail-fast: false
+      matrix:
+        include:
+          - target: payments
+            project-root: contracts/payments
+          - target: ledger
+            project-root: contracts/ledger
+          - target: escrow
+            project-root: services/escrow
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve project paths
+        id: paths
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ matrix.project-root }}
+        run: |
+          set -euo pipefail
+          root="${PROJECT_ROOT:-.}"
+          if [ ! -d "$root" ]; then
+            echo "::error::project-root '$root' does not exist in this workspace."
+            exit 1
+          fi
+          {
+            echo "fixtures-dir=${root%/}/fixtures"
+            if [ -f "${root%/}/.stellar-canary.toml" ]; then
+              echo "config=${root%/}/.stellar-canary.toml"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Protocol Canary for ${{ matrix.target }}
+        id: canary
+        uses: StellarCanary/ProtocolCanary-Action@v1
+        with:
+          protocol: 28
+          config: ${{ steps.paths.outputs.config }}
+          fixtures-dir: ${{ steps.paths.outputs.fixtures-dir }}
+          upload-report: "false"
+          annotations: "true"
+
+      - name: Record leg status
+        shell: bash
+        env:
+          LEG_STATUS: ${{ steps.canary.outputs.status }}
+          LEG_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          printf 'target=%s\nstatus=%s\n' "$LEG_TARGET" "${LEG_STATUS:-execution-failed}" \
+            > "canary-status-${LEG_TARGET}.txt"
+
+      - name: Upload report for ${{ matrix.target }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Target-unique name: parallel legs can never overwrite each other.
+          name: report-${{ matrix.target }}
+          path: |
+            ${{ steps.canary.outputs.report }}
+            canary-status-${{ matrix.target }}.txt
+          if-no-files-found: warn
+          retention-days: 14

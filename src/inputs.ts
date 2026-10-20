@@ -31,6 +31,9 @@ export interface ActionInputs {
   readonly generateReceipt: boolean;
   /** Duration in days (integer 1 to 90) to retain the uploaded JSON report artifact. */
   readonly reportRetentionDays: number | undefined;
+  /** Fail closed whenever binary integrity cannot be proven (issue #372).
+   * Default `false` preserves the historical degrade-to-pinning behaviour. */
+  readonly strictIntegrity: boolean;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;
@@ -89,6 +92,8 @@ export function getInputs(): ActionInputs {
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
   const reportRetentionDays = parseReportRetentionDays(core.getInput("report-retention-days"));
 
+  const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
+
   // A validated input that silently does nothing is worse than a missing one:
   // it reads as "my pack is pinned" when the run used whatever
   // `--fixtures-dir` happened to contain. Say so explicitly, the same way an
@@ -118,6 +123,7 @@ export function getInputs(): ActionInputs {
     githubToken,
     generateReceipt,
     reportRetentionDays,
+    strictIntegrity,
   };
 }
 

@@ -73,6 +73,7 @@ describe("getInputs", () => {
       githubToken: undefined,
       generateReceipt: false,
       reportRetentionDays: undefined,
+      strictIntegrity: false,
     });
   });
 

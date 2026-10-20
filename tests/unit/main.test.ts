@@ -124,6 +124,7 @@ const INPUTS: ActionInputs = {
   githubToken: undefined,
   generateReceipt: false,
   reportRetentionDays: undefined,
+  strictIntegrity: false,
 };
 
 const PASS_REPORT = report({
@@ -211,7 +212,7 @@ describe("run", () => {
     await run();
 
     expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
-    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined);
+    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined, false);
   });
 
   // #271, branch 1: a child killed by a signal closes with a null exit code,
@@ -319,8 +320,10 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("report", reportPath);
 
     // The success-path summary rendering was attempted exactly once, and a
-    // passing report emits no annotations.
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+    // passing report emits no annotations. The second argument is the
+    // provenance metadata plumbed into the summary (#373): the mocked
+    // binary path does not exist, so only the engine version is reported.
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, { engineVersion: "0.1.0" }, undefined);
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
     expect(warningMock).not.toHaveBeenCalled();
@@ -403,6 +406,7 @@ describe("run", () => {
       expect.anything(),
       60_000,
       "ghp_custom123",
+      false,
     );
   });
 
@@ -490,6 +494,7 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "1234");
     expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
       PASS_REPORT,
+      { engineVersion: "0.1.0" },
       { id: 1234, name: "stellar-protocol-canary-report" },
     );
   });
@@ -531,7 +536,7 @@ describe("run", () => {
     expect(uploadReportMock).not.toHaveBeenCalled();
     expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
     expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, { engineVersion: "0.1.0" }, undefined);
   });
 
   it("sets empty artifact outputs when uploadReport fails (#415)", async () => {
@@ -553,7 +558,7 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
     expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
     expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, { engineVersion: "0.1.0" }, undefined);
   });
 
   it("sets empty artifact outputs and logs warning when uploadReport throws (#415)", async () => {

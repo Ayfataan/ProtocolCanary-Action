@@ -68,6 +68,7 @@ const BASE_INPUTS: ActionInputs = {
   githubToken: undefined,
   generateReceipt: false,
   reportRetentionDays: undefined,
+  strictIntegrity: false,
 };
 
 describe("buildCheckArgs", () => {
