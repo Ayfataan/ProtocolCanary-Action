@@ -26,9 +26,11 @@ function findPackageJson(name, fromDir) {
 }
 
 function getDependencyTree() {
-  const stdout = execFileSync("npm", ["ls", "--omit=dev", "--json", "--all"], {
+  const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
+  const stdout = execFileSync(npmCmd, ["ls", "--omit=dev", "--json", "--all"], {
     encoding: "utf8",
     maxBuffer: 20 * 1024 * 1024,
+    shell: process.platform === "win32",
   });
   return JSON.parse(stdout);
 }
