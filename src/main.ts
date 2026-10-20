@@ -12,7 +12,7 @@ import { getInputs } from "./inputs";
 import { printLogBlock } from "./log-block";
 import { countReplayed, describeExitCode, parseReport } from "./output";
 import { buildReceipt, serializeReceipt } from "./receipt";
-import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck } from "./runner";
+import { buildCheckArgs, extractDiagnostic, runCheck } from "./runner";
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
 
@@ -116,12 +116,10 @@ export async function run(): Promise<void> {
     return;
   }
 
-  if (inputs.allowEmpty && !engineSupportsAllowEmpty(resolved.version)) {
-    core.info(
-      `"allow-empty" has no effect with Canary ${resolved.version}: that version already passes a run that executes nothing.`,
-    );
-  }
-
+  // The "allow-empty has no effect on this engine" note is emitted by
+  // buildCheckArgs itself: the version gate and its skip note for every
+  // gated flag (#413) now live in one place, so an input skipped for an old
+  // engine is reported exactly there, whatever the flag.
   core.info(`Protocol: ${inputs.protocol !== undefined ? String(inputs.protocol) : "(from configuration)"}`);
   core.info("Running compatibility checks...");
 

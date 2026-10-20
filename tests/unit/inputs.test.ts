@@ -34,6 +34,10 @@ const INPUT_KEYS = [
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
+  "INPUT_RPC-TIMEOUT-SECONDS",
+  "INPUT_MAX-CONCURRENCY",
+  "INPUT_NO-CACHE",
+  "INPUT_LIVE-CACHE-TTL-SECONDS",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_GITHUB-TOKEN",
@@ -67,6 +71,10 @@ describe("getInputs", () => {
       annotations: true,
       timeoutMinutes: 15,
       allowEmpty: false,
+      rpcTimeoutSeconds: undefined,
+      maxConcurrency: undefined,
+      noCache: undefined,
+      liveCacheTtlSeconds: undefined,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       githubToken: undefined,
@@ -257,6 +265,134 @@ describe("getInputs", () => {
   it("rejects an undocumented allow-empty form and names the input", () => {
     process.env["INPUT_ALLOW-EMPTY"] = "1";
     expect(() => getInputs()).toThrow(/"allow-empty"/);
+  });
+
+  /**
+   * #413: the engine check options `allow-empty` already paved the way for —
+   * `rpc-timeout-seconds`, `max-concurrency`, `no-cache` and
+   * `live-cache-ttl-seconds`. Omitted means "engine default", so every one
+   * parses to `undefined` when unset; when set, validation is strict (digits
+   * only, bounded) and every failure names the offending input.
+   */
+  describe("engine check option inputs (#413)", () => {
+    it("leaves all four inputs undefined when unset", () => {
+      const inputs = getInputs();
+      expect(inputs.rpcTimeoutSeconds).toBeUndefined();
+      expect(inputs.maxConcurrency).toBeUndefined();
+      expect(inputs.noCache).toBeUndefined();
+      expect(inputs.liveCacheTtlSeconds).toBeUndefined();
+    });
+
+    it("treats empty and whitespace-only values as unset", () => {
+      process.env["INPUT_RPC-TIMEOUT-SECONDS"] = "   ";
+      process.env["INPUT_MAX-CONCURRENCY"] = "";
+      process.env["INPUT_NO-CACHE"] = "";
+      process.env["INPUT_LIVE-CACHE-TTL-SECONDS"] = " \t ";
+      const inputs = getInputs();
+      expect(inputs.rpcTimeoutSeconds).toBeUndefined();
+      expect(inputs.maxConcurrency).toBeUndefined();
+      expect(inputs.noCache).toBeUndefined();
+      expect(inputs.liveCacheTtlSeconds).toBeUndefined();
+    });
+
+    it.each([
+      ["INPUT_RPC-TIMEOUT-SECONDS", "30", "rpcTimeoutSeconds", 30],
+      ["INPUT_RPC-TIMEOUT-SECONDS", "1", "rpcTimeoutSeconds", 1],
+      ["INPUT_RPC-TIMEOUT-SECONDS", "600", "rpcTimeoutSeconds", 600],
+      ["INPUT_MAX-CONCURRENCY", "8", "maxConcurrency", 8],
+      ["INPUT_MAX-CONCURRENCY", "1", "maxConcurrency", 1],
+      ["INPUT_MAX-CONCURRENCY", "64", "maxConcurrency", 64],
+      ["INPUT_LIVE-CACHE-TTL-SECONDS", "600", "liveCacheTtlSeconds", 600],
+      ["INPUT_LIVE-CACHE-TTL-SECONDS", "1", "liveCacheTtlSeconds", 1],
+      ["INPUT_LIVE-CACHE-TTL-SECONDS", "604800", "liveCacheTtlSeconds", 604800],
+    ])("parses %s=%s as %s", (envKey, raw, field, expected) => {
+      process.env[envKey] = raw;
+      expect(getInputs()[field as keyof ReturnType<typeof getInputs>]).toBe(expected);
+    });
+
+    it.each([
+      ["INPUT_NO-CACHE", "true", true],
+      ["INPUT_NO-CACHE", "True", true],
+      ["INPUT_NO-CACHE", "TRUE", true],
+      ["INPUT_NO-CACHE", "false", false],
+      ["INPUT_NO-CACHE", "False", false],
+      ["INPUT_NO-CACHE", "FALSE", false],
+    ])("parses no-cache %s=%s as %s", (envKey, raw, expected) => {
+      process.env[envKey] = raw;
+      expect(getInputs().noCache).toBe(expected);
+    });
+
+    it("rejects an undocumented no-cache form and names the input", () => {
+      process.env["INPUT_NO-CACHE"] = "1";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"no-cache"/);
+    });
+
+    // Strict parsing: these must fail in validation with a message naming the
+    // input — never be truncated by parseInt leniency ("12abc" → 12,
+    // "12.5" → 12) and forwarded to the engine as something else.
+    it.each([
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "0"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "-1"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "abc"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "12abc"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "12.5"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "+30"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "601"],
+      ["rpc-timeout-seconds", "INPUT_RPC-TIMEOUT-SECONDS", "999999999999999999999999"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "0"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "-1"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "abc"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "12abc"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "4.5"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "65"],
+      ["max-concurrency", "INPUT_MAX-CONCURRENCY", "999999999999999999999999"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "0"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "-1"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "abc"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "12abc"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "60.5"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "604801"],
+      ["live-cache-ttl-seconds", "INPUT_LIVE-CACHE-TTL-SECONDS", "999999999999999999999999"],
+    ])("rejects %s=%s and names the input", (input, envKey, raw) => {
+      process.env[envKey] = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(new RegExp(`"${input}"`));
+      // The message quotes the offending value so the mistake is actionable.
+      expect(() => getInputs()).toThrow(new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    });
+
+    // The engine declares `--no-cache` and `--live-cache-ttl` as conflicting
+    // (`conflicts_with` in CheckArgs), so the combination must die here —
+    // where the message can name both inputs — instead of at the CLI.
+    it("rejects no-cache: true together with live-cache-ttl-seconds and explains the conflict", () => {
+      process.env["INPUT_NO-CACHE"] = "true";
+      process.env["INPUT_LIVE-CACHE-TTL-SECONDS"] = "600";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"no-cache"/);
+      expect(() => getInputs()).toThrow(/"live-cache-ttl-seconds"/);
+      expect(() => getInputs()).toThrow(/conflicts with/);
+      expect(() => getInputs()).toThrow(/--no-cache/);
+      expect(() => getInputs()).toThrow(/--live-cache-ttl/);
+    });
+
+    it("accepts no-cache: false together with live-cache-ttl-seconds", () => {
+      // `false` is the engine-default cache behavior; a TTL alongside it is
+      // not a conflict — only `no-cache: true` disables the cache the TTL
+      // would configure.
+      process.env["INPUT_NO-CACHE"] = "false";
+      process.env["INPUT_LIVE-CACHE-TTL-SECONDS"] = "600";
+      const inputs = getInputs();
+      expect(inputs.noCache).toBe(false);
+      expect(inputs.liveCacheTtlSeconds).toBe(600);
+    });
+
+    it("accepts live-cache-ttl-seconds without no-cache", () => {
+      process.env["INPUT_LIVE-CACHE-TTL-SECONDS"] = "600";
+      const inputs = getInputs();
+      expect(inputs.liveCacheTtlSeconds).toBe(600);
+      expect(inputs.noCache).toBeUndefined();
+    });
   });
 
   // #361: `generate-receipt` opts a run into producing an Execution Receipt.

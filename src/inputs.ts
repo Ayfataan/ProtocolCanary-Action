@@ -16,6 +16,21 @@ export interface ActionInputs {
   readonly timeoutMinutes: number;
   /** Pass `--allow-empty` to engines that support it (0.2.0 and newer). */
   readonly allowEmpty: boolean;
+  /** `--rpc-timeout` request timeout in seconds for engines that support it
+   * (0.2.0 and newer), 1–600. `undefined` leaves the engine default (10). */
+  readonly rpcTimeoutSeconds: number | undefined;
+  /** `--max-concurrency` for live RPC/Soroban requests for engines that
+   * support it (0.2.0 and newer), 1–64. `undefined` leaves the engine
+   * default (4). */
+  readonly maxConcurrency: number | undefined;
+  /** `--no-cache` for engines that support it (0.2.0 and newer): `true`
+   * forwards the flag, `false`/`undefined` leaves the engine's cache alone.
+   * `true` conflicts with {@link ActionInputs.liveCacheTtlSeconds}. */
+  readonly noCache: boolean | undefined;
+  /** `--live-cache-ttl` in seconds for engines that support it (0.2.0 and
+   * newer), 1–604800 (7 days). `undefined` leaves the engine default (cached
+   * live results are not replayed). Conflicts with a `noCache` of `true`. */
+  readonly liveCacheTtlSeconds: number | undefined;
   /** Release tag of the fixture pack to run against, e.g. `v1.2.0`, kept as
    * written (leading `v` optional). Validated for format only — see
    * {@link parseFixturesPackVersion} for why it is not forwarded yet. */
@@ -77,6 +92,25 @@ export function getInputs(): ActionInputs {
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
+  const rpcTimeoutSeconds = parseBoundedInteger(
+    "rpc-timeout-seconds",
+    core.getInput("rpc-timeout-seconds"),
+    RPC_TIMEOUT_SECONDS_MAX,
+    "seconds",
+  );
+  const maxConcurrency = parseBoundedInteger(
+    "max-concurrency",
+    core.getInput("max-concurrency"),
+    MAX_CONCURRENCY_MAX,
+    "concurrent requests",
+  );
+  const noCache = parseOptionalBoolean("no-cache", core.getInput("no-cache"));
+  const liveCacheTtlSeconds = parseBoundedInteger(
+    "live-cache-ttl-seconds",
+    core.getInput("live-cache-ttl-seconds"),
+    LIVE_CACHE_TTL_SECONDS_MAX,
+    "seconds",
+  );
   const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
   const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
   const githubToken = resolveGithubToken(core.getInput("github-token"));
@@ -85,6 +119,22 @@ export function getInputs(): ActionInputs {
     core.setSecret(githubToken);
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+
+  // The engine declares `--no-cache` and `--live-cache-ttl` as conflicting
+  // (`conflicts_with` on `no_cache` in Protocol-Canary's `CheckArgs`), so a
+  // run carrying both would die at the CLI with an opaque clap error. Reject
+  // the combination here, where the message can name both inputs and say how
+  // to fix it. `no-cache: false` with a TTL is the engine-default cache
+  // behavior plus an explicit TTL — not a conflict.
+  if (noCache === true && liveCacheTtlSeconds !== undefined) {
+    throw new InvalidInputError(
+      `Invalid input combination: "no-cache" is set to true, which conflicts with ` +
+        `"live-cache-ttl-seconds": the engine rejects \`--no-cache\` together with ` +
+        "`--live-cache-ttl`, because disabling the cache and configuring how long cached " +
+        "live results stay reusable are mutually exclusive. Set \"no-cache\" to `false` (or " +
+        'omit it) to use a live-cache TTL, or omit "live-cache-ttl-seconds" to disable the cache.',
+    );
+  }
 
   // A validated input that silently does nothing is worse than a missing one:
   // it reads as "my pack is pinned" when the run used whatever
@@ -110,6 +160,10 @@ export function getInputs(): ActionInputs {
     annotations,
     timeoutMinutes,
     allowEmpty,
+    rpcTimeoutSeconds,
+    maxConcurrency,
+    noCache,
+    liveCacheTtlSeconds,
     fixturesPackVersion,
     fixturesPackProtocol,
     githubToken,
@@ -299,6 +353,62 @@ function parseBoolean(name: string, raw: string): boolean {
   throw new InvalidInputError(
     `Invalid "${name}" input: ${JSON.stringify(raw)}. Expected one of true/True/TRUE/false/False/FALSE.`,
   );
+}
+
+/**
+ * Upper bounds for the engine-forwarded check options (#413). Protocol-Canary
+ * itself only enforces positivity for these — `live-cache-ttl` is declared
+ * `range(1..)` and the other two are unsigned integers — so the upper bounds
+ * are the Action's own, chosen so that a value which is practically a unit
+ * mistake fails here, in input validation, with a message naming the input,
+ * instead of surfacing later as a hung or throttled run:
+ *
+ * - `rpc-timeout-seconds` 1–600 (10 minutes): a single-request RPC timeout
+ *   longer than that outruns the Action's own default `timeout-minutes` of
+ *   15 and can only be seconds-passed-as-something-else.
+ * - `max-concurrency` 1–64: the engine defaults to 4; beyond 64 concurrent
+ *   requests against a public RPC/Soroban endpoint is self-inflicted rate
+ *   limiting, not useful parallelism.
+ * - `live-cache-ttl-seconds` 1–604800 (7 days): the engine already rejects
+ *   0; a "live" result replayed for longer than a week no longer says
+ *   anything about what the network does now.
+ */
+const RPC_TIMEOUT_SECONDS_MAX = 600;
+const MAX_CONCURRENCY_MAX = 64;
+const LIVE_CACHE_TTL_SECONDS_MAX = 604_800;
+
+/**
+ * Strictly parses a positive-integer engine check option (#413) between 1
+ * and `max`, expressed in `unit`; `undefined` when unset/empty.
+ *
+ * Deliberately stricter than {@link parseTimeout}: the value must be digits
+ * only, so `"12abc"`, `"+7"`, `"12.5"` and `"-1"` are rejected outright
+ * rather than truncated the way `parseInt` would read them, and anything
+ * outside `1..max` — including digit strings too large to be safe integers
+ * — is rejected with an {@link InvalidInputError} naming the input.
+ */
+function parseBoundedInteger(name: string, raw: string, max: number, unit: string): number | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  const parsed = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > max) {
+    throw new InvalidInputError(
+      `Invalid "${name}" input: ${JSON.stringify(value)}. ` +
+        `Expected a positive integer between 1 and ${max} ${unit}.`,
+    );
+  }
+  return parsed;
+}
+
+/** Validates an optional boolean input: `undefined` when unset (or
+ * empty/whitespace-only), otherwise the documented literals via
+ * {@link parseBoolean}, which throws {@link InvalidInputError} naming the
+ * input for anything else. */
+function parseOptionalBoolean(name: string, raw: string): boolean | undefined {
+  const value = optional(raw);
+  return value === undefined ? undefined : parseBoolean(name, value);
 }
 
 /** Validates the "timeout-minutes" input as a positive integer. Throws

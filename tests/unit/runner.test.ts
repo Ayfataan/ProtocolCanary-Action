@@ -1,9 +1,10 @@
+import type * as actionsCore from "@actions/core";
 import type * as childProcess from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
@@ -16,7 +17,10 @@ import {
   runCheck,
 } from "../../src/runner";
 
-const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+const { spawnMock, infoMock } = vi.hoisted(() => ({
+  spawnMock: vi.fn(),
+  infoMock: vi.fn(),
+}));
 
 // Most tests exercise the real mock-canary fixture, so `spawn` defaults to a
 // pass-through of the real implementation; the timeout-escalation tests below
@@ -25,6 +29,15 @@ vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof childProcess>();
   spawnMock.mockImplementation(actual.spawn);
   return { ...actual, spawn: spawnMock };
+});
+
+// Only `info` is observed: buildCheckArgs logs a note for every version-gated
+// input the resolved engine is too old to accept, and those notes are part of
+// its contract (#413). Per CONTRIBUTING's partial-mock convention the rest of
+// `@actions/core` keeps working through the real module.
+vi.mock("@actions/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof actionsCore>();
+  return { ...actual, info: infoMock };
 });
 
 /** A `child_process.spawn` result that does nothing until it is signalled. */
@@ -63,6 +76,10 @@ const BASE_INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 15,
   allowEmpty: false,
+  rpcTimeoutSeconds: undefined,
+  maxConcurrency: undefined,
+  noCache: undefined,
+  liveCacheTtlSeconds: undefined,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
   githubToken: undefined,
@@ -177,6 +194,137 @@ describe("allow-empty forwarding", () => {
     [undefined, false],
   ])("engineSupportsAllowEmpty(%j) is %s", (version, expected) => {
     expect(engineSupportsAllowEmpty(version)).toBe(expected);
+  });
+});
+
+// #413: the four engine check options `allow-empty` already paved the way
+// for are declared in the same version-gate table, so every input must show
+// up in argv only when set *and* accepted by the resolved engine — and a
+// set input skipped for an older engine must always be reported.
+describe("engine check option forwarding (#413)", () => {
+  // Each case pairs one input with what `getInputs` returns for a set value:
+  // `flag` is the exact spelling Protocol-Canary's `CheckArgs` declares (v0.2.0),
+  // `value` the argv element that must follow it (undefined for a value-less
+  // flag).
+  const CASES: ReadonlyArray<{
+    readonly input: string;
+    readonly patch: Partial<ActionInputs>;
+    readonly flag: string;
+    readonly value: string | undefined;
+  }> = [
+    { input: "rpc-timeout-seconds", patch: { rpcTimeoutSeconds: 30 }, flag: "--rpc-timeout", value: "30" },
+    { input: "max-concurrency", patch: { maxConcurrency: 8 }, flag: "--max-concurrency", value: "8" },
+    { input: "no-cache", patch: { noCache: true }, flag: "--no-cache", value: undefined },
+    { input: "live-cache-ttl-seconds", patch: { liveCacheTtlSeconds: 600 }, flag: "--live-cache-ttl", value: "600" },
+  ];
+
+  // Reset on both sides: earlier tests in this file (the unsupported
+  // allow-empty case) also emit notes, and a stale call must never satisfy
+  // an assertion here.
+  beforeEach(() => infoMock.mockReset());
+  afterEach(() => infoMock.mockReset());
+
+  it.each(CASES)("forwards $input to a 0.2.0 engine when set", ({ patch, flag, value }) => {
+    const args = buildCheckArgs({ ...BASE_INPUTS, ...patch }, "0.2.0");
+    const index = args.indexOf(flag);
+    expect(index).toBeGreaterThanOrEqual(0);
+    if (value !== undefined) {
+      // The value is its own argv element — never concatenated onto the flag.
+      expect(args[index + 1]).toBe(value);
+      expect(args).not.toContain(`${flag} ${value}`);
+    }
+    // Nothing was skipped, so there is nothing to report.
+    expect(infoMock).not.toHaveBeenCalled();
+  });
+
+  it.each(CASES)("does not pass $input's flag when the input is unset", ({ flag }) => {
+    const args = buildCheckArgs(BASE_INPUTS, "0.2.0");
+    expect(args).not.toContain(flag);
+    expect(infoMock).not.toHaveBeenCalled();
+  });
+
+  it.each(CASES)("skips $input on a 0.1.1 engine and logs a note naming it", ({ input, patch, flag }) => {
+    const args = buildCheckArgs({ ...BASE_INPUTS, ...patch }, "0.1.1");
+    expect(args).not.toContain(flag);
+    const notes = infoMock.mock.calls.map((call) => String(call[0]));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain(`"${input}"`);
+    // The note names the first engine release that accepts the flag.
+    expect(notes[0]).toContain("0.2.0");
+  });
+
+  it("skips a new input when the engine version is unknown, with a note", () => {
+    const args = buildCheckArgs({ ...BASE_INPUTS, rpcTimeoutSeconds: 30 });
+    expect(args).not.toContain("--rpc-timeout");
+    const notes = infoMock.mock.calls.map((call) => String(call[0]));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('"rpc-timeout-seconds"');
+  });
+
+  it("passes none of the flags to a 0.1.1 engine and logs a note per skipped input", () => {
+    // Every gated input set at once. `no-cache: true` together with a TTL is
+    // rejected by getInputs (#413), but buildCheckArgs does not validate
+    // inputs and must still gate and report each flag independently.
+    const all = {
+      ...BASE_INPUTS,
+      allowEmpty: true,
+      rpcTimeoutSeconds: 30,
+      maxConcurrency: 8,
+      noCache: true,
+      liveCacheTtlSeconds: 600,
+    };
+    const args = buildCheckArgs(all, "0.1.1");
+    expect(args).toEqual(["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"]);
+    const notes = infoMock.mock.calls.map((call) => String(call[0]));
+    expect(notes).toHaveLength(5);
+    for (const input of [
+      "allow-empty",
+      "rpc-timeout-seconds",
+      "max-concurrency",
+      "no-cache",
+      "live-cache-ttl-seconds",
+    ]) {
+      expect(notes.some((note) => note.includes(`"${input}"`))).toBe(true);
+    }
+  });
+
+  it("builds the exact argv for a 0.2.0 engine with every new input set", () => {
+    const args = buildCheckArgs(
+      { ...BASE_INPUTS, allowEmpty: true, rpcTimeoutSeconds: 30, maxConcurrency: 8, noCache: true },
+      "0.2.0",
+    );
+    expect(args).toEqual([
+      "check",
+      "--format",
+      "json",
+      "--protocol",
+      "28",
+      "--fixtures-dir",
+      "fixtures",
+      "--allow-empty",
+      "--rpc-timeout",
+      "30",
+      "--max-concurrency",
+      "8",
+      "--no-cache",
+    ]);
+  });
+
+  it("builds the exact argv for a 0.2.0 engine with no-cache: false and a live-cache TTL", () => {
+    const args = buildCheckArgs({ ...BASE_INPUTS, noCache: false, liveCacheTtlSeconds: 600 }, "0.2.0");
+    expect(args).toEqual([
+      "check",
+      "--format",
+      "json",
+      "--protocol",
+      "28",
+      "--fixtures-dir",
+      "fixtures",
+      "--live-cache-ttl",
+      "600",
+    ]);
+    // `false` is the engine default: no flag to forward.
+    expect(args).not.toContain("--no-cache");
   });
 });
 
