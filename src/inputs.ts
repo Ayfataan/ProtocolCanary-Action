@@ -23,6 +23,13 @@ export interface ActionInputs {
   /** Protocol version the fixture pack is pinned to, as a positive integer.
    * Validated for format only — see {@link parseFixturesPackProtocol}. */
   readonly fixturesPackProtocol: number | undefined;
+  /** GitHub token input, mapped to `core.setSecret` for masking. */
+  readonly githubToken: string | undefined;
+  /** Whether to generate an execution receipt. */
+  readonly generateReceipt: boolean;
+  /** Whether to enforce strict integrity pinning. When true, checksum
+   * verification failures are treated as fatal instead of debug-logged. */
+  readonly strictIntegrity: boolean;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;

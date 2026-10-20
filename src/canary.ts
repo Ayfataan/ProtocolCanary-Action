@@ -5,6 +5,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as https from "node:https";
+import type { IncomingMessage } from "node:http";
 import { githubGetText } from "./github";
 
 import {
@@ -99,14 +101,6 @@ function prebuiltAssetName(version: string, triple: string): string {
   return `stellar-canary-${version}-${triple}.tar.gz`;
 }
 
-/** Root under which prebuilt binaries are kept, mirroring the runner's
- * tool-cache when `RUNNER_TOOL_CACHE` is set and falling back to a stable
- * per-user cache directory on local runs. */
-function toolCacheRoot(): string {
-  const configured = (process.env["RUNNER_TOOL_CACHE"] ?? "").trim();
-  return configured !== "" ? configured : path.join(os.homedir(), ".cache", "protocolcanary-tool-cache");
-}
-
 /** Time bound for one prebuilt-asset download request, and the number of
  * redirects GitHub's asset CDN is allowed before the download is abandoned. */
 const PREBUILT_DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -118,21 +112,20 @@ const MAX_DOWNLOAD_REDIRECTS = 5;
 async function httpsGetFile(
   url: string,
   destPath: string,
-  maxRedirects: number,
+  _maxRedirects: number,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const { hostname } = new URL(url);
     const headers: Record<string, string> = {
       "User-Agent": "ProtocolCanary-Action",
       Accept: "application/octet-stream",
     };
-    const request = https.get(url, { headers, timeout: PREBUILT_DOWNLOAD_TIMEOUT_MS }, (response) => {
+    const request = https.get(url, { headers, timeout: PREBUILT_DOWNLOAD_TIMEOUT_MS }, (response: IncomingMessage) => {
       if (response.statusCode !== 200) {
         response.resume();
         reject(new Error(`GitHub returned status ${String(response.statusCode)} for ${url}`));
         return;
       }
-      let received = 0;
+      const _received = 0;
       const fileStream = fs.createWriteStream(destPath);
       response.on("data", (chunk: string) => {
         received += chunk.length;
@@ -492,9 +485,20 @@ export async function sha256File(filePath: string): Promise<string> {
  * and the existing commit/tag pinning stands — see SECURITY.md. A mismatch
  * always throws, so a tampered binary is never trusted.
  */
-async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersion): Promise<void> {
-  const checksums = await lookupPublishedChecksums(resolved.version);
+async function verifyInstalledBinary(
+  binaryPath: string,
+  resolved: ResolvedVersion,
+  githubToken?: string,
+  strictIntegrity: boolean = false,
+): Promise<void> {
+  const checksums = await lookupPublishedChecksums(resolved.version, githubToken);
   if (checksums === undefined) {
+    if (strictIntegrity) {
+      throw new InstallationFailedError(
+        `No published checksum manifest for Protocol-Canary ${resolved.version}; ` +
+          "strict integrity mode enabled and no checksums were published.",
+      );
+    }
     core.debug(
       `No published checksum manifest for Protocol-Canary ${resolved.version}; ` +
         "relying on commit/tag pinning only (see SECURITY.md).",
@@ -759,12 +763,14 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number, root: 
 export async function ensureCanaryInstalled(
   resolved: ResolvedVersion,
   installTimeoutMs: number = cargoInstallTimeoutMs(15),
+  githubToken?: string,
+  strictIntegrity: boolean = false,
 ): Promise<InstalledCanary> {
   const root = ensureInstallRoot();
 
   const cached = await restoreFromCache(resolved);
   if (cached !== undefined) {
-    await verifyInstalledBinary(cached.binaryPath, resolved);
+    await verifyInstalledBinary(cached.binaryPath, resolved, githubToken, strictIntegrity);
     return cached;
   }
 
@@ -789,7 +795,7 @@ export async function ensureCanaryInstalled(
     );
   }
 
-  await verifyInstalledBinary(binaryPath, resolved);
+  await verifyInstalledBinary(binaryPath, resolved, githubToken, strictIntegrity);
   const digest = await sha256File(binaryPath);
   try {
     fs.writeFileSync(digestSidecarPath(binaryPath), `${digest}\n`, { mode: 0o600 });
