@@ -376,6 +376,23 @@ describe("renderSummaryMarkdown size limit (#334)", () => {
 
   // ---- Oversized ---------------------------------------------------------------
 
+  it("keeps the Provenance & Trust section when a 2 MiB report is truncated (#373, #334)", () => {
+    const results = manyFailures(2 * 1024 * 1024);
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "fail",
+        counts: { total: results.length, passed: 0, failed: results.length, warnings: 0, errors: 0, skipped: 0 },
+        results,
+      }),
+      { binarySha256: "a".repeat(64), engineVersion: "0.1.1" },
+    );
+
+    expect(utf8(markdown)).toBeLessThan(SUMMARY_BYTE_LIMIT);
+    expect(markdown).toContain("### Provenance & Trust");
+    expect(markdown).toContain(`sha256:${"a".repeat(64)}`);
+    expect(markdown).toContain(TRUNCATION_NOTICE);
+  });
+
   for (const [label, approximateBytes] of [
     ["2 MiB", 2 * 1024 * 1024],
     ["5 MiB", 5 * 1024 * 1024],
@@ -671,5 +688,56 @@ describe("renderExecutionFailureMarkdown", () => {
         expect([fence, `${fence}text`]).toContain(line);
       }
     }
+  });
+});
+
+describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
+  const BINARY_SHA = "a".repeat(64);
+  const PACK_DIGEST = "b".repeat(64);
+
+  it("renders a provenance table with the binary SHA-256, pack digest, and engine version", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      binarySha256: BINARY_SHA,
+      packDigest: PACK_DIGEST,
+      engineVersion: "0.1.0",
+    });
+
+    expect(markdown).toContain("### Provenance & Trust");
+    expect(markdown).toContain(`| Canary binary | \`sha256:${BINARY_SHA}\` |`);
+    expect(markdown).toContain(`| Fixture pack | \`sha256:${PACK_DIGEST}\` |`);
+    expect(markdown).toContain("| Engine version | 0.1.0 |");
+  });
+
+  it("states the D-07 trust boundary: digests prove integrity, not author authenticity", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      binarySha256: BINARY_SHA,
+    });
+
+    expect(markdown).toContain("data integrity");
+    expect(markdown).toMatch(/not\D*proof of (the )?release author/i);
+    expect(markdown).toContain("D-07");
+  });
+
+  it("marks missing provenance fields as unverified instead of fabricating digests", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      binarySha256: undefined,
+      packDigest: undefined,
+      engineVersion: "0.1.0",
+    });
+
+    expect(markdown).toContain("### Provenance & Trust");
+    expect(markdown).toContain("| Canary binary | (unverified — no published checksum verified in this run) |");
+    expect(markdown).toContain("| Fixture pack | (unverified — fixture-pack download pipeline not implemented, see #338) |");
+    expect(markdown).not.toContain("| Canary binary | `");
+  });
+
+  it("omits the section entirely when no provenance metadata is plumbed at all", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }));
+    expect(markdown).not.toContain("Provenance & Trust");
+  });
+
+  it("handles omitted provenance metadata cleanly without errors", () => {
+    expect(() => renderSummaryMarkdown(report({ status: "pass" }), {})).not.toThrow();
+    expect(() => renderSummaryMarkdown(report({ status: "fail" }), { engineVersion: "0.2.0" })).not.toThrow();
   });
 });

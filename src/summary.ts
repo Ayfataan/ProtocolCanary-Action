@@ -145,10 +145,70 @@ function summarySections(report: CanaryReport): SummarySection[] {
   ];
 }
 
+/**
+ * Provenance metadata for the "Provenance & Trust" summary section
+ * (issue #373). Every field is optional because the upstream pipelines
+ * that produce them are only partially landed on `main`: the binary digest
+ * comes from the published-checksum verification in `src/canary.ts`, while
+ * the fixture-pack digest depends on the unmerged download pipeline (#338)
+ * and the receipt data on #360. Missing fields are rendered as explicitly
+ * unverified rather than omitted or fabricated.
+ */
+export interface SummaryProvenance {
+  /** SHA-256 of the Canary binary as observed for this run (issue #373).
+   * Undefined when the binary could not be read. */
+  readonly binarySha256?: string | undefined;
+  /** SHA-256 digest of the canonical fixture pack, once #338's download
+   * verification produces one. */
+  readonly packDigest?: string | undefined;
+  /** Engine version the run executed. */
+  readonly engineVersion?: string | undefined;
+}
+
+const UNVERIFIED_BINARY_ROW =
+  "| Canary binary | (unverified — no published checksum verified in this run) |";
+const UNVERIFIED_PACK_ROW =
+  "| Fixture pack | (unverified — fixture-pack download pipeline not implemented, see #338) |";
+
+/** Renders the "Provenance & Trust" section (issue #373). The wording is
+ * deliberately constrained by decision D-07: a published checksum verifies
+ * *data integrity* — it detects corruption or substitution of the artifact
+ * between release and runner — and is expressly not proof of the release
+ * author's identity or endorsement, because Protocol-Canary publishes no
+ * signatures. D-11 keeps the same honesty on the transport side: no redirect
+ * is followed during lookup today, so a digest reported here was fetched (or
+ * refused) over a single authenticated HTTPS request. */
+function provenanceLines(provenance: SummaryProvenance): string[] {
+  const binaryRow =
+    provenance.binarySha256 !== undefined
+      ? `| Canary binary | \`sha256:${provenance.binarySha256}\` |`
+      : UNVERIFIED_BINARY_ROW;
+  const packRow =
+    provenance.packDigest !== undefined
+      ? `| Fixture pack | \`sha256:${provenance.packDigest}\` |`
+      : UNVERIFIED_PACK_ROW;
+  const engineRow = `| Engine version | ${provenance.engineVersion ?? "(unknown)"} |`;
+  return [
+    "### Provenance & Trust",
+    "",
+    "| Artifact | Digest |",
+    "|---|---|",
+    binaryRow,
+    packRow,
+    engineRow,
+    "",
+    "> ℹ️ These digests are a **data integrity** check against accidental corruption or " +
+      "substitution of published artifacts. They are **not** proof of the release author's " +
+      "identity, authenticity, or endorsement: release signing is deferred (decision D-07) " +
+      "and the download-redirect policy is unresolved (decision D-11).",
+    "",
+  ];
+}
+
 /** The verdict block: title, protocol/project/network identity, the per-surface
  * table, and the overall status with its counts. These are what a reader opens
  * the summary for, so truncation never drops them (#334). */
-function summaryPreamble(report: CanaryReport): string[] {
+function summaryPreamble(report: CanaryReport, provenance?: SummaryProvenance): string[] {
   const lines: string[] = [];
   lines.push("## Stellar Protocol Canary", "");
   lines.push(`Protocol: ${String(report.targetProtocol)}`);
@@ -181,6 +241,12 @@ function summaryPreamble(report: CanaryReport): string[] {
       `> ♻️ **Replayed from cache:** ${String(replayed)}/${String(total)} checks (${String(percent)}%) came from the engine's result cache rather than being executed in this run.`,
       "",
     );
+  }
+  if (provenance !== undefined) {
+    // Small and bounded, so it stays in the part truncation never drops.
+    for (const line of provenanceLines(provenance)) {
+      lines.push(line);
+    }
   }
   return lines;
 }
@@ -230,7 +296,7 @@ function clipToLimit(lines: readonly string[], limit: number): string {
  * reserved *before* any optional section is admitted, which is what
  * guarantees a summary that was clipped can always say so.
  */
-function renderTruncatedSummary(report: CanaryReport): string {
+function renderTruncatedSummary(report: CanaryReport, provenance?: SummaryProvenance): string {
   const body: string[] = [];
   /** Exactly `Buffer.byteLength(body.join("\n"))`, maintained incrementally:
    * each line contributes its own bytes plus the single newline separating it
@@ -261,7 +327,7 @@ function renderTruncatedSummary(report: CanaryReport): string {
   const fits = (lines: readonly string[]): boolean =>
     pushCost(lines) + reserved + noticeCost + bodyBytes < SUMMARY_BYTE_LIMIT;
 
-  push(summaryPreamble(report));
+  push(summaryPreamble(report, provenance));
 
   if (bodyBytes + noticeCost >= SUMMARY_BYTE_LIMIT) {
     // Pathological: even the identity and verdict exceed the ceiling, which
@@ -325,7 +391,7 @@ function renderTruncatedSummary(report: CanaryReport): string {
  * rendered — truncation is invisible to every ordinary run — and only an
  * oversized one is clipped, with {@link TRUNCATION_NOTICE} appended so the
  * loss is never silent (#334). */
-export function renderSummaryMarkdown(report: CanaryReport): string {
+export function renderSummaryMarkdown(report: CanaryReport, provenance?: SummaryProvenance): string {
   const lines: string[] = [];
   // Pushed element-wise rather than via `push(...array)`: a spread of tens of
   // thousands of arguments overflows the call stack, which is exactly the
@@ -336,7 +402,7 @@ export function renderSummaryMarkdown(report: CanaryReport): string {
     }
   };
 
-  add(summaryPreamble(report));
+  add(summaryPreamble(report, provenance));
   for (const section of summarySections(report)) {
     if (section.entries.length === 0) {
       continue;
@@ -349,7 +415,7 @@ export function renderSummaryMarkdown(report: CanaryReport): string {
   }
 
   const markdown = lines.join("\n");
-  return byteLength(markdown) < SUMMARY_BYTE_LIMIT ? markdown : renderTruncatedSummary(report);
+  return byteLength(markdown) < SUMMARY_BYTE_LIMIT ? markdown : renderTruncatedSummary(report, provenance);
 }
 
 /**
