@@ -13,6 +13,8 @@ import {
   InstallationFailedError,
   TimeoutError,
 } from "./errors";
+import { resolveGithubToken } from "./inputs";
+import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import type { CheckExecutionResult } from "./runner";
 import { CARGO_INSTALL_TIMEOUT_FLOOR_MS, runCheck } from "./runner";
 import type { ResolvedVersion } from "./version";
@@ -52,15 +54,23 @@ interface ReleaseAsset {
   readonly browser_download_url?: unknown;
 }
 
-/** GETs a URL as text, authenticating when a token is available. Rejects on
- * any non-200 response, timeout, or transport error. */
+/** GETs a URL as text, authenticating when a token is available and the host is api.github.com.
+ * Rejects on any non-200 response, timeout, or transport error. */
 function httpsGetText(url: string, token: string | undefined): Promise<string> {
   return new Promise((resolve, reject) => {
+    let hostname: string;
+    try {
+      hostname = new URL(url).hostname;
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+
     const headers: Record<string, string> = {
       "User-Agent": "ProtocolCanary-Action",
       Accept: "application/vnd.github+json",
     };
-    if (token !== undefined) {
+    if (token !== undefined && hostname === "api.github.com") {
       headers.Authorization = `Bearer ${token}`;
     }
 
@@ -113,8 +123,8 @@ function parseChecksumManifest(text: string): Map<string, string> {
  * no checksum asset, or no parseable manifest is available, so callers can
  * fall back to commit/tag pinning exactly as before.
  */
-async function lookupPublishedChecksums(version: string): Promise<Map<string, string> | undefined> {
-  const token = (process.env.GITHUB_TOKEN ?? "").trim() === "" ? undefined : process.env.GITHUB_TOKEN?.trim();
+async function lookupPublishedChecksums(version: string, explicitToken?: string): Promise<Map<string, string> | undefined> {
+  const token = resolveGithubToken(explicitToken);
   try {
     const releaseBody = await httpsGetText(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, token);
     const parsed = JSON.parse(releaseBody) as unknown;
@@ -189,8 +199,8 @@ async function sha256File(filePath: string): Promise<string> {
  * and the existing commit/tag pinning stands — see SECURITY.md. A mismatch
  * always throws, so a tampered binary is never trusted.
  */
-async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersion): Promise<void> {
-  const checksums = await lookupPublishedChecksums(resolved.version);
+async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersion, token?: string): Promise<void> {
+  const checksums = await lookupPublishedChecksums(resolved.version, token);
   if (checksums === undefined) {
     core.debug(
       `No published checksum manifest for Protocol-Canary ${resolved.version}; ` +
@@ -379,13 +389,21 @@ function buildInstallArgs(resolved: ResolvedVersion): string[] {
 /** Maps a `runCheck` rejection onto the install-failure error taxonomy. */
 function describeInstallFailure(error: unknown, timeoutMs: number, resolved: ResolvedVersion): Error {
   if (error instanceof TimeoutError) {
-    return new InstallationFailedError(
+    if (error.stdout.trim() !== "") {
+      printLogBlock("Cargo stdout", error.stdout);
+    }
+    if (error.stderr.trim() !== "") {
+      printLogBlock("Cargo stderr", error.stderr);
+    }
+    const diagnosticTail = formatSafeDiagnosticTail(error.stderr, 40, 8 * 1024);
+    const baseMessage =
       `\`cargo install\` for Protocol-Canary ${resolved.version} timed out after ` +
-        `${String(Math.round(timeoutMs / 1000))}s and was terminated. ` +
-        "This is usually a stalled network connection or an extremely slow build on the runner. " +
-        "Re-run the job, or raise the Action's `timeout-minutes` input if a build of this size " +
-        "legitimately needs longer.",
-    );
+      `${String(Math.round(timeoutMs / 1000))}s and was terminated. ` +
+      "This is usually a stalled network connection or an extremely slow build on the runner. " +
+      "Re-run the job, or raise the Action's `timeout-minutes` input if a build of this size " +
+      "legitimately needs longer.";
+    const message = diagnosticTail !== "" ? `${baseMessage}\n\n${diagnosticTail}` : baseMessage;
+    return new InstallationFailedError(message, diagnosticTail !== "" ? diagnosticTail : undefined);
   }
   if (error instanceof CanaryExecutionFailedError) {
     return new InstallationFailedError(
@@ -432,10 +450,18 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promi
     throw describeInstallFailure(error, timeoutMs, resolved);
   }
   if (execution.exitCode !== 0) {
-    throw new InstallationFailedError(
+    if (execution.stdout.trim() !== "") {
+      printLogBlock("Cargo stdout", execution.stdout);
+    }
+    if (execution.stderr.trim() !== "") {
+      printLogBlock("Cargo stderr", execution.stderr);
+    }
+    const diagnosticTail = formatSafeDiagnosticTail(execution.stderr, 40, 8 * 1024);
+    const baseMessage =
       `\`cargo install\` exited with code ${String(execution.exitCode)} while installing ` +
-        `Protocol-Canary ${resolved.version}.`,
-    );
+      `Protocol-Canary ${resolved.version}.`;
+    const message = diagnosticTail !== "" ? `${baseMessage}\n\n${diagnosticTail}` : baseMessage;
+    throw new InstallationFailedError(message, diagnosticTail !== "" ? diagnosticTail : undefined);
   }
 }
 
@@ -452,6 +478,7 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promi
 export async function ensureCanaryInstalled(
   resolved: ResolvedVersion,
   installTimeoutMs: number = cargoInstallTimeoutMs(15),
+  token?: string,
 ): Promise<InstalledCanary> {
   // Warn once, before any install work, when the requested engine release is
   // deprecated or from an unvalidated future major line. The default 0.1.1
@@ -463,13 +490,13 @@ export async function ensureCanaryInstalled(
 
   const existing = await findExisting(resolved);
   if (existing !== undefined) {
-    await verifyInstalledBinary(existing.binaryPath, resolved);
+    await verifyInstalledBinary(existing.binaryPath, resolved, token);
     return existing;
   }
 
   const cached = await restoreFromCache(resolved);
   if (cached !== undefined) {
-    await verifyInstalledBinary(cached.binaryPath, resolved);
+    await verifyInstalledBinary(cached.binaryPath, resolved, token);
     return cached;
   }
 
@@ -489,7 +516,7 @@ export async function ensureCanaryInstalled(
     );
   }
 
-  await verifyInstalledBinary(binaryPath, resolved);
+  await verifyInstalledBinary(binaryPath, resolved, token);
   await saveToCache(resolved, binaryPath);
   return { binaryPath, version };
 }

@@ -140,6 +140,33 @@ inputs:
       protocol a run actually checks is controlled by `protocol`.
     required: false
 
+  github-token:
+    description: >-
+      GitHub token used to authenticate read-only GitHub REST API requests
+      to the public `StellarCanary/Protocol-Canary` repository (tag and release
+      lookups). Defaults to `${{ github.token }}`. If set to a non-empty value,
+      it takes precedence over the `GITHUB_TOKEN` environment variable. If empty
+      or unset, the `GITHUB_TOKEN` environment variable is used if present;
+      otherwise unauthenticated requests are made. Requires only `contents: read`
+      permission, which works even in fork pull requests. Set to an empty string
+      (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
+    required: false
+    default: ${{ github.token }}
+
+  generate-receipt:
+    description: >-
+      Generate a machine-readable Execution Receipt (`receiptVersion: 1`)
+      recording the provenance of this run — engine version, engine build
+      commit, fixture-pack digest, target protocol, observed protocol, and
+      timestamp — write it to the runner temp directory, and upload it as
+      the workflow artifact `stellar-canary-receipt-<run-id>`. Defaults to
+      `false`; set to `true` to opt in. The receipt is a lightweight
+      provenance record, not a signed cryptographic attestation. Fields the
+      engine's report does not carry (for example older releases without
+      `engineCommit`/`packDigest`) are recorded as `unknown`.
+    required: false
+    default: "false"
+
 outputs:
   status:
     description: >-
@@ -154,12 +181,25 @@ outputs:
     description: Number of checks that failed a compatibility assertion.
   errors:
     description: Number of checks that could not complete due to an execution error.
+  replayed-count:
+    description: >-
+      Number of checks whose results were replayed from Protocol Canary's
+      result cache instead of executed in this run (a result with
+      `source: "cache"`, or an equivalent replayed/cached flag). Counts
+      results carrying any replayed marker; engines whose reports predate
+      the cache produce `0`. Explicitly set to `0` on an execution failure,
+      like the other counts.
   report:
     description: >-
       Absolute path to the generated JSON report file. Only set when Canary
       produced output to parse; empty/unset on an execution failure (when
       status is `execution-failed`), unlike `passed`/`warnings`/`failures`/`errors`,
       which are explicitly set to `0` in that case.
+  receipt-path:
+    description: >-
+      Absolute path to the generated Execution Receipt JSON. Only set when
+      `generate-receipt` is `true` and Canary produced a parseable report;
+      unset otherwise, including on an execution failure.
 
 runs:
   using: node24

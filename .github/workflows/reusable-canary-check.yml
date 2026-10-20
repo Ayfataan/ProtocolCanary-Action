@@ -1,0 +1,155 @@
+name: Reusable Protocol Canary check
+
+# A maintained, reusable wrapper around StellarCanary/ProtocolCanary-Action so a
+# repository can standardise its compatibility check with a single `uses:`
+# declaration. Read-only permissions are part of the contract, not an option:
+# this workflow never receives write access to the caller's repository.
+#
+# Usage (from another repository):
+#
+#   jobs:
+#     canary:
+#       uses: StellarCanary/ProtocolCanary-Action/.github/workflows/reusable-canary-check.yml@v1
+#       with:
+#         protocol: 28
+#
+# See docs/reusable-workflow.md for every input and output.
+on:
+  workflow_call:
+    inputs:
+      project-root:
+        description: >-
+          Path to the project root, relative to the caller's workspace. Used to
+          locate the project's `.stellar-canary.toml` and its `fixtures`
+          directory. Defaults to the repository root.
+        required: false
+        type: string
+        default: "."
+      protocol:
+        description: Target Stellar protocol version to check against.
+        required: false
+        type: number
+        default: 28
+      fixtures-version:
+        description: >-
+          Release tag of the fixture pack to check against, for example
+          `v1.2.0`. Validated by the Action; the engine has no fixture-pack
+          flag yet, so the run still reads `project-root/fixtures`.
+        required: false
+        type: string
+        default: ""
+      fail-on-warning:
+        description: Fail the calling job when Canary reports `warning`.
+        required: false
+        type: boolean
+        default: false
+      baseline-report:
+        description: >-
+          Path to a previous report to compare against. Accepted for forward
+          compatibility; the diff engine is not available yet, so the
+          `diff-verdict` output is `unavailable` when this is set.
+        required: false
+        type: string
+        default: ""
+    outputs:
+      report-path:
+        description: Absolute path to the generated JSON report, empty on an execution failure.
+        value: ${{ jobs.canary.outputs.report-path }}
+      diff-verdict:
+        description: >-
+          `not-requested` when no baseline was supplied, `unavailable` when a
+          baseline was supplied but the engine cannot diff yet.
+        value: ${{ jobs.canary.outputs.diff-verdict }}
+      exit-code:
+        description: >-
+          `0` when the run succeeded (after applying `fail-on-warning`), `1`
+          when the Action failed or warnings were promoted to a failure.
+        value: ${{ jobs.canary.outputs.exit-code }}
+    secrets:
+      github-token:
+        description: >-
+          Optional token used only to raise the GitHub REST rate limit when
+          resolving the engine tag. Defaults to the caller's `github.token`.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Protocol Canary (${{ inputs.protocol }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      report-path: ${{ steps.run.outputs.report }}
+      diff-verdict: ${{ steps.verdict.outputs.diff-verdict }}
+      exit-code: ${{ steps.verdict.outputs.exit-code }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve project paths
+        id: paths
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ inputs.project-root }}
+        run: |
+          set -euo pipefail
+          root="${PROJECT_ROOT:-.}"
+          if [ ! -d "$root" ]; then
+            echo "::error::project-root '$root' does not exist in the caller workspace."
+            exit 1
+          fi
+          {
+            echo "fixtures-dir=${root%/}/fixtures"
+            if [ -f "${root%/}/.stellar-canary.toml" ]; then
+              echo "config=${root%/}/.stellar-canary.toml"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Protocol Canary
+        id: run
+        uses: StellarCanary/ProtocolCanary-Action@v1
+        with:
+          protocol: ${{ inputs.protocol }}
+          config: ${{ steps.paths.outputs.config }}
+          fixtures-dir: ${{ steps.paths.outputs.fixtures-dir }}
+          fixtures-pack-version: ${{ inputs.fixtures-version }}
+          upload-report: "true"
+          annotations: "true"
+        env:
+          GITHUB_TOKEN: ${{ secrets.github-token || github.token }}
+
+      - name: Compute verdict
+        id: verdict
+        if: always()
+        shell: bash
+        env:
+          ACTION_OUTCOME: ${{ steps.run.outcome }}
+          STATUS: ${{ steps.run.outputs.status }}
+          FAIL_ON_WARNING: ${{ inputs.fail-on-warning }}
+          BASELINE_REPORT: ${{ inputs.baseline-report }}
+        run: |
+          set -euo pipefail
+          code=0
+          if [ "$ACTION_OUTCOME" != "success" ]; then
+            code=1
+          fi
+          if [ "$FAIL_ON_WARNING" = "true" ] && [ "$STATUS" = "warning" ]; then
+            echo "::error::Protocol Canary reported warnings and fail-on-warning is enabled."
+            code=1
+          fi
+          if [ -n "$BASELINE_REPORT" ]; then
+            echo "::warning::baseline-report is accepted, but diffing a baseline is not available yet; the run was not compared."
+            verdict="unavailable"
+          else
+            verdict="not-requested"
+          fi
+          {
+            echo "exit-code=$code"
+            echo "diff-verdict=$verdict"
+          } >> "$GITHUB_OUTPUT"
+          exit "$code"

@@ -193,6 +193,57 @@ exit-code contract:
 4. add a `MOCK_CANARY_SCENARIO` case exercising the new behavior in
    `tests/fixtures/mock-canary.cjs` before wiring the Action to it.
 
+## Pinning the fixtures pack (weekly live workflow)
+
+`.github/workflows/weekly-live.yml` checks out
+`StellarCanary/ProtocolCanary-Fixtures` at a recorded immutable commit —
+the full commit SHA behind the `protocol-28` tag, written on the
+"Checkout ProtocolCanary-Fixtures" step — so a scheduled canary changes
+only when the network or the pinned inputs change. A fixture merged into
+the fixtures repository's default branch between runs has no effect on
+Monday's result, and every run prints the commit it actually tested in the
+step summary ("Fixtures pack under test"). This is the same reason the
+repository publishes immutable pack tags in the first place.
+
+**When the pin moves:** only when `ProtocolCanary-Fixtures` publishes a new
+pack release (a new immutable tag — a future `protocol-29`, for example)
+*and* this repository decides to start testing that pack. It never moves
+because something landed on the fixtures default branch, because a network
+changed, or as a side effect of an unrelated pull request here. Each pin
+move is its own pull request.
+
+**Who approves it:** the repository maintainer
+([@Hollujay](https://github.com/Hollujay), the [CODEOWNERS](.github/CODEOWNERS)
+owner), recorded as the approving reviewer on that pull request.
+
+**How to move it:**
+
+1. resolve the new tag to its full (dereferenced) commit SHA:
+
+   ```bash
+   git ls-remote https://github.com/StellarCanary/ProtocolCanary-Fixtures.git refs/tags/<tag>
+   ```
+
+   For an annotated tag take the SHA of the `^{}` (peeled) line — that is
+   the commit, not the tag object.
+2. in `.github/workflows/weekly-live.yml`, replace the SHA in `ref:` on the
+   "Checkout ProtocolCanary-Fixtures" step and update that step's comment
+   (tag name and both SHAs) in the same commit, so the pin stays recorded
+   in exactly one place.
+3. if the new pack lives in a different directory, update `fixtures-dir:`
+   (and the workflow name/header comment) in the same commit.
+4. link the fixtures pack release (and its tracking issue, if any) in the
+   pull request description.
+5. run `actionlint .github/workflows/weekly-live.yml` before requesting
+   review.
+
+Manual dispatch runs may override the pin temporarily with the
+`fixtures_ref` input — any tag, branch, or commit, for example to
+candidate-test a pack before moving the pin. Scheduled runs ignore the
+input and always use the recorded SHA. A `fixtures_ref` that does not
+exist fails the job at checkout with the checkout step's own error; that
+is expected and leaves the pin untouched.
+
 ## Release process
 
 1. Update `CHANGELOG.md`. Link every entry to the pull request that

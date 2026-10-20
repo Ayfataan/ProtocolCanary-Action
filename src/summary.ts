@@ -1,6 +1,7 @@
 import * as core from "@actions/core";
 
 import { SummaryPublishFailedError } from "./errors";
+import { countReplayed } from "./output";
 import type { CanaryReport, OverallStatus, Surface } from "./output";
 
 const SURFACE_HEADINGS: Readonly<Record<Surface, string>> = {
@@ -78,6 +79,21 @@ export function renderSummaryMarkdown(report: CanaryReport): string {
 
   lines.push("### Result", "", OVERALL_LABEL[report.status], "");
   lines.push(`${String(report.counts.passed)}/${String(report.counts.total)} applicable checks passed.`, "");
+
+  const replayed = countReplayed(report);
+  if (replayed > 0) {
+    // Footnote for cache reuse (issue #350): how many results were replayed
+    // from the engine's result cache instead of executed in this run, so a
+    // reader can tell execution from cache reuse at a glance. Reports
+    // without any replayed results (all pre-cache engine releases) render
+    // nothing here.
+    const total = report.counts.total;
+    const percent = total > 0 ? Math.round((replayed / total) * 100) : 0;
+    lines.push(
+      `> ♻️ **Replayed from cache:** ${String(replayed)}/${String(total)} checks (${String(percent)}%) came from the engine's result cache rather than being executed in this run.`,
+      "",
+    );
+  }
 
   const failures = notablyList(report, ["fail", "error"]);
   if (failures.length > 0) {

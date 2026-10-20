@@ -22,6 +22,23 @@ export interface CanaryResult {
   readonly details?: string;
   readonly durationMs: number;
   readonly fixtureId: string | null;
+  /**
+   * Where this result came from, per CF-01 §6/§4 reserved field:
+   * `"live"` (executed in this run), `"cache"` (replayed from the engine's
+   * result cache), or absent/not-recorded (reports from engines that predate
+   * the cache). An unknown value is deliberately typed as a plain `string`
+   * and read as *not recorded*, exactly as the contract prescribes — the
+   * Action must never assume a result was live.
+   */
+  readonly source?: string;
+  /**
+   * Boolean spellings of {@link CanaryResult.source} some engines may emit
+   * for a cached replay. Honored alongside `source: "cache"` so a replayed
+   * result is flagged whichever form the report uses.
+   */
+  readonly replayed?: boolean;
+  /** Boolean companion to {@link CanaryResult.replayed} ("cached: true"). */
+  readonly cached?: boolean;
 }
 
 export interface CanarySkip {
@@ -209,6 +226,25 @@ export function parseReport(stdout: string): CanaryReport {
   }
   const results = rawResults as CanaryResult[];
 
+  // CF-01 section 4: a result is identified inside one report by
+  // `(surface, fixtureId)`, using `testId` when `fixtureId` is absent. A
+  // report in which two results share an identity is invalid and must be
+  // rejected by consumers — otherwise duplicated entries could skew the
+  // derived counts or mask a real failure behind a copy of a passing result.
+  const seenIdentities = new Set<string>();
+  for (const [index, result] of results.entries()) {
+    const id = result.fixtureId ?? result.testId;
+    const identity = `${result.surface}:${id}`;
+    if (seenIdentities.has(identity)) {
+      throw new InvalidReportError(
+        `Canary's JSON output contains a duplicate result identity: ` +
+          `(surface, id) = (\"${result.surface}\", \"${id}\") appears more than once ` +
+          `(results[${String(index)}]).`,
+      );
+    }
+    seenIdentities.add(identity);
+  }
+
   if (report.skipped !== undefined && !Array.isArray(report.skipped)) {
     throw new InvalidReportError(
       'Canary\'s JSON output does not match the documented report shape: "skipped" is present but not an array.',
@@ -227,6 +263,29 @@ export function parseReport(stdout: string): CanaryReport {
   const counts = isCountsShape(report.counts) ? report.counts : deriveCounts(results, skipped);
 
   return { ...report, results, skipped, counts } as CanaryReport;
+}
+
+/**
+ * Whether a result was replayed from the engine's result cache rather than
+ * executed in this run (CF-01 §6). `source: "cache"` is the contract's
+ * spelling; the boolean `replayed`/`cached` attributes are honored too.
+ * Anything else — including an unknown or absent `source` — is *not
+ * recorded*, never assumed live and never counted as replayed.
+ */
+export function isReplayed(result: CanaryResult): boolean {
+  if (result.source === "cache") {
+    return true;
+  }
+  return result.replayed === true || result.cached === true;
+}
+
+/**
+ * How many of the report's results were replayed from cache. Reports from
+ * engines without the cache simply have no replayed results — this counts,
+ * it never throws.
+ */
+export function countReplayed(report: CanaryReport): number {
+  return report.results.filter(isReplayed).length;
 }
 
 export type ExitCodeCategory =
@@ -251,9 +310,18 @@ interface ExitCodeInfo {
  */
 const EXIT_CODES: Readonly<Record<number, ExitCodeInfo>> = {
   0: { category: "pass", description: "Compatibility checks passed." },
-  1: { category: "compatibility_failure", description: "A compatibility check failed." },
-  2: { category: "configuration_error", description: "Canary configuration is invalid." },
-  3: { category: "execution_error", description: "Execution or RPC communication failed." },
+  1: {
+    category: "compatibility_failure",
+    description: "Test failures detected: a compatibility assertion failed.",
+  },
+  2: {
+    category: "configuration_error",
+    description: "Regression gate triggered or Canary configuration is invalid.",
+  },
+  3: {
+    category: "execution_error",
+    description: "Unexpected runtime crash: execution or RPC communication failed.",
+  },
   4: { category: "invalid_fixture", description: "One or more fixtures are invalid." },
   5: { category: "internal_error", description: "Canary encountered an internal error." },
 };
