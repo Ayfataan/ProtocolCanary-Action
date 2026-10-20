@@ -344,8 +344,11 @@ function findPrebuiltAsset(assets: ReleaseAsset[], version: string, triple: stri
 }
 
 /** Hashes a file with SHA-256, streaming so a large binary never has to be
- * read into memory all at once. */
-async function sha256File(filePath: string): Promise<string> {
+ * read into memory all at once. Exported for the Provenance & Trust summary
+ * section (issue #373), which reports the digest of the binary this run
+ * actually executed; decision D-07 bounds what that digest may be claimed
+ * to prove (data integrity, not authorship). */
+export async function sha256File(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash("sha256");
     const stream = fs.createReadStream(filePath);
@@ -365,10 +368,34 @@ async function sha256File(filePath: string): Promise<string> {
  * checksum (or none applies to this platform) this degrades to a debug log
  * and the existing commit/tag pinning stands — see SECURITY.md. A mismatch
  * always throws, so a tampered binary is never trusted.
+ *
+ * With `strictIntegrity` (issue #372) the degrades are themselves fatal: the
+ * run fails closed whenever integrity cannot be *proven*, not only when it
+ * is disproven. Redirected and unencrypted manifest lookups surface through
+ * {@link lookupPublishedChecksums} as "no manifest", so the strict branches
+ * below also implement the D-11 boundary: no redirect is ever followed.
+>
+ *
+ * The *absence* of a verification opportunity is the fail-closed trigger in
+ * strict mode; the presence of a mismatch aborts in both modes. The digest
+ * itself surfaces in the job summary through the Provenance & Trust section
+ * (issue #373), which hashes the executed binary directly.
  */
-async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersion, token?: string): Promise<void> {
+async function verifyInstalledBinary(
+  binaryPath: string,
+  resolved: ResolvedVersion,
+  token: string | undefined,
+  strictIntegrity: boolean,
+): Promise<void> {
   const checksums = await lookupPublishedChecksums(resolved.version, token);
   if (checksums === undefined) {
+    if (strictIntegrity) {
+      throw new InstallationFailedError(
+        `strict-integrity is enabled, but there is no published checksum manifest for ` +
+          `Protocol-Canary ${resolved.version} (or its lookup could not complete over an ` +
+          "authenticated HTTPS channel). Integrity cannot be proven, so the run fails closed.",
+      );
+    }
     core.debug(
       `No published checksum manifest for Protocol-Canary ${resolved.version}; ` +
         "relying on commit/tag pinning only (see SECURITY.md).",
@@ -377,6 +404,13 @@ async function verifyInstalledBinary(binaryPath: string, resolved: ResolvedVersi
   }
   const expected = selectExpectedChecksum(checksums, binaryName());
   if (expected === undefined) {
+    if (strictIntegrity) {
+      throw new InstallationFailedError(
+        `strict-integrity is enabled, but the published checksum manifest for ` +
+          `Protocol-Canary ${resolved.version} has no entry for this platform. ` +
+          "Integrity cannot be proven, so the run fails closed.",
+      );
+    }
     core.debug(
       `Published checksum manifest for Protocol-Canary ${resolved.version} has no entry for this platform; ` +
         "relying on commit/tag pinning only.",
@@ -832,21 +866,26 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promi
  *
  * The install step is bounded by `installTimeoutMs` and terminated when it
  * exceeds it.
+ *
+ * `strictIntegrity` (issue #372, default `false`) makes any inability to
+ * prove binary integrity against a published checksum fatal instead of a
+ * debug-logged degrade; see {@link verifyInstalledBinary}.
  */
 export async function ensureCanaryInstalled(
   resolved: ResolvedVersion,
   installTimeoutMs: number = cargoInstallTimeoutMs(15),
   token?: string,
+  strictIntegrity = false,
 ): Promise<InstalledCanary> {
   const existing = await findExisting(resolved);
   if (existing !== undefined) {
-    await verifyInstalledBinary(existing.binaryPath, resolved, token);
+    await verifyInstalledBinary(existing.binaryPath, resolved, token, strictIntegrity);
     return existing;
   }
 
   const cached = await restoreFromCache(resolved);
   if (cached !== undefined) {
-    await verifyInstalledBinary(cached.binaryPath, resolved, token);
+    await verifyInstalledBinary(cached.binaryPath, resolved, token, strictIntegrity);
     return cached;
   }
 
@@ -871,7 +910,7 @@ export async function ensureCanaryInstalled(
     );
   }
 
-  await verifyInstalledBinary(binaryPath, resolved, token);
+  await verifyInstalledBinary(binaryPath, resolved, token, strictIntegrity);
   await saveToCache(resolved, binaryPath);
   return { binaryPath, version };
 }

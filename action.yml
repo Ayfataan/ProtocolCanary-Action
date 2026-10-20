@@ -195,6 +195,23 @@ inputs:
       (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
     required: false
     default: ${{ github.token }}
+  strict-integrity:
+    description: >-
+      Optional fail-closed integrity policy (issue #372). Defaults to `false`,
+      preserving today's behaviour: when the published SHA-256 checksum for
+      the resolved release is missing or does not cover this platform, the
+      Action degrades to commit/tag pinning with a debug note. Set to `true`
+      to abort instead whenever binary integrity cannot be proven - no
+      published checksum manifest, no manifest entry for this platform, or a
+      checksum lookup that could not be completed (for example a redirected
+      or unencrypted manifest request). A checksum mismatch aborts the run in
+      either mode. Be honest about what "proven" means (decision D-07): a
+      checksum verifies data integrity, not the release author's identity or
+      endorsement, and release signing is deferred; the download-redirect
+      allowlist policy (D-11) remains blocked until verified against real
+      release hosts, so no redirect is followed at all today.
+    required: false
+    default: "false"
 
   generate-receipt:
     description: >-

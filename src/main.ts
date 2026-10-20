@@ -5,7 +5,7 @@ import * as path from "node:path";
 
 import { uploadReceipt, uploadReport } from "./artifact";
 import { emitAnnotations, emitExecutionFailureAnnotation, emitExitFailureAnnotation } from "./annotations";
-import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "./canary";
+import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./canary";
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
@@ -109,6 +109,7 @@ export async function run(): Promise<void> {
       resolved,
       cargoInstallTimeoutMs(inputs.timeoutMinutes),
       inputs.githubToken,
+      inputs.strictIntegrity,
     );
   } catch (error) {
     const diagnostic = error instanceof InstallationFailedError && error.diagnostic ? error.diagnostic : "";
@@ -186,7 +187,26 @@ export async function run(): Promise<void> {
   }
 
   try {
-    await writeSummary(renderSummaryMarkdown(report));
+    // Provenance & Trust section (issue #373): digest of the binary this run
+    // actually executed, observed (not verified — decision D-07 bounds that
+    // claim). The fixture-pack digest awaits the #338 download pipeline;
+    // fields this run cannot produce are rendered as explicitly unverified
+    // rather than fabricated, and omitted from the metadata object entirely
+    // when there is nothing honest to say.
+    let binarySha256: string | undefined;
+    try {
+      binarySha256 = await sha256File(installed.binaryPath);
+    } catch {
+      // A binary that vanished between check and reporting is itself
+      // diagnostic; the summary says "unverified" instead of guessing.
+      core.debug("Provenance: could not hash the executed binary for the summary.");
+    }
+    await writeSummary(
+      renderSummaryMarkdown(report, {
+        ...(binarySha256 !== undefined ? { binarySha256 } : {}),
+        engineVersion: installed.version,
+      }),
+    );
   } catch (error) {
     core.setFailed(describeError(error));
   }
