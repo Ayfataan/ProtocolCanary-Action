@@ -84,19 +84,11 @@ A compiled-from-a-pinned-commit build is still a weaker integrity story
 than a checksum published by the artifact's own maintainers, so making
 checksum-verified installs the primary path remains the goal.
 
-## Cache integrity check
-
-The cached `stellar-canary` binary is accompanied by a sibling SHA-256 sidecar
-file (`stellar-canary.sha256`). On cache restore, this Action recomputes the
-binary's digest and compares it to the sidecar before it is executed. If the
-sidecar is missing, malformed, or the binary hash differs, the Action discards
-that cache entry and falls back to a fresh install instead of trusting the
-restored binary.
-
-This check detects modifications after installation and while restoring a
-cache entry. It does not validate the integrity of the original upstream source
-or artifact publication process; it only verifies that the file on this runner
-still matches the digest captured at install time.
+The full integrity model — trust boundaries, the optional
+`strict-integrity` fail-closed policy, the D-07 (checksums are data
+integrity, not author authenticity) and D-11 (redirect policy unresolved,
+so no redirect is followed) decision boundaries, and the threat model — is
+documented in [`docs/integrity-model.md`](docs/integrity-model.md).
 
 ## Subprocess isolation
 
@@ -163,42 +155,6 @@ workflow's `rpc-url` happens to embed a credential in its query string
 Canary itself might log it — the same as any other CLI argument a workflow
 author chooses to pass.
 
-## Release provenance and attestation
-
-The release workflow emits a build provenance attestation for the committed
-`dist/` bundle before creating the GitHub Release. Consumers can verify that the
-workflow and repository identity match the expected release pipeline with
-`gh attestation verify`.
-
-Example verification commands:
-
-```bash
-# Verify the attestation against the repo identity and the expected release workflow.
-gh attestation verify dist/index.js \
-  --repo StellarCanary/ProtocolCanary-Action \
-  --source-branch main \
-  --workflow-path .github/workflows/release.yml
-
-# Verify the built action bundle or a single artifact in dist/ for a tagged release.
-gh attestation verify dist/index.js \
-  --repo StellarCanary/ProtocolCanary-Action \
-  --predicate-type https://in-toto.io/attestation/v0.1 \
-  --workflow-path .github/workflows/release.yml
-```
-
-These checks confirm that the artifact was produced by this repository's
-release workflow, not that the upstream Rust source itself was signed by a
-trusted maintainer. The provenance attestation is a build-chain guarantee for
-this action bundle; it is not a substitute for upstream project signing.
-
-## Full integrity model
-
-The full integrity model — trust boundaries, the optional
-`strict-integrity` fail-closed policy, the D-07 (checksums are data
-integrity, not author authenticity) and D-11 (redirect policy unresolved,
-so no redirect is followed) decision boundaries, and the threat model — is
-documented in [`docs/integrity-model.md`](docs/integrity-model.md).
-
 ## Supported versions
 
 | Version | Supported |
@@ -231,3 +187,10 @@ filing a public issue. Include:
 We aim to acknowledge new reports within **5 business days**. After
 acknowledging a report, we will work with you on a fix and disclosure
 timeline before any public write-up.
+
+This is a single-maintainer, pre-1.0 project, so the 5-business-day target
+is for the initial acknowledgement only, not for a fix: a fix and its
+release depend on the severity and complexity of the issue. If you have
+not received an acknowledgement within 5 business days, please follow up
+on your existing private report thread rather than opening a public issue,
+so the report is not lost or unintentionally disclosed.
