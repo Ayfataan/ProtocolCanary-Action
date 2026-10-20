@@ -304,4 +304,40 @@ describe("resolveVersion", () => {
     const resolved = await resolveVersion("0.1.0");
     expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: undefined });
   });
+
+  it("prefers explicit options.token over GITHUB_TOKEN environment variable", async () => {
+    process.env.GITHUB_TOKEN = "env-token";
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]) }]);
+
+    await resolveVersion("0.1.0", { token: "explicit-token" });
+
+    expect(calls[0]?.headers.Authorization).toBe("Bearer explicit-token");
+  });
+
+  it("falls back to GITHUB_TOKEN when options.token is whitespace-only", async () => {
+    process.env.GITHUB_TOKEN = "env-token";
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]) }]);
+
+    await resolveVersion("0.1.0", { token: "   \t  \n " });
+
+    expect(calls[0]?.headers.Authorization).toBe("Bearer env-token");
+  });
+
+  it("attaches Authorization header only when request host is api.github.com", async () => {
+    const calls = mockHttpsPages([
+      {
+        body: tagsBody([{ name: "v9.9.9", sha: "other" }]),
+        link: '<https://untrusted.host.test/tags?page=2>; rel="next"',
+      },
+      {
+        body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]),
+      },
+    ]);
+
+    await resolveVersion("0.1.0", { token: "secret-token" });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.headers.Authorization).toBe("Bearer secret-token");
+    expect(calls[1]?.headers.Authorization).toBeUndefined();
+  });
 });

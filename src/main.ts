@@ -3,20 +3,29 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { uploadReport } from "./artifact";
-import { emitAnnotations, emitExecutionFailureAnnotation } from "./annotations";
+import { uploadReceipt, uploadReport } from "./artifact";
+import { emitAnnotations, emitExecutionFailureAnnotation, emitExitFailureAnnotation } from "./annotations";
 import { cargoInstallTimeoutMs, ensureCanaryInstalled } from "./canary";
-import { describeError, isCanaryActionError } from "./errors";
+import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
-import { describeExitCode, parseReport } from "./output";
-import { buildCheckArgs, engineSupportsAllowEmpty, runCheck } from "./runner";
+import { printLogBlock } from "./log-block";
+import { countReplayed, describeExitCode, parseReport } from "./output";
+import { buildReceipt, serializeReceipt } from "./receipt";
+import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck } from "./runner";
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
 
 function reportFilePath(): string {
   const dir = process.env.RUNNER_TEMP ?? os.tmpdir();
   return path.join(dir, "stellar-canary-report.json");
+}
+
+/** Location of the Execution Receipt written when `generate-receipt` is
+ * true (#361 input, #362 export); same temp dir as the report. */
+function receiptFilePath(): string {
+  const dir = process.env.RUNNER_TEMP ?? os.tmpdir();
+  return path.join(dir, "stellar-canary-receipt.json");
 }
 
 /**
@@ -46,7 +55,7 @@ function artifactDifferentiator(inputs: ActionInputs): string | undefined {
 async function handleExecutionFailure(reason: string, diagnostic: string, annotate: boolean): Promise<void> {
   core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${reason}`);
   if (annotate) {
-    emitExecutionFailureAnnotation(reason);
+    emitExecutionFailureAnnotation(reason, diagnostic);
   }
   try {
     await writeSummary(renderExecutionFailureMarkdown(reason, diagnostic));
@@ -58,6 +67,7 @@ async function handleExecutionFailure(reason: string, diagnostic: string, annota
   core.setOutput("warnings", "0");
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
+  core.setOutput("replayed-count", "0");
 }
 
 /**
@@ -86,7 +96,7 @@ export async function run(): Promise<void> {
     return;
   }
 
-  const resolved = await resolveVersion(inputs.version);
+  const resolved = await resolveVersion(inputs.version, { token: inputs.githubToken });
   core.info(
     `Stellar Protocol Canary Action\nCanary version: ${resolved.version} (${resolved.tag}${
       resolved.commitSha !== undefined ? `@${resolved.commitSha.slice(0, 12)}` : ""
@@ -95,9 +105,14 @@ export async function run(): Promise<void> {
 
   let installed;
   try {
-    installed = await ensureCanaryInstalled(resolved, cargoInstallTimeoutMs(inputs.timeoutMinutes));
+    installed = await ensureCanaryInstalled(
+      resolved,
+      cargoInstallTimeoutMs(inputs.timeoutMinutes),
+      inputs.githubToken,
+    );
   } catch (error) {
-    await handleExecutionFailure(describeError(error), "", inputs.annotations);
+    const diagnostic = error instanceof InstallationFailedError && error.diagnostic ? error.diagnostic : "";
+    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations);
     return;
   }
 
@@ -114,8 +129,16 @@ export async function run(): Promise<void> {
   try {
     execution = await runCheck(installed.binaryPath, buildCheckArgs(inputs, resolved.version), inputs.timeoutMinutes * 60_000);
   } catch (error) {
-    await handleExecutionFailure(describeError(error), "", inputs.annotations);
+    const diagnostic = error instanceof TimeoutError && error.stderr ? error.stderr : "";
+    if (error instanceof TimeoutError && error.stderr.trim() !== "") {
+      printLogBlock("Canary diagnostics", error.stderr);
+    }
+    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations);
     return;
+  }
+
+  if (execution.stderr.trim() !== "") {
+    printLogBlock("Canary diagnostics", execution.stderr);
   }
 
   const reportPath = reportFilePath();
@@ -151,6 +174,17 @@ export async function run(): Promise<void> {
 
   if (inputs.annotations) {
     emitAnnotations(report);
+    if (execution.exitCode !== 0) {
+      // The engine's own exit code failed the run (#351): annotate the root
+      // diagnostic from stderr, falling back to the failing result the
+      // report itself carries (engines report some failures there only),
+      // and finally to nothing — never a fabricated reason.
+      const rootResult =
+        report.results.find((r) => r.status === "fail") ?? report.results.find((r) => r.status === "error");
+      const reportDiagnostic =
+        rootResult !== undefined ? `${rootResult.testId} (${rootResult.surface}): ${rootResult.summary}` : "";
+      emitExitFailureAnnotation(execution.exitCode, extractDiagnostic(execution.stderr) || reportDiagnostic);
+    }
   }
 
   try {
@@ -164,10 +198,30 @@ export async function run(): Promise<void> {
   core.setOutput("warnings", String(report.counts.warnings));
   core.setOutput("failures", String(report.counts.failed));
   core.setOutput("errors", String(report.counts.errors));
+  core.setOutput("replayed-count", String(countReplayed(report)));
   core.setOutput("report", reportPath);
 
   if (inputs.uploadReport) {
     await uploadReport(reportPath, artifactDifferentiator(inputs));
+  }
+
+  // #362: strictly opt-in, and auxiliary like the report artifact. A receipt
+  // is only produced when Canary actually yielded a report (the
+  // execution-failure paths returned above), and neither a write failure nor
+  // an upload failure can change the compatibility result.
+  if (inputs.generateReceipt) {
+    const receiptPath = receiptFilePath();
+    let written = false;
+    try {
+      fs.writeFileSync(receiptPath, serializeReceipt(buildReceipt(report)), "utf8");
+      core.setOutput("receipt-path", receiptPath);
+      written = true;
+    } catch (error) {
+      core.warning(`Failed to write the Execution Receipt: ${describeError(error)}`);
+    }
+    if (written) {
+      await uploadReceipt(receiptPath);
+    }
   }
 
   // Canary's own exit code is authoritative: never recompute pass/fail

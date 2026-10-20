@@ -60,8 +60,9 @@ the tag does not exist. That check belongs after publication.
 
 ## Risks to watch
 
-- The weekly `integration.yml` job has failed since Testnet moved to protocol 29
-  (see the draft issue "Repair the weekly live integration workflow"). It will
+- The weekly live integration job (formerly `integration.yml`, now
+  `weekly-live.yml`) has failed since Testnet moved to protocol 29
+  (issue #352, repaired there). It will
   also fail for 0.2.0 against Protocol 28 identity fixtures. That is expected under
   decision D-09 and is not a reason to change engine behavior.
 - Anyone running a "no fixtures" step on purpose (for example to test their

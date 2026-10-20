@@ -125,6 +125,7 @@ jobs:
 | `diagnostics` | Opt in to a best-effort redacted diagnostics log bundle when Canary cannot produce a usable report. Strictly opt-in: the artifact is downloadable by anyone who can read the repository, and the process environment is never included. | `false` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
 | `timeout-minutes` | Maximum time to let Canary run before it is terminated. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
+| `github-token` | GitHub token used to authenticate read-only requests to `api.github.com` for version resolution and checksum discovery, raising GitHub API rate limits. Defaults to `${{ github.token }}`. Pass an empty string (`""`) to disable authenticated requests. Requires only `contents: read` permission and works on fork pull requests. | `${{ github.token }}` |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
 | `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected here, unlike `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
 
@@ -135,7 +136,7 @@ annotations), and never invokes Canary twice to get a second format.
 ## Outputs
 
 All values are strings, as GitHub Actions outputs always are. The counts
-(`passed`, `warnings`, `failures`, `errors`) are decimal-string integers
+(`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are decimal-string integers
 (rendered with `String(n)`), and `status` is one of the five fixed
 literals below.
 
@@ -146,6 +147,7 @@ literals below.
 | `warnings` | Number of checks that produced a warning. | `"1"` |
 | `failures` | Number of checks that failed a compatibility assertion. | `"2"` |
 | `errors` | Number of checks that could not complete due to an execution error. | `"0"` |
+| `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. | `"3"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
@@ -159,7 +161,7 @@ A concrete consumer, using the outputs to gate a follow-up step:
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 
 ## How failures appear
 
@@ -326,6 +328,24 @@ what to do about each.
 the message itself; see [Inputs](#inputs) for each input's accepted
 values.
 
+### Viewing diagnostics
+
+External process diagnostics are automatically captured, redacted, and formatted
+in GitHub Actions collapsed log groups:
+
+- **Canary diagnostics:** Whenever `stellar-canary check` writes to standard error
+  (on passing runs, failing runs, unexpected errors, or timeouts), the full stderr
+  is printed in a collapsed log group named `Canary diagnostics`.
+- **Cargo install diagnostics:** When `cargo install` fails or times out, the last
+  40 lines (up to 8 KiB) of cargo's standard error are surfaced in the error message,
+  annotation, and job summary, and captured stdout and stderr are printed in
+  `Cargo stdout` and `Cargo stderr` collapsed log groups.
+- **Log safety:** External text is sanitized: recognised secrets (tokens, seeds,
+  credential URLs) are masked, ANSI escape sequences and control characters are
+  stripped, byte/line tail bounds are enforced, and runner command processing is
+  disabled via `::stop-commands::` using fresh random tokens to prevent command
+  injection.
+
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
@@ -344,6 +364,23 @@ In both cases the hung process is sent `SIGTERM` and, if it ignores that,
 `SIGKILL` after a short grace period, so neither operation can block the job
 until GitHub's much longer job-level `timeout-minutes` steps in with a
 generic error and no Canary diagnostic.
+
+### Bounded stream capture
+
+To protect the runner from unbounded memory exhaustion:
+
+- **stdout limit:** Standard output capture is bounded to 64 MiB
+  (`MAX_STDOUT_CAPTURE_BYTES`). If `stellar-canary check` emits more than 64 MiB,
+  the process is immediately terminated (SIGTERM followed by SIGKILL escalation)
+  and the run fails with a dedicated `CanaryExecutionFailedError` stating that
+  output was truncated. The partial output is never parsed as a valid report.
+- **stderr limit:** Standard error capture is bounded to 1 MiB
+  (`MAX_STDERR_CAPTURE_BYTES`). If stderr exceeds 1 MiB, earlier output is dropped
+  and the tail is retained with a truncation notice (`[... earlier output dropped ...]`)
+  so that the root failure diagnostic remains intact.
+- **UTF-8 stream decoding:** Both streams are decoded statefully as UTF-8, ensuring
+  multi-byte characters (2, 3, and 4-byte UTF-8 sequences) straddling chunk boundaries
+  survive without corruption.
 
 GitHub Actions' own job- and step-level `timeout-minutes` are unrelated: set
 any surrounding job- or step-level timeout comfortably higher than this
@@ -475,6 +512,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 Interfaces shared with the other two repositories (report, lockfile,
 comparison, fixture releases, project roots) are specified in
 [`docs/contracts.md`](docs/contracts.md).
+
+Repositories that want a single-declaration compatibility check can call the
+maintained reusable workflow; its inputs, outputs, and matrix, monorepo, and
+PR-gating examples are documented in
+[`docs/reusable-workflow.md`](docs/reusable-workflow.md).
 
 ## License
 

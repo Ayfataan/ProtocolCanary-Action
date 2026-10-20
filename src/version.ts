@@ -1,6 +1,8 @@
 import * as core from "@actions/core";
 import * as https from "node:https";
 
+import { resolveGithubToken } from "./inputs";
+
 /**
  * Single point of control for where this Action installs Protocol-Canary from.
  *
@@ -51,7 +53,7 @@ export interface ResolveVersionOptions {
    * hour per source IP, which matters because GitHub-hosted runners share
    * IP ranges across many concurrent jobs.
    */
-  readonly token?: string;
+  readonly token?: string | undefined;
 }
 
 /** Resolves a bare version (e.g. "0.1.0") to its upstream tag and, if
@@ -91,15 +93,9 @@ interface TagsPage {
   readonly next: string | undefined;
 }
 
-/** Normalizes a token candidate: an explicit value wins, otherwise the
- * `GITHUB_TOKEN` environment variable is used. Blank/whitespace-only values
- * count as "no token" so an empty secret never produces a bad header. */
+/** Normalizes a token candidate using the shared precedence rules. */
 function resolveToken(explicitToken: string | undefined): string | undefined {
-  const candidate = explicitToken ?? process.env.GITHUB_TOKEN;
-  if (candidate === undefined || candidate.trim() === "") {
-    return undefined;
-  }
-  return candidate.trim();
+  return resolveGithubToken(explicitToken);
 }
 
 /**
@@ -126,11 +122,19 @@ function parseNextLink(header: string | string[] | undefined): string | undefine
  * a non-200 response, malformed JSON, or an unexpected response shape. */
 function fetchTagsPage(url: string, token: string | undefined): Promise<TagsPage> {
   return new Promise((resolve, reject) => {
+    let hostname: string;
+    try {
+      hostname = new URL(url).hostname;
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+
     const headers: Record<string, string> = {
       "User-Agent": "ProtocolCanary-Action",
       Accept: "application/vnd.github+json",
     };
-    if (token !== undefined) {
+    if (token !== undefined && hostname === "api.github.com") {
       headers.Authorization = `Bearer ${token}`;
     }
 
