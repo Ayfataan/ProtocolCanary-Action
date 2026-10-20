@@ -1,0 +1,211 @@
+# Example workflow for issue #368: aggregate the per-target JSON reports
+# produced by a parallel matrix check (see examples/matrix-check.yml) into a
+# single consolidated Markdown table in the GitHub job summary.
+#
+# The `aggregate` job:
+#   * runs with `if: always()` so a partially-failing matrix still produces
+#     the consolidated view;
+#   * downloads every `report-*` artifact without merging them, so each leg's
+#     files land in their own `report-<target>/` directory;
+#   * walks the expected target list (EXPECTED_TARGETS) exactly once, so a
+#     target whose artifact never arrived is highlighted as **missing** in the
+#     table instead of crashing the aggregation.
+#
+# This file lives under .github/workflows/examples/ and is never executed by
+# GitHub. The embedded aggregation script is dependency-free CommonJS and is
+# exercised by tests/unit/matrix-examples.test.ts, which extracts and runs it.
+name: Example - Consolidated Matrix Report Aggregation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary-matrix:
+    name: canary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: payments
+            project-root: contracts/payments
+          - target: ledger
+            project-root: contracts/ledger
+          - target: escrow
+            project-root: services/escrow
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve project paths
+        id: paths
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ matrix.project-root }}
+        run: |
+          set -euo pipefail
+          root="${PROJECT_ROOT:-.}"
+          if [ ! -d "$root" ]; then
+            echo "::error::project-root '$root' does not exist in this workspace."
+            exit 1
+          fi
+          {
+            echo "fixtures-dir=${root%/}/fixtures"
+            if [ -f "${root%/}/.stellar-canary.toml" ]; then
+              echo "config=${root%/}/.stellar-canary.toml"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Protocol Canary for ${{ matrix.target }}
+        id: canary
+        uses: StellarCanary/ProtocolCanary-Action@v1
+        with:
+          protocol: 28
+          config: ${{ steps.paths.outputs.config }}
+          fixtures-dir: ${{ steps.paths.outputs.fixtures-dir }}
+          upload-report: "false"
+          annotations: "true"
+
+      - name: Record leg status
+        shell: bash
+        env:
+          LEG_STATUS: ${{ steps.canary.outputs.status }}
+          LEG_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          printf 'target=%s\nstatus=%s\n' "$LEG_TARGET" "${LEG_STATUS:-execution-failed}" \
+            > "canary-status-${LEG_TARGET}.txt"
+
+      - name: Upload report for ${{ matrix.target }}
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.target }}
+          path: |
+            ${{ steps.canary.outputs.report }}
+            canary-status-${{ matrix.target }}.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  aggregate:
+    name: Consolidated matrix report
+    needs: canary-matrix
+    # Partial matrix failures must still produce the consolidated table.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download all matrix reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: report-*
+          path: matrix-reports
+          merge-multiple: false
+
+      - name: Build consolidated summary
+        shell: bash
+        env:
+          # Must list every matrix target once; targets with no downloaded
+          # artifact are reported as missing instead of crashing the job.
+          EXPECTED_TARGETS: payments ledger escrow
+          REPORTS_DIR: matrix-reports
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const reportsDir = process.env.REPORTS_DIR || "matrix-reports";
+          const targets = (process.env.EXPECTED_TARGETS || "")
+            .split(/\s+/)
+            .filter((target) => target !== "");
+          const summaryFile = process.env.GITHUB_STEP_SUMMARY || "";
+
+          function findFile(dir, pattern) {
+            const stack = [dir];
+            while (stack.length > 0) {
+              const current = stack.pop();
+              let entries;
+              try {
+                entries = fs.readdirSync(current, { withFileTypes: true });
+              } catch {
+                continue;
+              }
+              for (const entry of entries) {
+                const full = path.join(current, entry.name);
+                if (entry.isDirectory()) {
+                  stack.push(full);
+                } else if (pattern.test(entry.name)) {
+                  return full;
+                }
+              }
+            }
+            return undefined;
+          }
+
+          function rowFromTarget(target) {
+            const dir = path.join(reportsDir, "report-" + target);
+            if (!fs.existsSync(dir)) {
+              return { target, status: "missing", note: "no artifact for this target" };
+            }
+            const statusFile = findFile(dir, /^canary-status-.*\.txt$/);
+            if (statusFile !== undefined) {
+              const match = /^status=(.*)$/m.exec(fs.readFileSync(statusFile, "utf8"));
+              const status = match && match[1] ? match[1].trim() : "";
+              if (status !== "") {
+                return { target, status, note: "from leg status file" };
+              }
+            }
+            const jsonFile = findFile(dir, /\.json$/);
+            if (jsonFile === undefined) {
+              return { target, status: "missing", note: "artifact carries no report" };
+            }
+            try {
+              const report = JSON.parse(fs.readFileSync(jsonFile, "utf8"));
+              const results = Array.isArray(report.results) ? report.results : [];
+              const count = (state) =>
+                results.filter((result) => result && result.status === state).length;
+              return {
+                target,
+                status: String(report.status || "unknown"),
+                passed: count("pass"),
+                warnings: count("warning"),
+                failures: count("fail"),
+                errors: count("error"),
+                total: results.length,
+              };
+            } catch {
+              return { target, status: "invalid", note: "report could not be parsed" };
+            }
+          }
+
+          const rows = targets.map(rowFromTarget);
+          const lines = [];
+          lines.push("## Protocol Canary matrix summary", "");
+          lines.push("| Target | Status | Passed | Warnings | Failures | Errors |");
+          lines.push("| --- | --- | ---: | ---: | ---: | ---: |");
+          for (const row of rows) {
+            const status = row.status === "missing"
+              ? "**missing** (no report for this target)"
+              : row.status;
+            const cell = (value) => (value === undefined ? "-" : String(value));
+            lines.push(
+              `| ${row.target} | ${status} | ${cell(row.passed)} | ` +
+                `${cell(row.warnings)} | ${cell(row.failures)} | ${cell(row.errors)} |`
+            );
+          }
+          lines.push("");
+          lines.push(
+            "Targets shown as **missing** did not deliver a report (their leg failed, " +
+              "was cancelled, or uploaded no artifact); aggregation completed anyway."
+          );
+          const text = lines.join("\n") + "\n";
+          if (summaryFile) {
+            fs.appendFileSync(summaryFile, text);
+          } else {
+            process.stdout.write(text);
+          }
+          NODE
