@@ -947,17 +947,57 @@ describe("ensureCanaryInstalled", () => {
       }
     });
 
-    it("falls back to cargo install on cache miss", async () => {
-      cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-      cacheMocks.restoreCacheMock.mockResolvedValue(undefined);
+it("falls back to cargo install on cache miss", async () => {
+    cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
+    cacheMocks.restoreCacheMock.mockResolvedValue(undefined);
 
-      const installed = await ensureCanaryInstalled(RESOLVED);
+    const installed = await ensureCanaryInstalled(RESOLVED);
 
-      expect(installed.version).toBe("0.1.0");
-      expect(cacheMocks.restoreCacheMock).toHaveBeenCalledTimes(1);
-      expect(cacheMocks.saveCacheMock).toHaveBeenCalledTimes(1);
-      expect(spawnMock).toHaveBeenCalled();
-    });
+    expect(installed.version).toBe("0.1.0");
+    expect(cacheMocks.restoreCacheMock).toHaveBeenCalledTimes(1);
+    expect(cacheMocks.saveCacheMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalled();
+  });
+
+  it("warns but succeeds when saving an installed binary to cache fails", async () => {
+    cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
+    cacheMocks.saveCacheMock.mockRejectedValue(new Error("cache quota exceeded"));
+
+    const installed = await ensureCanaryInstalled(RESOLVED);
+
+    expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
+    expect(cacheMocks.saveCacheMock).toHaveBeenCalledOnce();
+    expect(coreMocks.warningMock).toHaveBeenCalledWith("Cache save failed, ignoring: Error: cache quota exceeded");
+    expect(spawnMock).toHaveBeenCalled();
+  });
+
+  it("warns when a prebuilt asset HTTP 404 is encountered and falls back to cargo install", async () => {
+    // Mock a release with a checksum asset
+    httpsGetMock
+      .mockImplementationOnce(
+        respond(
+          200,
+          JSON.stringify({
+            assets: [
+              {
+                name: "SHA256SUMS",
+                browser_download_url: "https://example.test/SHA256SUMS",
+              },
+            ],
+          }),
+        ),
+      )
+      .mockImplementationOnce(respond(404, ""));
+
+    const installed = await ensureCanaryInstalled(RESOLVED);
+
+    // Installation should succeed (fall back to cargo install)
+    expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
+    // The debug message should identify the asset that returned 404
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(
+      expect.stringContaining("SHA256SUMS"),
+    );
+  });
 
     it("falls back to cargo install when restored binary is not executable", async () => {
       cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
