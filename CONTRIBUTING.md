@@ -60,6 +60,32 @@ actionlint           # static analysis of .github/workflows/
 zizmor .github/workflows # security audit of .github/workflows/
 ```
 
+### Trying the Action locally without GitHub
+
+To see what a change does end to end without pushing a branch, run the
+committed bundle the way a workflow run would:
+
+```bash
+npm run build
+node scripts/run-local.mjs \
+  --engine "$HOME/.cargo/bin/stellar-canary" \
+  --fixtures-dir ./my-fixtures \
+  --protocol 28 \
+  --input version=0.1.1 \
+  --input allow-empty=true
+```
+
+`scripts/run-local.mjs` builds the runner environment the Action reads
+(`INPUT_*` from `--input name=value`, plus `GITHUB_OUTPUT`,
+`GITHUB_STEP_SUMMARY`, `GITHUB_ENV`, `RUNNER_TEMP` and a temporary
+`CARGO_HOME` holding the engine given by `--engine`) in a temporary
+directory, runs `dist/index.js`, and prints the outputs the Action wrote,
+the rendered job summary, the `::`-annotation lines it emitted, and the exit
+code — then exits with that code and removes the temporary directory. It
+never installs an engine (`--engine` is required) and never talks to the
+network. `--help` documents every option; see `tests/unit/run-local.test.ts`
+for the exact contract.
+
 `npm run test:coverage` runs the same suite as `npm test` with coverage
 measurement enabled (via `@vitest/coverage-v8`; configured in
 `vitest.config.ts` to measure `src/` only). It reports line/branch coverage

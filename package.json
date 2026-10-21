@@ -22,6 +22,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "check:root": "node scripts/check-root-files.mjs",
     "lint": "eslint src tests"
   },
   "dependencies": {

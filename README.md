@@ -492,6 +492,13 @@ tag like `@v1.2.3` when you need full reproducibility (consistent with the
 |---|---|
 | v1 | `0.1.1` (default; `0.1.0` also installable, but predates the `ContractExecutable` XDR type two current Protocol 28 fixtures require, and its report predates the `counts` field) |
 
+The dated evidence behind each row — the runs, engine tags and fixture
+pack that were executed — lives in
+[`docs/releases.md`](docs/releases.md); no version is added to this table
+before a consumer run with that engine version has actually passed there.
+(`0.2.0` is released upstream but not yet verified end to end from a
+consumer run by this Action; see [`docs/releases.md`](docs/releases.md).)
+
 This table will grow as `Protocol-Canary` cuts new releases; a
 `schemaVersion` change to its JSON report is a breaking change for this
 Action and will be called out here explicitly.
