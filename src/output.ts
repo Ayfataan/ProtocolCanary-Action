@@ -9,6 +9,118 @@ import { InvalidReportError } from "./errors";
  */
 export const SUPPORTED_SCHEMA_VERSION = 1;
 
+/**
+ * Validates that a value is a non-empty string. Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requireNonEmptyString(value: unknown, fieldPath: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an empty "${fieldPath}" field.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a value is a positive integer (>= 1). Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requirePositiveInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected a positive integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a value is a non-negative integer (>= 0). Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requireNonNegativeInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected a non-negative integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates the project object has required name and type fields.
+ */
+function validateProject(project: unknown, fieldPath: string): { readonly name: string; readonly type: string } {
+  if (typeof project !== "object" || project === null) {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an invalid "${fieldPath}" field: expected an object.`);
+  }
+  const p = project as Record<string, unknown>;
+  const name = requireNonEmptyString(p.name, `${fieldPath}.name`);
+  const type = requireNonEmptyString(p.type, `${fieldPath}.type`);
+  return { name, type };
+}
+
+/**
+ * Validates the network object if present.
+ */
+function validateNetwork(network: unknown, fieldPath: string): { readonly name: string; readonly observedProtocol?: number } | undefined {
+  if (network === undefined || network === null) {
+    return undefined;
+  }
+  if (typeof network !== "object") {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected an object or null.`);
+  }
+  const n = network as Record<string, unknown>;
+  const name = requireNonEmptyString(n.name, `${fieldPath}.name`);
+  let observedProtocol: number | undefined;
+  if (n.observedProtocol !== undefined) {
+    observedProtocol = requirePositiveInteger(n.observedProtocol, `${fieldPath}.observedProtocol`);
+  }
+  if (n.error !== undefined && typeof n.error !== "string") {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}.error" field: expected a string.`);
+  }
+  return observedProtocol !== undefined ? { name, observedProtocol } : { name };
+}
+
+/**
+ * Validates the counts object and checks agreement with results/skipped.
+ */
+function validateCounts(
+  counts: unknown,
+  results: readonly CanaryResult[],
+  skipped: readonly CanarySkip[] | undefined,
+  fieldPath: string,
+): CanaryCounts {
+  if (typeof counts !== "object" || counts === null) {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an invalid "${fieldPath}" field: expected an object.`);
+  }
+  const c = counts as Partial<CanaryCounts>;
+  const total = requireNonNegativeInteger(c.total, `${fieldPath}.total`);
+  const passed = requireNonNegativeInteger(c.passed, `${fieldPath}.passed`);
+  const failed = requireNonNegativeInteger(c.failed, `${fieldPath}.failed`);
+  const warnings = requireNonNegativeInteger(c.warnings, `${fieldPath}.warnings`);
+  const errors = requireNonNegativeInteger(c.errors, `${fieldPath}.errors`);
+  const skippedCount = requireNonNegativeInteger(c.skipped, `${fieldPath}.skipped`);
+
+  const validated: CanaryCounts = { total, passed, failed, warnings, errors, skipped: skippedCount };
+
+  // Verify agreement with results and skipped
+  const derived = deriveCounts(results, skipped);
+  if (
+    validated.total !== derived.total ||
+    validated.passed !== derived.passed ||
+    validated.failed !== derived.failed ||
+    validated.warnings !== derived.warnings ||
+    validated.errors !== derived.errors ||
+    validated.skipped !== derived.skipped
+  ) {
+    throw new InvalidReportError(
+      `Canary's JSON output has a "${fieldPath}" field that disagrees with results/skipped: ` +
+        `expected total=${derived.total}, passed=${derived.passed}, failed=${derived.failed}, ` +
+        `warnings=${derived.warnings}, errors=${derived.errors}, skipped=${derived.skipped}; ` +
+        `got total=${validated.total}, passed=${validated.passed}, failed=${validated.failed}, ` +
+        `warnings=${validated.warnings}, errors=${validated.errors}, skipped=${validated.skipped}.`,
+    );
+  }
+
+  return validated;
+}
+
 export type Surface = "xdr" | "rpc" | "soroban";
 export type ResultStatus = "pass" | "warning" | "fail" | "error" | "skipped";
 export type OverallStatus = "pass" | "warning" | "fail" | "error";
@@ -215,6 +327,12 @@ export function parseReport(stdout: string): CanaryReport {
     throw new InvalidReportError("Canary's JSON output does not match the documented report shape.");
   }
 
+  // Validate required fields that the renderer and annotation code depend on
+  const toolVersion = requireNonEmptyString(report.toolVersion, "toolVersion");
+  const targetProtocol = requirePositiveInteger(report.targetProtocol, "targetProtocol");
+  const project = validateProject(report.project, "project");
+  const network = validateNetwork(report.network, "network");
+
   const rawResults: unknown[] = report.results;
   for (const [index, entry] of rawResults.entries()) {
     const problem = resultShapeError(entry);
@@ -238,7 +356,7 @@ export function parseReport(stdout: string): CanaryReport {
     if (seenIdentities.has(identity)) {
       throw new InvalidReportError(
         `Canary's JSON output contains a duplicate result identity: ` +
-          `(surface, id) = (\"${result.surface}\", \"${id}\") appears more than once ` +
+          `(surface, id) = ("${result.surface}", "${id}") appears more than once ` +
           `(results[${String(index)}]).`,
       );
     }
@@ -260,13 +378,40 @@ export function parseReport(stdout: string): CanaryReport {
     }
   }
   const skipped = report.skipped as CanarySkip[] | undefined;
-  const rawCounts = isCountsShape(report.counts) ? report.counts : deriveCounts(results, skipped);
-  const counts: CanaryCounts = {
-    ...rawCounts,
-    skipped: typeof rawCounts.skipped === "number" ? rawCounts.skipped : (skipped?.length ?? 0),
-  };
 
-  return { ...report, results, skipped, counts } as CanaryReport;
+  // Validate counts if present and complete; otherwise derive.
+  // A malformed counts field (missing fields, wrong types) is silently
+  // replaced by derived counts, preserving the behavior older engines rely
+  // on. A well-formed counts field that disagrees with results/skipped is
+  // rejected. Engines that predate the `skipped` count omit only that one
+  // field: the rest of their counts are preserved and `skipped` is populated
+  // from the skipped array, exactly as before.
+  const rawCounts = isCountsShape(report.counts) ? report.counts : undefined;
+  let counts: CanaryCounts;
+  if (rawCounts === undefined) {
+    counts = deriveCounts(results, skipped);
+  } else if (rawCounts.skipped === undefined) {
+    counts = { ...rawCounts, skipped: skipped?.length ?? 0 };
+  } else {
+    counts = validateCounts(rawCounts, results, skipped, "counts");
+  }
+
+  // Spread the raw report so reserved/additive fields this Action does not
+  // (yet) model — `engineCommit`, `packDigest`, `network.error`, … — survive
+  // parsing for downstream consumers such as the Execution Receipt. The
+  // validated fields below overwrite their raw counterparts.
+  return {
+    ...report,
+    toolVersion,
+    targetProtocol,
+    project,
+    ...(network !== undefined ? { network } : {}),
+    status: report.status,
+    counts,
+    results,
+    skipped,
+    git: report.git ?? { commit: null, branch: null, isDirty: null },
+  } as CanaryReport;
 }
 
 /**

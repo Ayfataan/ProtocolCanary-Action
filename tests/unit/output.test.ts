@@ -132,14 +132,25 @@ describe("parseReport", () => {
   it("trusts a well-formed counts field from the CLI rather than recomputing it", () => {
     // If the CLI's own counts ever legitimately differed from a naive
     // recount (e.g. a future aggregation rule), the Action must not
-    // second-guess it.
-    const report = { ...JSON.parse(VALID_REPORT), counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 9 } };
+    // second-guess it — but counts must agree with results/skipped.
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+    };
     const parsed = parseReport(JSON.stringify(report));
-    expect(parsed.counts.skipped).toBe(9);
+    expect(parsed.counts.skipped).toBe(0);
+  });
+
+  it("rejects a counts field that disagrees with results/skipped", () => {
+    // A counts field that disagrees with the actual results/skipped is invalid
+    const report = { ...JSON.parse(VALID_REPORT), counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 9 } };
+    expect(() => parseReport(JSON.stringify(report))).toThrow(InvalidReportError);
+    expect(() => parseReport(JSON.stringify(report))).toThrow(/disagrees with results\/skipped/);
   });
 
   it("derives counts when the provided counts field is malformed", () => {
-    const report = { ...JSON.parse(VALID_REPORT), counts: { total: "not-a-number" } };
+    // counts with wrong type fails isCountsShape check, so derived counts are used
+    const report = { ...JSON.parse(VALID_REPORT), counts: { total: "not-a-number", passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 } };
     const parsed = parseReport(JSON.stringify(report));
     expect(parsed.counts).toEqual({ total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 });
   });
@@ -265,7 +276,11 @@ describe("parseReport", () => {
   });
 
   it("accepts a well-formed skipped entry", () => {
-    const report = { ...RESULT_FIXTURE, skipped: [{ fixtureId: "f", surface: "xdr", reason: "disabled" }] };
+    const report = {
+      ...RESULT_FIXTURE,
+      counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+      skipped: [{ fixtureId: "f", surface: "xdr", reason: "disabled" }],
+    };
     expect(() => parseReport(JSON.stringify(report))).not.toThrow();
   });
 
@@ -306,6 +321,7 @@ describe("parseReport", () => {
   it("accepts the same fixtureId on different surfaces (identity is per-surface) (#349)", () => {
     const report = {
       ...RESULT_FIXTURE,
+      counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
       results: [
         { testId: "a", protocol: 28, surface: "xdr", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
         { testId: "a", protocol: 28, surface: "rpc", status: "pass", summary: "ok", durationMs: 1, fixtureId: "dup" },
@@ -324,10 +340,10 @@ describe("parseReport", () => {
       durationMs: 1,
       fixtureId: null,
     });
-    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, results: [dup("xdr"), dup("xdr")] }))).toThrow(
+    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 }, results: [dup("xdr"), dup("xdr")] }))).toThrow(
       InvalidReportError,
     );
-    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, results: [dup("xdr"), dup("rpc")] }))).not.toThrow();
+    expect(() => parseReport(JSON.stringify({ ...RESULT_FIXTURE, counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 }, results: [dup("xdr"), dup("rpc")] }))).not.toThrow();
   });
 
   it("passes cleanly when every result identity is distinct (#349)", () => {

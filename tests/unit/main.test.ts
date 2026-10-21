@@ -312,9 +312,13 @@ describe("run", () => {
 
     // The success-path summary rendering was attempted exactly once, and a
     // passing report emits no annotations. The second argument is the
-    // provenance metadata plumbed into the summary (#373): the mocked
-    // binary path does not exist, so only the engine version is reported.
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, { engineVersion: "0.1.0" });
+    // provenance metadata plumbed into the summary: the mocked binary path
+    // does not exist, so only the engine version and the reproduction
+    // command's argument array are reported (#373, #416).
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, {
+      engineVersion: "0.1.0",
+      engineArgs: ["check", "--format", "json", "--protocol", "28", "--network", "testnet", "--fixtures-dir", "fixtures"],
+    });
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
     expect(warningMock).not.toHaveBeenCalled();
@@ -460,16 +464,17 @@ describe("run", () => {
       ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
       const testReport = report({
         status: "pass",
-        counts: { total: 5, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 1 },
         network: { name: "testnet", observedProtocol: 28 },
-        results: [result({ testId: "a", fixtureId: "a" })],
+        results: ["a", "b", "c", "d"].map((testId) => result({ testId, fixtureId: testId })),
+        skipped: [{ fixtureId: "e", surface: "soroban", reason: "disabled" }],
       });
       runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
 
       await run();
 
       expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
-      expect(setOutputMock).toHaveBeenCalledWith("total", "5");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "4");
       expect(setOutputMock).toHaveBeenCalledWith("skipped", "1");
       expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
     });
@@ -480,7 +485,11 @@ describe("run", () => {
         status: "fail",
         counts: { total: 3, passed: 1, failed: 2, warnings: 0, errors: 0, skipped: 0 },
         network: { name: "testnet", observedProtocol: 28 },
-        results: [result({ testId: "a", status: "fail", fixtureId: "a" })],
+        results: [
+          result({ testId: "a", status: "pass", fixtureId: "a" }),
+          result({ testId: "b", status: "fail", fixtureId: "b" }),
+          result({ testId: "c", status: "fail", fixtureId: "c" }),
+        ],
       });
       runCheckMock.mockResolvedValueOnce({ exitCode: 1, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
 
