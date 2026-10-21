@@ -66,6 +66,8 @@ const BASE_INPUTS: ActionInputs = {
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
   githubToken: undefined,
+  generateReceipt: false,
+  strictIntegrity: false,
 };
 
 describe("buildCheckArgs", () => {

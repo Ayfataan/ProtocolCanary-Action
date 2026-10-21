@@ -38,6 +38,7 @@ const INPUT_KEYS = [
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
+  "INPUT_GENERATE-RECEIPT",
 ];
 
 function clearInputs(): void {
@@ -69,6 +70,8 @@ describe("getInputs", () => {
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       githubToken: undefined,
+      generateReceipt: false,
+      strictIntegrity: false,
     });
   });
 
@@ -255,6 +258,30 @@ describe("getInputs", () => {
   it("rejects an undocumented allow-empty form and names the input", () => {
     process.env["INPUT_ALLOW-EMPTY"] = "1";
     expect(() => getInputs()).toThrow(/"allow-empty"/);
+  });
+
+  // #361: `generate-receipt` opts a run into producing an Execution Receipt.
+  // It shares the documented boolean literals with the other toggles.
+  it("defaults generate-receipt to false", () => {
+    expect(getInputs().generateReceipt).toBe(false);
+  });
+
+  it.each([
+    ["true", true],
+    ["True", true],
+    ["TRUE", true],
+    ["false", false],
+    ["False", false],
+    ["FALSE", false],
+  ])("parses generate-receipt %s", (value, expected) => {
+    process.env["INPUT_GENERATE-RECEIPT"] = value;
+    expect(getInputs().generateReceipt).toBe(expected);
+  });
+
+  it("rejects a non-boolean generate-receipt and names the input", () => {
+    process.env["INPUT_GENERATE-RECEIPT"] = "yes";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"generate-receipt"/);
   });
 });
 
