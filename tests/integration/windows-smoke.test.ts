@@ -119,7 +119,12 @@ function setUp(scenario: string, options: { cargoHomeName?: string } = {}): Scen
   process.env.MOCK_CANARY_SCENARIO = scenario;
   process.env.INPUT_VERSION = ENGINE_VERSION;
   process.env.INPUT_PROTOCOL = "28";
-  process.env["INPUT_FIXTURES-DIR"] = path.join(workDir, "fixtures");
+  // #400: run() validates fixtures-dir on disk before version resolution and
+  // installation, so the input must point at an existing directory — an
+  // empty one inside the scratch workDir is enough for the mock engine.
+  const fixturesDir = path.join(workDir, "fixtures");
+  fs.mkdirSync(fixturesDir);
+  process.env["INPUT_FIXTURES-DIR"] = fixturesDir;
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env.INPUT_ANNOTATIONS = "true";
   process.env["INPUT_TIMEOUT-MINUTES"] = "1";
