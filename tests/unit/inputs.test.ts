@@ -80,9 +80,14 @@ describe("getInputs", () => {
     expect(getInputs().protocol).toBe(28);
   });
 
-  it("accepts protocol '0' as a valid non-negative integer", () => {
+  it("rejects protocol 0, which the engine rejects too (#456)", () => {
+    // `protocol` now accepts 1 to 4294967295 inclusive: 0 was accepted by the
+    // Action but is rejected by the engine ("--protocol must be a positive
+    // protocol version number"), so no working configuration changes.
     process.env.INPUT_PROTOCOL = "0";
-    expect(getInputs().protocol).toBe(0);
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"protocol"/);
+    expect(() => getInputs()).toThrow(/from 1 to 4294967295/);
   });
 
   it("rejects a non-numeric protocol", () => {
@@ -236,8 +241,100 @@ describe("getInputs", () => {
     expect(getInputs().timeoutMinutes).toBe(30);
   });
 
-  it("truncates a fractional timeout to an integer", () => {
+  it("rejects a fractional timeout instead of silently truncating it (#456)", () => {
+    // A truncated timeout silently runs a different timeout than the user
+    // wrote, so "15.9" is rejected outright rather than becoming 15.
     process.env["INPUT_TIMEOUT-MINUTES"] = "15.9";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"timeout-minutes"/);
+    expect(() => getInputs()).toThrow(/from 1 to 35791/);
+  });
+
+  it.each([
+    ["1", 1],
+    ["15", 15],
+    [" 15 ", 15],
+    ["35791", 35791],
+  ])("accepts timeout-minutes %j as %i minutes (#456)", (raw, expected) => {
+    process.env["INPUT_TIMEOUT-MINUTES"] = raw;
+    expect(getInputs().timeoutMinutes).toBe(expected);
+  });
+
+  it.each([
+    ["0", 1, 35791],
+    ["35792", 1, 35791],
+    ["40000", 1, 35791],
+    ["9".repeat(400), 1, 35791],
+  ])(
+    "rejects timeout-minutes %j (#456)",
+    (raw, min, max) => {
+      process.env["INPUT_TIMEOUT-MINUTES"] = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"timeout-minutes"/);
+      expect(() => getInputs()).toThrow(new RegExp(`from ${min} to ${max}`));
+    },
+  );
+
+  it.each([
+    ["1", 1],
+    ["28", 28],
+    [" 28 ", 28],
+    ["028", 28],
+    ["4294967295", 4294967295],
+  ])("accepts protocol %j as %i (#456)", (raw, expected) => {
+    process.env.INPUT_PROTOCOL = raw;
+    expect(getInputs().protocol).toBe(expected);
+  });
+
+  it.each([
+    ["0", 1, 4294967295],
+    ["4294967296", 1, 4294967295],
+    ["9".repeat(20), 1, 4294967295],
+    ["9".repeat(400), 1, 4294967295],
+  ])(
+    "rejects protocol %j (#456)",
+    (raw, min, max) => {
+      process.env.INPUT_PROTOCOL = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"protocol"/);
+      expect(() => getInputs()).toThrow(new RegExp(`from ${min} to ${max}`));
+    },
+  );
+
+  it("treats an empty or whitespace-only protocol as unset (#456)", () => {
+    process.env.INPUT_PROTOCOL = "";
+    expect(getInputs().protocol).toBeUndefined();
+    process.env.INPUT_PROTOCOL = "   ";
+    expect(getInputs().protocol).toBeUndefined();
+  });
+
+  it.each([
+    "1e3",
+    "5 minutes",
+    "1.9",
+    "+5",
+    "-1",
+    "0x10",
+    "1_000",
+    "٣",
+    "5 5",
+  ])(
+    "rejects %j for both protocol and timeout-minutes, naming the input and range (#456)",
+    (raw) => {
+      process.env.INPUT_PROTOCOL = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"protocol"/);
+      expect(() => getInputs()).toThrow(/from 1 to 4294967295/);
+
+      delete process.env.INPUT_PROTOCOL;
+      process.env["INPUT_TIMEOUT-MINUTES"] = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"timeout-minutes"/);
+      expect(() => getInputs()).toThrow(/from 1 to 35791/);
+    },
+  );
+
+  it("keeps the default timeout-minutes of 15 when unset (#456)", () => {
     expect(getInputs().timeoutMinutes).toBe(15);
   });
 
@@ -366,14 +463,15 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
     expect(getInputs().fixturesPackProtocol).toBe(expected);
   });
 
-  it("rejects fixtures-pack-protocol 0, unlike the protocol input", () => {
-    // The two inputs differ deliberately: `protocol` accepts 0 because a
-    // non-negative integer is the right shape there, while a pack "pinned to
-    // protocol 0" is not something anyone publishes. Pin that difference so a
-    // future refactor cannot silently unify the two validators.
+  it("rejects fixtures-pack-protocol 0, as does the protocol input (#456)", () => {
+    // `protocol` now rejects 0 too (the engine rejects `--protocol 0`), so no
+    // working configuration changes. Pin that the two validators stay strict
+    // and independent rather than silently unifying around a shared shape.
     process.env.INPUT_PROTOCOL = "0";
-    expect(getInputs().protocol).toBe(0);
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"protocol"/);
 
+    delete process.env.INPUT_PROTOCOL;
     process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "0";
     expect(() => getInputs()).toThrow(InvalidInputError);
     expect(() => getInputs()).toThrow(/"fixtures-pack-protocol"/);

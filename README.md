@@ -140,7 +140,7 @@ jobs:
 
 | Input | Description | Default |
 |---|---|---|
-| `protocol` | Target Stellar protocol version (`--protocol`). | (from `.stellar-canary.toml`, or 28) |
+| `protocol` | Target Stellar protocol version (`--protocol`), a whole number from 1 to 4294967295 (the engine rejects 0). | (from `.stellar-canary.toml`, or 28) |
 | `config` | Path to `.stellar-canary.toml` (`--config`). Fails clearly if the given path does not exist, or is not a regular file (e.g. a directory). | (CLI default lookup) |
 | `network` | Network for live RPC/Soroban checks (`--network`). | `testnet` (CLI default) |
 | `rpc-url` | Stellar RPC endpoint (`--rpc-url`). Must be `https://`, or `http://localhost`/`127.0.0.1` for local development. | (none) |
@@ -149,10 +149,10 @@ jobs:
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
-| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
+| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
 | `github-token` | GitHub token used to authenticate read-only requests to `api.github.com` for version resolution and checksum discovery, raising GitHub API rate limits. Defaults to `${{ github.token }}`. Pass an empty string (`""`) to disable authenticated requests. Requires only `contents: read` permission and works on fork pull requests. | `${{ github.token }}` |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
-| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected here, unlike `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
+| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected, as with `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
 
 There is deliberately no `format` input: the Action always requests
 `--format json` from the CLI (the only way it can build the summary and
@@ -379,7 +379,11 @@ in GitHub Actions collapsed log groups:
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
-long-running operations it controls:
+long-running operations it controls. It must be a whole number from 1 to
+35791 minutes: the value is multiplied by 60,000 and handed to Node's
+`setTimeout`, which clamps any delay above 2,147,483,647 ms and would fire
+the timer after 1 ms, ending the run almost immediately — so values above
+35791 are rejected up front. The default is 15.
 
 - **The Canary process** (`stellar-canary check`): terminated when it runs
   longer than `timeout-minutes`.
