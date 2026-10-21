@@ -1,0 +1,173 @@
+name: Verification (issues #438, #439)
+
+# Fork-side verification for issues #438 ("state which engine/version the
+# new expectations were taken from") and #439 ("run the Action from the
+# branch under test with version: 0.2.0 and, separately, version: 0.1.1
+# against a small checkout of the Fixtures protocol-28 tag, installing from
+# the tag with cargo install"). Both jobs are offline: no secrets, no
+# network beyond GitHub itself and the local-refused-loopback RPC port in
+# the exit-codes suite.
+#
+# Not part of the documented contract of either issue the way
+# engine-compat.yml is; it exists to produce auditable, reproducible run
+# URLs for docs/releases.md (issue #439 step 6 records them).
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: Protocol-Canary ref for the exit-codes suite (default v0.2.0; use main for unreleased behavior)
+        required: false
+        default: v0.2.0
+  # Paths-filtered so editing docs while recording results (docs/releases.md)
+  # does not re-run the engine builds; touching the test files or this file
+  # does.
+  push:
+    branches: [feat/436-439-batch]
+    paths:
+      - ".github/workflows/verify-engine-compat-439.yml"
+      - "tests/integration/**"
+
+permissions:
+  contents: read
+
+jobs:
+  # The engine-compat.yml job with its dispatch inputs pinned to the
+  # combination issue #439 asks for (engine_ref=v0.2.0, legacy_ref=v0.1.1).
+  # Steps are identical to the manual workflow; this copy only exists so the
+  # run can be produced from a branch without the Actions:write permission
+  # workflow_dispatch requires. It runs the SAME suite that
+  # engine-compat.yml runs (tests/integration/real-engine.test.ts).
+  engine-compat-pinned:
+    name: "engine-compat.yml pinned to the issue #439 refs (v0.2.0 / v0.1.1)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Action
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Checkout engine under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/Protocol-Canary
+          ref: v0.2.0
+          path: engine-under-test
+          persist-credentials: false
+
+      - name: Checkout older engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/Protocol-Canary
+          ref: v0.1.1
+          path: engine-legacy
+          persist-credentials: false
+
+      - name: Build both engines
+        run: |
+          (cd engine-under-test && cargo build --release --locked)
+          (cd engine-legacy && cargo build --release --locked)
+          echo "STELLAR_CANARY_BIN=$PWD/engine-under-test/target/release/stellar-canary" >> "$GITHUB_ENV"
+          echo "STELLAR_CANARY_LEGACY_BIN=$PWD/engine-legacy/target/release/stellar-canary" >> "$GITHUB_ENV"
+
+      - name: Report the engine versions being tested
+        run: |
+          "$STELLAR_CANARY_BIN" version
+          "$STELLAR_CANARY_LEGACY_BIN" version
+
+      - name: Run the Action against the real engines
+        run: npx vitest run tests/integration/real-engine.test.ts
+
+  real-engine-exit-codes:
+    name: Exit codes 1/3/4 + skips against ${{ inputs.engine_ref || 'v0.2.0' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Action (this branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Checkout engine under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/Protocol-Canary
+          ref: ${{ inputs.engine_ref || 'v0.2.0' }}
+          path: engine-under-test
+          persist-credentials: false
+
+      - name: Build engine
+        run: (cd engine-under-test && cargo build --release --locked)
+
+      - name: Report engine version
+        run: engine-under-test/target/release/stellar-canary version
+
+      - name: Run the exit-code suite against the real engine
+        env:
+          STELLAR_CANARY_BIN: ${{ github.workspace }}/engine-under-test/target/release/stellar-canary
+        run: npx vitest run tests/integration/real-engine-exit-codes.test.ts
+
+  action-consumer:
+    name: Action from this branch, version ${{ matrix.version }} vs Fixtures protocol-28
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["0.2.0", "0.1.1"]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout the Action repository (this branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout the immutable Fixtures protocol-28 pack
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/ProtocolCanary-Fixtures
+          ref: protocol-28
+          path: fixtures-pack
+          persist-credentials: false
+
+      - name: Record what this run installed from
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Consumer run"
+            echo "- version input: \`${{ matrix.version }}\`"
+            echo "- engine install: \`cargo install --git StellarCanary/Protocol-Canary --tag v${{ matrix.version }} --locked\` (the Action's own path)"
+            echo "- Fixtures tag: \`protocol-28\` (commit $(git -C fixtures-pack rev-parse HEAD))"
+            echo "- Offline config: \`tests/fixtures/real-engine/offline.stellar-canary.toml\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Offline pass: XDR only, no RPC, no Soroban, no credentials. The
+      # engine is installed from the immutable tag by the Action itself
+      # (issue #439 step 2, the "install through cargo install ... --tag"
+      # verification engine-compat.yml cannot provide).
+      - name: Run Stellar Protocol Canary (this Action, from this branch)
+        uses: ./ # zizmor: ignore[self-repository] root composite action executed from source within this repository
+        with:
+          version: ${{ matrix.version }}
+          protocol: "28"
+          fixtures-dir: fixtures-pack/protocol-28
+          config: tests/fixtures/real-engine/offline.stellar-canary.toml
+          upload-report: "false"

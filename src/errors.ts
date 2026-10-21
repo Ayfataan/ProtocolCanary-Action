@@ -35,6 +35,10 @@ export class CanaryNotFoundError extends CanaryActionError {
 /** Installing the requested Canary version failed. */
 export class InstallationFailedError extends CanaryActionError {
   readonly code = "InstallationFailed";
+
+  constructor(message: string, readonly diagnostic?: string) {
+    super(message);
+  }
 }
 
 /** The Canary process could not be started or was killed abnormally. */
@@ -45,6 +49,14 @@ export class CanaryExecutionFailedError extends CanaryActionError {
 /** The Canary process exceeded its allotted execution time. */
 export class TimeoutError extends CanaryActionError {
   readonly code = "Timeout";
+
+  constructor(
+    message: string,
+    readonly stdout: string = "",
+    readonly stderr: string = "",
+  ) {
+    super(message);
+  }
 }
 
 /** Canary's stdout could not be parsed as a report matching the documented schema. */
