@@ -135,7 +135,9 @@ function setUp(binary: string, version: string, inputs: Record<string, string>):
   warningMock.mockClear();
   infoMock.mockClear();
 
-  return { workDir, outputPath, reportPath: () => path.join(runnerTemp, "stellar-canary-report.json"), emptyDir };
+  // #399: the report filename is unique per invocation, so the path is read
+  // back from the run's "report" output instead of being reconstructed.
+  return { workDir, outputPath, reportPath: () => readOutputs(outputPath).report as string, emptyDir };
 }
 
 function readOutputs(outputPath: string): Record<string, string> {

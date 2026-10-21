@@ -178,7 +178,7 @@ literals below.
 | `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. Explicitly set to `0` on an execution failure, like the other counts. | `"3"` |
 | `engine-version` | Protocol Canary engine version that produced the result, read from the installed binary. On an execution failure, set to the resolved version if installation succeeded, or an empty string if installation failed. | `"0.1.1"` |
 | `observed-protocol` | Stellar protocol version reported by the network during live checks (`network.observedProtocol`), or an empty string when the report has no network object. Explicitly set to an empty string on an execution failure. | `"28"` |
-| `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `report` | Absolute path to the JSON report file this invocation wrote. The file is uniquely named per invocation (see below), so it is never shared with another Action step. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report-canary-check-4b9c1d2e3f4a5b6c.json` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
 
@@ -190,6 +190,26 @@ A concrete consumer, using the outputs to gate a follow-up step:
 - name: React to the result
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
+```
+
+Every Action invocation writes its report to its own uniquely named JSON
+file, directly inside the runner's temporary directory (`RUNNER_TEMP`,
+falling back to the system temp directory). The filename is
+`stellar-canary-report-<step>-<random>.json`, where `<step>` is the
+current step's `GITHUB_ACTION` identifier sanitized to ASCII letters,
+digits, `-`, and `_`, and `<random>` is a short cryptographically random
+suffix. Multiple Action steps in the same job therefore never overwrite
+each other's reports, and the `report` output always contains the
+absolute path of the file *that* invocation wrote — so a later step can
+safely read or upload an earlier step's report:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  id: canary
+  with:
+    protocol: "28"
+- name: Read the report from a later step
+  run: jq .status "${{ steps.canary.outputs.report }}"
 ```
 
 > **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol` is set to an empty string `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
