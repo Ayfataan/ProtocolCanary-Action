@@ -103,19 +103,6 @@ vi.mock("../../src/artifact", async (importOriginal) => {
   return { ...actual, uploadReceipt: uploadReceiptMock };
 });
 
-// Mock resolveVersion to prevent GitHub API calls during unit tests.
-// This ensures the 'fails the run when writeSummary rejects' test is
-// deterministic and not affected by rate limiting or network issues.
-vi.mock("../../src/version", async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/version')>();
-  return {
-    ...actual,
-    resolveVersion: vi.fn().mockImplementation(async (version) => {
-      return { version, tag: 'v' + version, commitSha: 'abc123' };
-    }),
-  };
-});
-
 import { run } from "../../src/main";
 
 const BINARY_PATH = path.join("/fake-cargo-home", "bin", "stellar-canary");
@@ -467,5 +454,138 @@ describe("run", () => {
     expect(setOutputMock).not.toHaveBeenCalledWith("receipt-path", expect.anything());
     expect(uploadReceiptMock).not.toHaveBeenCalled();
   });
-});
 
+  describe("issue #414: engine-version, total, skipped and observed-protocol outputs", () => {
+    it("sets engine-version, total, skipped and observed-protocol on success", async () => {
+      ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
+      const testReport = report({
+        status: "pass",
+        counts: { total: 5, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+        network: { name: "testnet", observedProtocol: 28 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "5");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "1");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
+    });
+
+    it("sets engine-version, total, skipped and observed-protocol on compatibility failure", async () => {
+      ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
+      const testReport = report({
+        status: "fail",
+        counts: { total: 3, passed: 1, failed: 2, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet", observedProtocol: 28 },
+        results: [result({ testId: "a", status: "fail", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 1, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "3");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
+    });
+
+    it("sets observed-protocol to empty string for an offline run (no network object)", async () => {
+      const testReport = report({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+    });
+
+    it("sets observed-protocol to empty string when network is present but observedProtocol is missing or NaN", async () => {
+      const missingObserved = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet" },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(missingObserved), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+
+      setOutputMock.mockClear();
+      const nanObserved = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet", observedProtocol: Number.NaN },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(nanObserved), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+    });
+
+    it("sets total and skipped when counts.skipped is absent in older engine report", async () => {
+      const rawJson = {
+        schemaVersion: 1,
+        toolVersion: "0.1.0",
+        targetProtocol: 28,
+        project: { name: "mock-project", type: "soroban" },
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0 },
+        results: [
+          {
+            testId: "p28-xdr-1",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "ok",
+            durationMs: 1,
+            fixtureId: "p28-xdr-1",
+          },
+        ],
+        git: { commit: "deadbeef", branch: "main", isDirty: false },
+      };
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(rawJson), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("total", "4");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+    });
+
+    it("sets failure outputs with resolved engine-version when execution fails after install succeeded", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, version: "0.1.1" });
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.1");
+    });
+
+    it("sets failure outputs with empty engine-version when installation fails", async () => {
+      ensureCanaryInstalledMock.mockRejectedValueOnce(
+        new InstallationFailedError("cargo install failed", "error[E0432]: unresolved import\n"),
+      );
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+    });
+  });
+});
