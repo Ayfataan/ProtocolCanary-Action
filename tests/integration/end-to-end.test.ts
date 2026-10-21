@@ -151,7 +151,7 @@ function readOutputs(outputPath: string): Record<string, string> {
   const outputs: Record<string, string> = {};
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
-    const match = /^([A-Za-z_][A-Za-z0-9_]*)<<(.+)$/.exec(lines[i] ?? "");
+    const match = /^([A-Za-z_][A-Za-z0-9_-]*)<<(.+)$/.exec(lines[i] ?? "");
     if (match) {
       const [, name, delimiter] = match;
       const valueLines: string[] = [];
@@ -195,6 +195,10 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(outputs.status).toBe("pass");
     expect(outputs.passed).toBe("1");
     expect(outputs.failures).toBe("0");
+    expect(outputs.total).toBe("1");
+    expect(outputs.skipped).toBe("0");
+    expect(outputs["engine-version"]).toBe("0.1.0");
+    expect(outputs["observed-protocol"]).toBe("");
     expect(typeof outputs.report).toBe("string");
     const passReport = outputs.report as string;
     expect(path.isAbsolute(passReport)).toBe(true);
@@ -243,6 +247,10 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     const outputs = readOutputs(fixture.outputPath);
     expect(outputs.status).toBe("fail");
     expect(outputs.failures).toBe("1");
+    expect(outputs.total).toBe("1");
+    expect(outputs.skipped).toBe("0");
+    expect(outputs["engine-version"]).toBe("0.1.0");
+    expect(outputs["observed-protocol"]).toBe("");
     expect(typeof outputs.report).toBe("string");
     const failReport = outputs.report as string;
     expect(path.isAbsolute(failReport)).toBe(true);
@@ -259,7 +267,39 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("could not be executed");
     const outputs = readOutputs(fixture.outputPath);
     expect(outputs.status).toBe("execution-failed");
+    expect(outputs.total).toBe("0");
+    expect(outputs.skipped).toBe("0");
+    expect(outputs["engine-version"]).toBe("0.1.0");
+    expect(outputs["observed-protocol"]).toBe("");
     expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain("could not be executed");
+  });
+
+  it("pass-network: succeeds, sets observed-protocol, engine-version, total and skipped", async () => {
+    fixture = setUp("pass-network");
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    const outputs = readOutputs(fixture.outputPath);
+    expect(outputs.status).toBe("pass");
+    expect(outputs.passed).toBe("1");
+    expect(outputs.total).toBe("1");
+    expect(outputs.skipped).toBe("0");
+    expect(outputs["engine-version"]).toBe("0.1.0");
+    expect(outputs["observed-protocol"]).toBe("28");
+  });
+
+  it("offline run: observed-protocol is empty string when report has no network object", async () => {
+    fixture = setUp("pass");
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    const outputs = readOutputs(fixture.outputPath);
+    expect(outputs["observed-protocol"]).toBe("");
+    expect(outputs["engine-version"]).toBe("0.1.0");
+    expect(outputs.total).toBe("1");
+    expect(outputs.skipped).toBe("0");
   });
 
   // Maintainer decision D-02: after Protocol-Canary 0.1.1 a run that executes

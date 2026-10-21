@@ -1,0 +1,25 @@
+# Allow-list of tracked files permitted in the repository root.
+#
+# Tracked files in the repository root are strictly governed: only repository
+# metadata, configuration files, and standard project entrypoints belong here.
+# Any additional files (scratch files, PR notes, reports, stray artifacts) must
+# live in a subdirectory or be removed.
+#
+# Comments starting with '#' and blank lines are ignored.
+# File names must match exactly (case-sensitive).
+
+.gitattributes
+.gitignore
+.nvmrc
+action.yml
+CHANGELOG.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+eslint.config.js
+LICENSE
+package-lock.json
+package.json
+README.md
+SECURITY.md
+tsconfig.json
+vitest.config.ts

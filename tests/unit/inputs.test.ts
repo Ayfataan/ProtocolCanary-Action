@@ -10,11 +10,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // CONTRIBUTING's partial-mock convention requires spreading the real module so
 // everything else keeps working. `vi.spyOn` cannot be used here because an ESM
 // namespace object is not configurable.
-const { infoMock } = vi.hoisted(() => ({ infoMock: vi.fn() }));
+const { infoMock, setSecretMock } = vi.hoisted(() => ({
+  infoMock: vi.fn(),
+  setSecretMock: vi.fn(),
+}));
 
 vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof actionsCore>();
-  return { ...actual, info: infoMock };
+  return { ...actual, info: infoMock, setSecret: setSecretMock };
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
@@ -33,12 +36,18 @@ const INPUT_KEYS = [
   "INPUT_ALLOW-EMPTY",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
+  "INPUT_GITHUB-TOKEN",
+  "INPUT_GITHUB_TOKEN",
+  "INPUT_GENERATE-RECEIPT",
 ];
 
 function clearInputs(): void {
   for (const key of INPUT_KEYS) {
     delete process.env[key];
   }
+  delete process.env.GITHUB_TOKEN;
+  setSecretMock.mockClear();
+  infoMock.mockClear();
 }
 
 describe("getInputs", () => {
@@ -60,6 +69,9 @@ describe("getInputs", () => {
       allowEmpty: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
+      githubToken: undefined,
+      generateReceipt: false,
+      strictIntegrity: false,
     });
   });
 
@@ -247,6 +259,30 @@ describe("getInputs", () => {
     process.env["INPUT_ALLOW-EMPTY"] = "1";
     expect(() => getInputs()).toThrow(/"allow-empty"/);
   });
+
+  // #361: `generate-receipt` opts a run into producing an Execution Receipt.
+  // It shares the documented boolean literals with the other toggles.
+  it("defaults generate-receipt to false", () => {
+    expect(getInputs().generateReceipt).toBe(false);
+  });
+
+  it.each([
+    ["true", true],
+    ["True", true],
+    ["TRUE", true],
+    ["false", false],
+    ["False", false],
+    ["FALSE", false],
+  ])("parses generate-receipt %s", (value, expected) => {
+    process.env["INPUT_GENERATE-RECEIPT"] = value;
+    expect(getInputs().generateReceipt).toBe(expected);
+  });
+
+  it("rejects a non-boolean generate-receipt and names the input", () => {
+    process.env["INPUT_GENERATE-RECEIPT"] = "yes";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"generate-receipt"/);
+  });
 });
 
 /**
@@ -402,5 +438,55 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       .map((call) => String(call[0]))
       .filter((message) => message.includes("fixtures-pack"));
     expect(mentions).toHaveLength(0);
+  });
+
+  describe("github-token input and GITHUB_TOKEN precedence", () => {
+    it("selects input token over GITHUB_TOKEN when both are provided", () => {
+      process.env["INPUT_GITHUB-TOKEN"] = "token-from-input";
+      process.env.GITHUB_TOKEN = "token-from-env";
+      const inputs = getInputs();
+      expect(inputs.githubToken).toBe("token-from-input");
+      expect(setSecretMock).toHaveBeenCalledWith("token-from-input");
+      expect(setSecretMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to GITHUB_TOKEN when github-token input is not set", () => {
+      process.env.GITHUB_TOKEN = "token-from-env";
+      const inputs = getInputs();
+      expect(inputs.githubToken).toBe("token-from-env");
+      expect(setSecretMock).toHaveBeenCalledWith("token-from-env");
+      expect(setSecretMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("treats whitespace-only github-token input as empty and falls back to GITHUB_TOKEN", () => {
+      process.env["INPUT_GITHUB-TOKEN"] = "   \t  \n ";
+      process.env.GITHUB_TOKEN = "token-from-env";
+      const inputs = getInputs();
+      expect(inputs.githubToken).toBe("token-from-env");
+      expect(setSecretMock).toHaveBeenCalledWith("token-from-env");
+      expect(setSecretMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("treats whitespace-only GITHUB_TOKEN as empty when input is not set", () => {
+      process.env.GITHUB_TOKEN = "   \t  \n ";
+      const inputs = getInputs();
+      expect(inputs.githubToken).toBeUndefined();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("calls core.setSecret once with selected token and registers tokens with special regex chars and newlines", () => {
+      const specialToken = "token+with*special?chars^$()[]{}|\\";
+      process.env["INPUT_GITHUB-TOKEN"] = `  ${specialToken}  `;
+      const inputs = getInputs();
+      expect(inputs.githubToken).toBe(specialToken);
+      expect(setSecretMock).toHaveBeenCalledWith(specialToken);
+      expect(setSecretMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("results in undefined when both input and environment are unset", () => {
+      const inputs = getInputs();
+      expect(inputs.githubToken).toBeUndefined();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
   });
 });
