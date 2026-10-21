@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -16,9 +17,54 @@ import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck }
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
 
-function reportFilePath(): string {
+/** Maximum length of the sanitized `GITHUB_ACTION` identifier embedded in
+ * the report filename (#399), keeping the name short on every filesystem. */
+const REPORT_IDENTIFIER_MAX_LENGTH = 64;
+
+/** Step identifier used when `GITHUB_ACTION` is unset or sanitizes to
+ * nothing usable (#399). */
+const FALLBACK_ACTION_IDENTIFIER = "action";
+
+/**
+ * Reduces the untrusted `GITHUB_ACTION` environment variable to a single
+ * safe path component (#399): every run of characters outside ASCII
+ * letters, digits, `-` and `_` collapses to one hyphen, leading/trailing
+ * hyphens are trimmed, and the result is length-capped. Path separators,
+ * traversal sequences, spaces, and Unicode therefore can never survive
+ * into the generated filename.
+ */
+export function sanitizeActionIdentifier(value: string): string {
+  return value
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, REPORT_IDENTIFIER_MAX_LENGTH)
+    .replace(/-+$/, "");
+}
+
+/**
+ * The report path for *this* Action invocation (#399): a uniquely named
+ * JSON file directly inside the runner's temporary directory
+ * (`RUNNER_TEMP`, falling back to `os.tmpdir()`), so two invocations in
+ * one job — a second Action step, or a matrix leg sharing the runner —
+ * never overwrite each other's report.
+ *
+ * The filename is `stellar-canary-report-<step>-<random>.json`, where
+ * `<step>` is the sanitized `GITHUB_ACTION` identifier (a safe fallback
+ * when it is missing or empty) and `<random>` is a short cryptographically
+ * random hex suffix, so uniqueness never depends on the identifier alone.
+ * The filename is a single path component built only from `[A-Za-z0-9_-]`,
+ * so resolving it cannot escape the temp directory.
+ *
+ * `run()` calls this exactly once per invocation and reuses the result for
+ * writing the report, the `report` output, and the artifact upload — the
+ * path is never regenerated after the file has been written.
+ */
+export function reportFilePath(): string {
   const dir = process.env.RUNNER_TEMP ?? os.tmpdir();
-  return path.join(dir, "stellar-canary-report.json");
+  const sanitized = sanitizeActionIdentifier(process.env.GITHUB_ACTION ?? "");
+  const step = sanitized !== "" ? sanitized : FALLBACK_ACTION_IDENTIFIER;
+  const unique = crypto.randomBytes(8).toString("hex");
+  return path.resolve(dir, `stellar-canary-report-${step}-${unique}.json`);
 }
 
 /** Location of the Execution Receipt written when `generate-receipt` is
@@ -151,6 +197,8 @@ export async function run(): Promise<void> {
     printLogBlock("Canary diagnostics", execution.stderr);
   }
 
+  // #399: generated exactly once per invocation; the same path is reused
+  // below for the write, the "report" output, and the artifact upload.
   const reportPath = reportFilePath();
   if (execution.stdout.trim() !== "") {
     fs.writeFileSync(reportPath, execution.stdout, "utf8");

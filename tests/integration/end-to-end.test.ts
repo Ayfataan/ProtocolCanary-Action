@@ -456,4 +456,54 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
       true,
     );
   });
+
+  // #399: the regression this issue exists for — two invocations in one job
+  // (the same RUNNER_TEMP, the same GITHUB_ACTION, the same inputs) used to
+  // write the *same* fixed report file, so the second invocation silently
+  // overwrote the first one's report. Both invocations must now keep their
+  // own file, and every consumer (report output, artifact upload, summary)
+  // must see the correct per-invocation report.
+  it("two invocations in one job write distinct report files that never overwrite each other (#399)", async () => {
+    fixture = setUp("pass");
+    process.env["INPUT_UPLOAD-REPORT"] = "true";
+    const { run } = await import("../../src/main");
+
+    // First invocation: a passing report.
+    await run();
+    const firstReport = readOutputs(fixture.outputPath).report as string;
+    const firstSummary = fs.readFileSync(fixture.summaryPath, "utf8");
+
+    // Second invocation: same environment, different report data.
+    process.env.MOCK_CANARY_SCENARIO = "warning";
+    await run();
+    const secondReport = readOutputs(fixture.outputPath).report as string;
+
+    // Both report paths are absolute, live directly in the shared
+    // RUNNER_TEMP, and are distinct.
+    expect(path.isAbsolute(firstReport)).toBe(true);
+    expect(path.isAbsolute(secondReport)).toBe(true);
+    expect(firstReport).not.toBe(secondReport);
+    expect(path.dirname(firstReport)).toBe(path.join(fixture.workDir, "runner-temp"));
+    expect(path.dirname(secondReport)).toBe(path.dirname(firstReport));
+
+    // Both files exist, and the first file — read *after* the second
+    // invocation — still holds the first invocation's data.
+    expect(fs.existsSync(firstReport)).toBe(true);
+    expect(fs.existsSync(secondReport)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(firstReport, "utf8"))).toMatchObject({ status: "pass" });
+    expect(JSON.parse(fs.readFileSync(secondReport, "utf8"))).toMatchObject({ status: "warning" });
+
+    // The artifact client received the correct per-invocation path.
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
+    const firstUpload = uploadArtifactMock.mock.calls[0] as [string, string[], string];
+    const secondUpload = uploadArtifactMock.mock.calls[1] as [string, string[], string];
+    expect(firstUpload[1]).toEqual([firstReport]);
+    expect(secondUpload[1]).toEqual([secondReport]);
+
+    // The summary reflects each invocation's own report: the first run's
+    // PASS summary is still present (summaries append), and the second
+    // run's summary describes the second run's warning report.
+    expect(firstSummary).toContain("✅ **PASS**");
+    expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain("⚠️ **WARNING**");
+  });
 });
