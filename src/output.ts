@@ -53,7 +53,7 @@ export interface CanaryCounts {
   readonly failed: number;
   readonly warnings: number;
   readonly errors: number;
-  readonly skipped: number;
+  readonly skipped?: number;
 }
 
 export interface CanaryReport {
@@ -84,7 +84,7 @@ function isCountsShape(value: unknown): value is CanaryCounts {
     typeof candidate.failed === "number" &&
     typeof candidate.warnings === "number" &&
     typeof candidate.errors === "number" &&
-    typeof candidate.skipped === "number"
+    (typeof candidate.skipped === "number" || candidate.skipped === undefined)
   );
 }
 
@@ -260,7 +260,11 @@ export function parseReport(stdout: string): CanaryReport {
     }
   }
   const skipped = report.skipped as CanarySkip[] | undefined;
-  const counts = isCountsShape(report.counts) ? report.counts : deriveCounts(results, skipped);
+  const rawCounts = isCountsShape(report.counts) ? report.counts : deriveCounts(results, skipped);
+  const counts: CanaryCounts = {
+    ...rawCounts,
+    skipped: typeof rawCounts.skipped === "number" ? rawCounts.skipped : (skipped?.length ?? 0),
+  };
 
   return { ...report, results, skipped, counts } as CanaryReport;
 }

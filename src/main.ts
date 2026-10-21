@@ -52,7 +52,12 @@ function artifactDifferentiator(inputs: ActionInputs): string | undefined {
 /** Handles every case where Canary did not produce a usable report at all
  * (install failure, process error, timeout, or malformed JSON) —
  * distinct from a real compatibility failure per section 29. */
-async function handleExecutionFailure(reason: string, diagnostic: string, annotate: boolean): Promise<void> {
+async function handleExecutionFailure(
+  reason: string,
+  diagnostic: string,
+  annotate: boolean,
+  engineVersion: string = "",
+): Promise<void> {
   core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${reason}`);
   if (annotate) {
     emitExecutionFailureAnnotation(reason, diagnostic);
@@ -67,7 +72,11 @@ async function handleExecutionFailure(reason: string, diagnostic: string, annota
   core.setOutput("warnings", "0");
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
+  core.setOutput("total", "0");
+  core.setOutput("skipped", "0");
   core.setOutput("replayed-count", "0");
+  core.setOutput("engine-version", engineVersion);
+  core.setOutput("observed-protocol", "");
 }
 
 /**
@@ -113,7 +122,7 @@ export async function run(): Promise<void> {
     );
   } catch (error) {
     const diagnostic = error instanceof InstallationFailedError && error.diagnostic ? error.diagnostic : "";
-    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations);
+    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations, "");
     return;
   }
 
@@ -134,7 +143,7 @@ export async function run(): Promise<void> {
     if (error instanceof TimeoutError && error.stderr.trim() !== "") {
       printLogBlock("Canary diagnostics", error.stderr);
     }
-    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations);
+    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations, resolved.version);
     return;
   }
 
@@ -152,6 +161,7 @@ export async function run(): Promise<void> {
       `Canary was terminated by signal ${execution.signal ?? "unknown"}.`,
       execution.stderr,
       inputs.annotations,
+      resolved.version,
     );
     return;
   }
@@ -166,6 +176,7 @@ export async function run(): Promise<void> {
       `${exitInfo.description} (exit code ${String(execution.exitCode)}). ${describeError(error)}`,
       execution.stderr,
       inputs.annotations,
+      resolved.version,
     );
     return;
   }
@@ -218,7 +229,17 @@ export async function run(): Promise<void> {
   core.setOutput("warnings", String(report.counts.warnings));
   core.setOutput("failures", String(report.counts.failed));
   core.setOutput("errors", String(report.counts.errors));
+  core.setOutput("total", String(report.counts.total));
+  core.setOutput("skipped", String(report.counts.skipped ?? 0));
   core.setOutput("replayed-count", String(countReplayed(report)));
+  core.setOutput("engine-version", installed.version);
+  const observedProtocol =
+    report.network?.observedProtocol !== undefined &&
+    report.network.observedProtocol !== null &&
+    !Number.isNaN(report.network.observedProtocol)
+      ? String(report.network.observedProtocol)
+      : "";
+  core.setOutput("observed-protocol", observedProtocol);
   core.setOutput("report", reportPath);
 
   if (inputs.uploadReport) {

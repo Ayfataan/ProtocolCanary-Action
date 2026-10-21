@@ -144,6 +144,27 @@ describe("parseReport", () => {
     expect(parsed.counts).toEqual({ total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 });
   });
 
+  it("preserves counts and defaults skipped to 0 when counts.skipped is absent (older engines)", () => {
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      counts: { total: 5, passed: 5, failed: 0, warnings: 0, errors: 0 },
+    };
+    const parsed = parseReport(JSON.stringify(report));
+    expect(parsed.counts.total).toBe(5);
+    expect(parsed.counts.skipped).toBe(0);
+  });
+
+  it("preserves counts and populates skipped from skipped array when counts.skipped is absent (older engines)", () => {
+    const report = {
+      ...JSON.parse(VALID_REPORT),
+      counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0 },
+      skipped: [{ fixtureId: "s1", surface: "xdr", reason: "protocol mismatch" }],
+    };
+    const parsed = parseReport(JSON.stringify(report));
+    expect(parsed.counts.total).toBe(2);
+    expect(parsed.counts.skipped).toBe(1);
+  });
+
   // Regression tests for issue #67: the top-level report is otherwise
   // valid, but a single malformed `results` entry must be rejected at
   // parse time with InvalidReportError — not surface later as "undefined"

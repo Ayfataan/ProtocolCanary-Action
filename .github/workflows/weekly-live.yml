@@ -111,7 +111,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run Stellar Protocol Canary (this Action, from source)
-        uses: ./
+        uses: ./ # zizmor: ignore[self-repository] root composite action executed from source within this repository
         with:
           protocol: "29"
           # Pack from the pinned fixtures ref above (`protocol-28`); when

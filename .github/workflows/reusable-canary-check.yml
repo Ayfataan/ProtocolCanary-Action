@@ -112,6 +112,7 @@ jobs:
 
       - name: Run Protocol Canary
         id: run
+        # zizmor: ignore[unpinned-uses] reusable workflow deliberately invokes the latest Action release via @v1
         uses: StellarCanary/ProtocolCanary-Action@v1
         with:
           protocol: ${{ inputs.protocol }}
