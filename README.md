@@ -87,6 +87,32 @@ including that Protocol 28 one, which checks out the real
 one that runs on a self-hosted runner
 ([`examples/self-hosted.yml`](examples/self-hosted.yml)).
 
+## Checking many projects in parallel (matrix examples)
+
+Monorepos that contain several contracts or services usually want to run a
+Canary check for each of them, in parallel, and then see one combined result.
+Two maintained example workflows cover that pattern
+([`.github/workflows/examples/`](.github/workflows/examples/)):
+
+- [`matrix-check.yml`](.github/workflows/examples/matrix-check.yml) runs the
+  Action once per matrix target. Each leg resolves its own `project-root`
+  (fixtures and config are derived from it, so legs never touch the same
+  paths), disables the Action's fixed-name report upload, and uploads the
+  JSON report itself under a target-unique artifact name
+  (`report-${{ matrix.target }}`) so parallel legs can never overwrite each
+  other's results.
+- [`matrix-aggregation.yml`](.github/workflows/examples/matrix-aggregation.yml)
+  adds an `aggregate` job that runs with `if: always()`, downloads every
+  `report-*` artifact without merging them, and renders one consolidated
+  Markdown table into the GitHub job summary. A target whose report never
+  arrived is highlighted as **missing** in the table instead of crashing the
+  aggregation, so a partially-failed matrix still produces a single clear
+  overview.
+
+Both files live under `.github/workflows/examples/`, which GitHub does not
+execute — copy them into your own `.github/workflows/` and replace the
+example matrix entries with your projects' paths.
+
 ## Example workflow
 
 ```yaml
@@ -135,7 +161,7 @@ annotations), and never invokes Canary twice to get a second format.
 ## Outputs
 
 All values are strings, as GitHub Actions outputs always are. The counts
-(`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are decimal-string integers
+(`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are decimal-string integers
 (rendered with `String(n)`), and `status` is one of the five fixed
 literals below.
 
@@ -146,7 +172,11 @@ literals below.
 | `warnings` | Number of checks that produced a warning. | `"1"` |
 | `failures` | Number of checks that failed a compatibility assertion. | `"2"` |
 | `errors` | Number of checks that could not complete due to an execution error. | `"0"` |
-| `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. | `"3"` |
+| `total` | Total number of checks in the report counts. Explicitly set to `0` on an execution failure, like the other counts. | `"15"` |
+| `skipped` | Number of checks skipped. Explicitly set to `0` on an execution failure, like the other counts. | `"0"` |
+| `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. Explicitly set to `0` on an execution failure, like the other counts. | `"3"` |
+| `engine-version` | Protocol Canary engine version that produced the result, read from the installed binary. On an execution failure, set to the resolved version if installation succeeded, or an empty string if installation failed. | `"0.1.1"` |
+| `observed-protocol` | Stellar protocol version reported by the network during live checks (`network.observedProtocol`), or an empty string when the report has no network object. Explicitly set to an empty string on an execution failure. | `"28"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
@@ -159,8 +189,9 @@ A concrete consumer, using the outputs to gate a follow-up step:
 - name: React to the result
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
+```
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `replayed-count`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol` is set to an empty string `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 
 ## How failures appear
 
@@ -312,7 +343,7 @@ what to do about each.
 
 | Message (step log / job summary) | Meaning | What to do |
 |---|---|---|
-| ``The `cargo` command was not found on this runner. …`` | No Rust toolchain is available, so the Action cannot build Canary from source. | On a self-hosted or non-Ubuntu runner, install a toolchain first — e.g. a `dtolnay/rust-toolchain` step ahead of this Action; [`examples/self-hosted.yml`](examples/self-hosted.yml) shows a complete workflow. GitHub-hosted Ubuntu runners include one by default; seeing this there usually means an earlier step removed it from `PATH`. |
+| ``The `cargo` command was not found on this runner. …`` | This Action prefers a prebuilt Protocol-Canary release binary when one exists for this platform and version and falls back to building from source only when no usable prebuilt asset was found — so this error means neither path is available: no usable prebuilt release (or no checksum manifest for one) and no Rust toolchain. | On a self-hosted or non-Ubuntu runner, install a toolchain first — e.g. a `dtolnay/rust-toolchain` step ahead of this Action; [`examples/self-hosted.yml`](examples/self-hosted.yml) shows a complete workflow. GitHub-hosted Ubuntu runners include one by default; seeing this there usually means an earlier step removed it from `PATH`. |
 | ``` `cargo install` exited with code 101 while installing Protocol-Canary … ``` | The source build failed — most often a Rust toolchain too old for Canary's `Cargo.toml`, a corrupted build cache, or a transient network failure while fetching crates. | Re-run the job once to rule out a transient failure. If it persists, update the runner's Rust toolchain. Cargo's own error output appears in the log above this message; `ACTIONS_STEP_DEBUG: true` adds more detail. |
 | `Stellar Protocol Canary timed out after Ns and was terminated.` | Canary ran longer than `timeout-minutes` (default 15; it bounds only the Canary process, not the whole job) and was killed. | Raise `timeout-minutes` if your fixture set legitimately needs longer. Otherwise check whether a live-RPC check is hanging on an unreachable `rpc-url`. |
 | `` `cargo install` … timed out after Ns and was terminated. `` | The `cargo install` step ran longer than `timeout-minutes` (floored at one minute — see [Timeouts](#timeouts)) and was killed. | Re-run the job; this is usually a stalled network fetch. Raise `timeout-minutes` if a build of this size legitimately needs longer. Cargo's own progress output appears in the log above this message. |
@@ -516,6 +547,7 @@ Repositories that want a single-declaration compatibility check can call the
 maintained reusable workflow; its inputs, outputs, and matrix, monorepo, and
 PR-gating examples are documented in
 [`docs/reusable-workflow.md`](docs/reusable-workflow.md).
+The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail-closed policy are documented in [`docs/integrity-model.md`](docs/integrity-model.md).
 
 ## License
 

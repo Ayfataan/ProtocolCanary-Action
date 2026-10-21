@@ -10,6 +10,14 @@ import * as path from "node:path";
 export const ARTIFACT_NAME = "stellar-protocol-canary-report";
 
 /**
+ * Stable prefix of the Execution Receipt artifact (#362). The full name is
+ * run-scoped (`stellar-canary-receipt-<run-id>`) so the receipt never
+ * collides with the report artifact and downstream consumers can fetch it
+ * by a predictable name.
+ */
+export const RECEIPT_ARTIFACT_PREFIX = "stellar-canary-receipt";
+
+/**
  * Describes the result of an artifact upload attempt.
  *
  * `reason` is present only when `uploaded` is `false`; a successful upload
@@ -97,6 +105,58 @@ export async function uploadReport(
           `uploading this report as "${name}" instead.`,
       );
       await client.uploadArtifact(name, [reportPath], path.dirname(reportPath));
+    }
+    core.info(`Uploaded ${name} artifact.`);
+    return { uploaded: true };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    core.warning(`Failed to upload ${name} artifact: ${reason}`);
+    return { uploaded: false, reason };
+  }
+}
+
+/**
+ * The artifact name for the Execution Receipt of the current workflow run:
+ * `stellar-canary-receipt-<run-id>`, falling back to a short unique suffix
+ * when `GITHUB_RUN_ID` is unavailable (outside a workflow) so the name is
+ * never empty or colliding with itself.
+ */
+export function receiptArtifactName(runId: string | undefined): string {
+  const id = runId?.trim() ?? "";
+  if (id !== "") {
+    return `${RECEIPT_ARTIFACT_PREFIX}-${sanitizeDifferentiator(id)}`;
+  }
+  const unique = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  return `${RECEIPT_ARTIFACT_PREFIX}-${unique}`;
+}
+
+/**
+ * Uploads the Execution Receipt JSON (#362) as a run-scoped workflow
+ * artifact. Like {@link uploadReport}, this is auxiliary: failures are
+ * logged and reflected in the returned outcome, never thrown, and never
+ * change the compatibility result. Because the name embeds the run id it is
+ * unique per run already; if a second Action invocation in the *same* run
+ * collides on it (409), the upload retries once under a short unique suffix,
+ * mirroring the report artifact's collision behavior.
+ */
+export async function uploadReceipt(receiptPath: string): Promise<ArtifactUploadOutcome> {
+  let name = receiptArtifactName(process.env.GITHUB_RUN_ID);
+  const preferredName = name;
+  try {
+    const client = new DefaultArtifactClient();
+    try {
+      await client.uploadArtifact(name, [receiptPath], path.dirname(receiptPath));
+    } catch (error) {
+      if (!isArtifactNameCollision(error)) {
+        throw error;
+      }
+      const unique = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      name = `${preferredName}-${unique}`;
+      core.info(
+        `Artifact name "${preferredName}" is already used in this workflow run; ` +
+          `uploading this receipt as "${name}" instead.`,
+      );
+      await client.uploadArtifact(name, [receiptPath], path.dirname(receiptPath));
     }
     core.info(`Uploaded ${name} artifact.`);
     return { uploaded: true };
