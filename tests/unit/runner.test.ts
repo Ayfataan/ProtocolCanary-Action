@@ -433,10 +433,10 @@ describe("runner remaining capture branches (#496)", () => {
     spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
     const pending = runCheck("fake-canary", ["check"], 60_000);
 
-    // The final 1 MiB cutoff falls one byte into a three-byte euro sign.
+    // The final 1 MiB cutoff falls inside a three-byte euro sign.
     // This exercises the continuation-byte skip in sliceTailSafely.
-    const stderr = "€" + "x".repeat(MAX_STDERR_CAPTURE_BYTES - STDERR_DROPPED_NOTICE.length - 1);
-    child.stderr.emit("data", stderr + "€".repeat(200_000));
+    const stderr = "€".repeat(600_000);
+    child.stderr.emit("data", stderr);
     child.emit("close", 0, null);
 
     const result = await pending;
