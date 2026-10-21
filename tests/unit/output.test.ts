@@ -606,6 +606,25 @@ describe("describeExitCode", () => {
     expect(describeExitCode(5).category).toBe("internal_error");
   });
 
+  it("describes each documented exit code according to the engine contract", () => {
+    expect(describeExitCode(0).description).toBe("Every applicable check passed.");
+    expect(describeExitCode(1).description).toBe(
+      "At least one fixture's compatibility assertion failed — a real incompatibility was found.",
+    );
+    expect(describeExitCode(2).description).toBe(
+      "The invocation was unusable or no check applied, so no checks ran.",
+    );
+    expect(describeExitCode(3).description).toBe(
+      "At least one check could not complete — it was executed but hit an XDR, RPC, or Soroban execution problem.",
+    );
+    expect(describeExitCode(4).description).toBe(
+      "A fixture file failed to load or validate, so the run never started.",
+    );
+    expect(describeExitCode(5).description).toBe(
+      "An internal error unrelated to configuration, fixtures, or the three compatibility surfaces.",
+    );
+  });
+
   it("falls back to unknown for an unrecognized code", () => {
     expect(describeExitCode(99).category).toBe("unknown");
   });

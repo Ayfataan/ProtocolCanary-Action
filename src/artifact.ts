@@ -78,6 +78,30 @@ export function isArtifactNameCollision(error: unknown): boolean {
 }
 
 /**
+ * Maximum attempts to upload a report artifact before giving up on collisions (#494).
+ */
+export const MAX_REPORT_UPLOAD_ATTEMPTS = 3;
+
+/**
+ * Builds candidate artifact names across successive attempts.
+ * Attempt 1: stable name {@link ARTIFACT_NAME}.
+ * Attempt 2: readable differentiator name when available, else a unique name.
+ * Attempt 3+: unique name with short random suffix to guarantee distinct names.
+ */
+function candidateReportArtifactName(attempt: number, differentiator?: string): string {
+  if (attempt === 1) {
+    return ARTIFACT_NAME;
+  }
+  const hasDifferentiator = differentiator !== undefined && sanitizeDifferentiator(differentiator) !== "";
+  if (attempt === 2 && hasDifferentiator) {
+    return fallbackArtifactName(differentiator);
+  }
+  const base = hasDifferentiator ? fallbackArtifactName(differentiator) : ARTIFACT_NAME;
+  const unique = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  return `${base}-${unique}`;
+}
+
+/**
  * Uploads the JSON report as a workflow artifact. Artifact upload is
  * always auxiliary (section 30/62 of the product spec): a failure here is
  * logged as a warning and reflected in the returned outcome, but it never
@@ -87,8 +111,9 @@ export function isArtifactNameCollision(error: unknown): boolean {
  * second invocation (a matrix leg, or a second Action step) would
  * otherwise fail to upload. The stable {@link ARTIFACT_NAME} is tried
  * first; only if the service reports that name as taken does the upload
- * retry once under a name derived from `differentiator` (falling back to a
- * short unique suffix when none was provided).
+ * retry under a name derived from `differentiator` (falling back to a
+ * short unique suffix when none was provided or when multiple invocations
+ * share the same differentiator, #494).
  */
 export async function uploadReport(
   reportPath: string,
@@ -112,46 +137,44 @@ export async function uploadReport(
     typeof arg3 === "number" ? arg3 : typeof arg4 === "number" ? arg4 : undefined;
   const additionalFiles: readonly string[] =
     Array.isArray(arg3) ? arg3 : Array.isArray(arg4) ? arg4 : [];
-  let name = ARTIFACT_NAME;
   const files = [reportPath, ...additionalFiles];
-  try {
-    const client = new DefaultArtifactClient();
-    const options = retentionDays !== undefined ? { retentionDays } : undefined;
-    let response;
+  const options = retentionDays !== undefined ? { retentionDays } : undefined;
+  const client = new DefaultArtifactClient();
+  let previousName = ARTIFACT_NAME;
+  let currentName = ARTIFACT_NAME;
+
+  for (let attempt = 1; attempt <= MAX_REPORT_UPLOAD_ATTEMPTS; attempt += 1) {
+    currentName = candidateReportArtifactName(attempt, differentiator);
     try {
-      response = await client.uploadArtifact(
-        ARTIFACT_NAME,
-        files,
-        path.dirname(reportPath),
-        ...(options !== undefined ? [options] : []),
-      );
-    } catch (error) {
-      if (!isArtifactNameCollision(error)) {
-        throw error;
+      if (attempt > 1) {
+        core.info(
+          `Artifact name "${previousName}" is already used in this workflow run; ` +
+            `uploading this report as "${currentName}" instead.`,
+        );
       }
-      name = fallbackArtifactName(differentiator);
-      core.info(
-        `Artifact name "${ARTIFACT_NAME}" is already used in this workflow run; ` +
-          `uploading this report as "${name}" instead.`,
-      );
-      response = await client.uploadArtifact(
-        name,
+      const response = await client.uploadArtifact(
+        currentName,
         files,
         path.dirname(reportPath),
         ...(options !== undefined ? [options] : []),
       );
+      core.info(`Uploaded ${currentName} artifact.`);
+      return {
+        uploaded: true,
+        name: currentName,
+        ...(response?.id !== undefined ? { id: response.id } : {}),
+      };
+    } catch (error) {
+      if (!isArtifactNameCollision(error) || attempt === MAX_REPORT_UPLOAD_ATTEMPTS) {
+        const reason = error instanceof Error ? error.message : String(error);
+        core.warning(`Failed to upload ${currentName} artifact: ${reason}`);
+        return { uploaded: false, reason };
+      }
+      previousName = currentName;
     }
-    core.info(`Uploaded ${name} artifact.`);
-    return {
-      uploaded: true,
-      name,
-      ...(response?.id !== undefined ? { id: response.id } : {}),
-    };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    core.warning(`Failed to upload ${name} artifact: ${reason}`);
-    return { uploaded: false, reason };
   }
+
+  return { uploaded: false, reason: `Failed to upload artifact after ${MAX_REPORT_UPLOAD_ATTEMPTS} attempts.` };
 }
 
 /**
