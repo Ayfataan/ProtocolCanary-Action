@@ -399,3 +399,49 @@ describe("runCheck timeout escalation", () => {
     expect(child.signals).toEqual(["SIGTERM"]);
   });
 });
+
+describe("runner remaining capture branches (#496)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    spawnMock.mockReset();
+  });
+
+  it("ignores subsequent stdout chunks and escalates to SIGKILL when SIGTERM is ignored", async () => {
+    vi.useFakeTimers();
+    const child = new FakeChild(false);
+    spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+
+    const pending = runCheck("fake-canary", ["check"], 60_000, 25);
+    // A single chunk just over the limit keeps the test's memory usage bounded.
+    child.stdout.emit("data", Buffer.alloc(64 * 1024 * 1024 + 1, "x"));
+    expect(child.signals).toEqual(["SIGTERM"]);
+
+    // Node may still deliver an already-queued chunk after pause/destroy.
+    // It must be ignored rather than triggering another termination.
+    child.stdout.emit("data", "late chunk after overflow");
+    expect(child.signals).toEqual(["SIGTERM"]);
+
+    await vi.advanceTimersByTimeAsync(24);
+    expect(child.signals).toEqual(["SIGTERM"]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    await expect(pending).rejects.toThrow(CanaryExecutionFailedError);
+  });
+
+  it("keeps a valid UTF-8 stderr tail when the byte cutoff splits a multibyte character", async () => {
+    const child = new FakeChild(false);
+    spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+    const pending = runCheck("fake-canary", ["check"], 60_000);
+
+    // The final 1 MiB cutoff falls one byte into a three-byte euro sign.
+    // This exercises the continuation-byte skip in sliceTailSafely.
+    const stderr = "€" + "x".repeat(MAX_STDERR_CAPTURE_BYTES - STDERR_DROPPED_NOTICE.length - 1);
+    child.stderr.emit("data", stderr + "€".repeat(200_000));
+    child.emit("close", 0, null);
+
+    const result = await pending;
+    expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
+    expect(result.stderr).not.toContain("\uFFFD");
+    expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_STDERR_CAPTURE_BYTES);
+  });
+});
