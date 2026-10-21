@@ -3,11 +3,18 @@ import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
-import { buildCheckArgs, engineSupportsAllowEmpty, runCheck } from "../../src/runner";
+import {
+  MAX_STDERR_CAPTURE_BYTES,
+  STDERR_DROPPED_NOTICE,
+  buildCheckArgs,
+  engineSupportsAllowEmpty,
+  extractDiagnostic,
+  runCheck,
+} from "../../src/runner";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -56,6 +63,11 @@ const BASE_INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 15,
   allowEmpty: false,
+  fixturesPackVersion: undefined,
+  fixturesPackProtocol: undefined,
+  githubToken: undefined,
+  generateReceipt: false,
+  strictIntegrity: false,
 };
 
 describe("buildCheckArgs", () => {
@@ -400,48 +412,215 @@ describe("runCheck timeout escalation", () => {
   });
 });
 
-describe("runner remaining capture branches (#496)", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-    spawnMock.mockReset();
+describe("extractDiagnostic", () => {
+  // #351: failure annotations must carry the engine's root message, not a
+  // bare "Process exited with code N" — so the useful line has to be dug
+  // out of stderr that often leads with progress/banner noise.
+  it("prefers the root error line over surrounding noise (#351)", () => {
+    const stderr = [
+      "stellar-canary 0.2.0 (canary-cli)",
+      "loading fixtures from ./fixtures",
+      "error: configuration error: no checks ran: all 7 loaded fixtures were skipped",
+      "stack backtrace: ...",
+    ].join("\n");
+    expect(extractDiagnostic(stderr)).toBe(
+      "error: configuration error: no checks ran: all 7 loaded fixtures were skipped",
+    );
   });
 
-  it("ignores subsequent stdout chunks and escalates to SIGKILL when SIGTERM is ignored", async () => {
-    vi.useFakeTimers();
-    const child = new FakeChild(false);
-    spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
-
-    const pending = runCheck("fake-canary", ["check"], 60_000, 25);
-    // A single chunk just over the limit keeps the test's memory usage bounded.
-    child.stdout.emit("data", Buffer.alloc(64 * 1024 * 1024 + 1, "x"));
-    expect(child.signals).toEqual(["SIGTERM"]);
-
-    // Node may still deliver an already-queued chunk after pause/destroy.
-    // It must be ignored rather than triggering another termination.
-    child.stdout.emit("data", "late chunk after overflow");
-    expect(child.signals).toEqual(["SIGTERM"]);
-
-    await vi.advanceTimersByTimeAsync(24);
-    expect(child.signals).toEqual(["SIGTERM"]);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
-    await expect(pending).rejects.toThrow(CanaryExecutionFailedError);
+  it("falls back to the first non-empty line when nothing reads as an error (#351)", () => {
+    expect(extractDiagnostic("\n\n   just context   \nmore detail\n")).toBe("just context");
   });
 
-  it("keeps a valid UTF-8 stderr tail when the byte cutoff splits a multibyte character", async () => {
-    const child = new FakeChild(false);
-    spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
-    const pending = runCheck("fake-canary", ["check"], 60_000);
+  it("honors other root-message prefixes the engine uses (#351)", () => {
+    expect(extractDiagnostic("no checks ran: empty plan")).toBe("no checks ran: empty plan");
+    expect(extractDiagnostic("panic: thread main panicked")).toBe("panic: thread main panicked");
+    expect(extractDiagnostic("Invalid fixture: bad xdr")).toBe("Invalid fixture: bad xdr");
+  });
 
-    // The final 1 MiB cutoff falls inside a three-byte euro sign.
-    // This exercises the continuation-byte skip in sliceTailSafely.
-    const stderr = "€".repeat(600_000);
-    child.stderr.emit("data", stderr);
-    child.emit("close", 0, null);
+  it("returns an empty string for empty or whitespace-only stderr (#351)", () => {
+    expect(extractDiagnostic("")).toBe("");
+    expect(extractDiagnostic("  \n \t \n")).toBe("");
+  });
 
-    const result = await pending;
+  it("truncates a very long diagnostic to the documented bound (#351)", () => {
+    const long = `error: ${"x".repeat(5_000)}`;
+    const diagnostic = extractDiagnostic(long);
+    expect(diagnostic.length).toBe(500);
+    expect(diagnostic.startsWith("error: ")).toBe(true);
+  });
+});
+
+describe("UTF-8 stream decoding and bounded capture (issue #427)", () => {
+  it("survives 2, 3 and 4 byte characters being split at every possible byte offset across child writes", async () => {
+    // 2-byte: é (0xC3 0xA9)
+    // 3-byte: € (0xE2 0x82 0xAC)
+    // 4-byte: 🎉 (0xF0 0x9F 0x8E 0x89)
+    const script = `
+      const e2 = Buffer.from("é", "utf8");
+      const e3 = Buffer.from("€", "utf8");
+      const e4 = Buffer.from("🎉", "utf8");
+
+      // Split 2-byte at offset 1
+      process.stdout.write(e2.subarray(0, 1));
+      process.stdout.write(e2.subarray(1));
+
+      // Split 3-byte at offset 1 and 2
+      process.stdout.write(e3.subarray(0, 1));
+      process.stdout.write(e3.subarray(1));
+      process.stdout.write(e3.subarray(0, 2));
+      process.stdout.write(e3.subarray(2));
+
+      // Split 4-byte at offset 1, 2, 3
+      process.stdout.write(e4.subarray(0, 1));
+      process.stdout.write(e4.subarray(1));
+      process.stdout.write(e4.subarray(0, 2));
+      process.stdout.write(e4.subarray(2));
+      process.stdout.write(e4.subarray(0, 3));
+      process.stdout.write(e4.subarray(3));
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("é€€🎉🎉🎉");
+    expect(result.stdout).not.toContain("\uFFFD");
+  });
+
+  it("handles one-byte chunks without corrupting text", async () => {
+    const script = `
+      const buf = Buffer.from("Stellar Protocol Canary 🚀 € 28", "utf8");
+      for (const b of buf) {
+        process.stdout.write(Buffer.from([b]));
+      }
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("Stellar Protocol Canary 🚀 € 28");
+  });
+
+  it("replaces invalid byte sequences and lone continuation bytes without damaging surrounding valid text", async () => {
+    const script = `
+      process.stdout.write(Buffer.from([0x61, 0xFF, 0x62])); // 'a', 0xFF, 'b'
+      process.stdout.write(Buffer.from([0x63, 0x80, 0x64])); // 'c', 0x80, 'd'
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("a\uFFFDb\nc\uFFFDd".replace("\n", ""));
+  });
+
+  it("handles an empty stream cleanly", async () => {
+    const result = await runCheck(process.execPath, ["-e", ""], 5000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+  });
+
+  it("terminates child and fails with CanaryExecutionFailedError when stdout exceeds 64 MiB", async () => {
+    // 65 MiB in stdout
+    const script = `
+      process.stdout.write(Buffer.alloc(65 * 1024 * 1024, "a"));
+    `;
+
+    await expect(runCheck(process.execPath, ["-e", script], 10_000)).rejects.toThrow(
+      CanaryExecutionFailedError,
+    );
+
+    try {
+      await runCheck(process.execPath, ["-e", script], 10_000);
+    } catch (err) {
+      expect(err).toBeInstanceOf(CanaryExecutionFailedError);
+      const message = (err as CanaryExecutionFailedError).message;
+      expect(message).toContain("64 MiB");
+      expect(message).toContain("output was truncated");
+      expect(message).toContain("process terminated");
+    }
+  });
+
+  it("terminates a child that writes stdout without ever exiting", async () => {
+    const script = `
+      setInterval(() => {
+        process.stdout.write(Buffer.alloc(1024 * 1024, "x"));
+      }, 5);
+    `;
+
+    await expect(runCheck(process.execPath, ["-e", script], 10_000)).rejects.toThrow(
+      CanaryExecutionFailedError,
+    );
+  });
+
+  it("keeps bounded tail and prepends notice when stderr exceeds 1 MiB", async () => {
+    const script = `
+      process.stderr.write(Buffer.alloc(2 * 1024 * 1024, "e"));
+      process.stderr.write("FINAL ROOT DIAGNOSTIC ERROR\\n");
+    `;
+
+    const result = await runCheck(process.execPath, ["-e", script], 10_000);
+    expect(result.exitCode).toBe(0);
     expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
-    expect(result.stderr).not.toContain("\uFFFD");
+    expect(result.stderr).toContain("FINAL ROOT DIAGNOSTIC ERROR");
     expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_STDERR_CAPTURE_BYTES);
+  });
+});
+
+describe("runCheck timeoutMs guard (#456)", () => {
+  beforeEach(() => {
+    spawnMock.mockClear();
+  });
+
+  it("rejects a timeoutMs above the Node timer limit instead of starting a timer", async () => {
+    await expect(
+      runCheck("fake-canary", ["check"], 2_147_483_648),
+    ).rejects.toThrow(/timeoutMs/);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, NaN, Infinity])(
+    "rejects a non-positive or non-finite timeoutMs %j",
+    async (timeoutMs) => {
+      await expect(runCheck("fake-canary", ["check"], timeoutMs)).rejects.toThrow(
+        /timeoutMs/,
+      );
+      expect(spawnMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("passes a sub-limit delay to setTimeout for 35791 minutes and does not fire immediately", async () => {
+    // Regression: timeout-minutes: 40000 used to be multiplied by 60,000 and
+    // handed to setTimeout, which clamped delays above 2,147,483,647 ms to
+    // fire after 1 ms and terminate the engine almost immediately. The largest
+    // accepted value (35791 minutes) must keep a real, sub-limit delay.
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild(false); // ignores SIGTERM: only the timer can settle it
+      spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+      const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+      let settled = false;
+      const pending = runCheck("fake-canary", ["check"], 35791 * 60_000);
+      pending.then(() => {
+        settled = true;
+      }, () => {
+        settled = true;
+      });
+
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      const [, delay] = setTimeoutSpy.mock.lastCall as [unknown, number];
+      expect(delay).toBe(35791 * 60_000);
+      expect(delay).toBeLessThan(2_147_483_647);
+
+      // Advancing 1 ms must not settle the promise: the timer is honoured,
+      // not clamped to fire immediately.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(false);
+
+      // Letting the timer fire proves the delay is real: SIGTERM is sent, the
+      // child ignores it, and SIGKILL after the grace period settles it.
+      await vi.advanceTimersByTimeAsync(35791 * 60_000 + 6_000);
+      await expect(pending).rejects.toThrow(TimeoutError);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

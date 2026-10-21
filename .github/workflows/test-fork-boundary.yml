@@ -1,0 +1,201 @@
+name: Fork PR trust boundary verification (#369)
+
+# Independent security verification of the fork-PR trust boundary around the
+# maintained reusable workflow. It deliberately does NOT re-run the #366
+# setup: it audits that the shipped workflows obey the boundary rules, and it
+# probes the live `GITHUB_TOKEN` of a fork pull request by attempting a
+# write-scoped API call that must be refused. The bash below is executed
+# verbatim by tests/unit/fork-boundary.test.ts against fixture workflows and
+# a stubbed token probe, so what CI asserts is what is shipped here.
+#
+# See docs/security-model.md for the threat model this guards.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/reusable-canary-check.yml'
+      - '.github/workflows/test-fork-boundary.yml'
+      - '.github/workflows/test-reusable-workflow.yml'
+      - 'docs/security-model.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fork-boundary:
+    name: Audit least-privilege boundaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Audit fork trust boundaries
+        id: fork-boundary-audit
+        shell: bash
+        env:
+          TARGET_WORKFLOW: .github/workflows/reusable-canary-check.yml .github/workflows/test-reusable-workflow.yml .github/workflows/test-fork-boundary.yml
+        run: |
+          set -euo pipefail
+          if [ -z "${TARGET_WORKFLOW:-}" ]; then
+            echo "::error::TARGET_WORKFLOW must list the workflow file(s) to audit"
+            exit 1
+          fi
+          violations=0
+          fail() {
+            echo "::error::$*"
+            violations=$((violations + 1))
+          }
+          # Detection literals. The checkout step scan flags any step whose line
+          # contains BOTH markers; the assignments below each carry only one, so
+          # the audit never reports itself.
+          USES_KEY='uses:'
+          CHECKOUT_MARK='actions/checkout'
+          PERSIST_KEY='persist-credentials:'
+          for target in $TARGET_WORKFLOW; do
+            if [ ! -f "$target" ]; then
+              echo "::error::audit target '$target' does not exist"
+              exit 1
+            fi
+
+            # 1. Trust surface. These events run the workflow with the full
+            #    write-capable token even when the code originates from a fork.
+            for trigger in pull_request_target workflow_run repository_dispatch; do
+              if grep -Eq "^[[:space:]]*${trigger}[[:space:]]*:" "$target"; then
+                fail "$target is triggered by ${trigger}: code from untrusted forks would run with an elevated token"
+              fi
+            done
+
+            # 2. Least privilege. Every token scope the workflow can express
+            #    must stay read-only; anything else lets a fork PR mutate the
+            #    repository or its metadata.
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              scope=$(printf '%s' "$line" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*:.*$//')
+              value=$(printf '%s' "$line" | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*$//')
+              case "$value" in
+                read) ;;
+                *) fail "$target requests '${scope}: ${value}'; fork PR checks must stay on read-only token scopes";;
+              esac
+            done < <(grep -E '^[[:space:]]*(contents|actions|checks|issues|packages|pull-requests|statuses|security-events)[[:space:]]*:[[:space:]]*[A-Za-z]+[[:space:]]*$' "$target" || true)
+
+            # 3. Credential persistence. A checkout that keeps the token in
+            #    .git/config survives across steps and is exfiltrable by any
+            #    later step that runs fork code. Absence of the hardening is a
+            #    violation; the audit fails closed, never "assume secure".
+            mapfile -t wlines < "$target"
+            i=0
+            while [ "$i" -lt "${#wlines[@]}" ]; do
+              line="${wlines[$i]}"
+              if printf '%s' "$line" | grep -Fq "$USES_KEY" && printf '%s' "$line" | grep -Fq "$CHECKOUT_MARK"; then
+                dash_indent=-1
+                if printf '%s' "$line" | grep -Eq '^[[:space:]]*-[[:space:]]'; then
+                  tmp="$line"
+                  ws="${tmp%%[![:space:]]*}"
+                  dash_indent=${#ws}
+                else
+                  k=$((i - 1))
+                  while [ "$k" -ge 0 ]; do
+                    prev="${wlines[$k]}"
+                    if printf '%s' "$prev" | grep -Eq '^[[:space:]]*-([[:space:]]|$)'; then
+                      tmpp="$prev"
+                      wsp="${tmpp%%[![:space:]]*}"
+                      dash_indent=${#wsp}
+                      break
+                    fi
+                    k=$((k - 1))
+                  done
+                fi
+                if [ "$dash_indent" -lt 0 ]; then
+                  tmpe="$line"
+                  wse="${tmpe%%[![:space:]]*}"
+                  dash_indent=$(( ${#wse} - 2 ))
+                  [ "$dash_indent" -lt 0 ] && dash_indent=0
+                fi
+                j=$((i + 1))
+                found=0
+                while [ "$j" -lt "${#wlines[@]}" ]; do
+                  nxt="${wlines[$j]}"
+                  if [ -z "${nxt//[[:space:]]/}" ]; then
+                    j=$((j + 1))
+                    continue
+                  fi
+                  tmpn="$nxt"
+                  wsn="${tmpn%%[![:space:]]*}"
+                  nxt_ind=${#wsn}
+                  if [ "$nxt_ind" -le "$dash_indent" ]; then
+                    break
+                  fi
+                  if printf '%s' "$nxt" | grep -Fq "$PERSIST_KEY"; then
+                    pv=$(printf '%s' "$nxt" | sed -E 's/.*persist-credentials:[[:space:]]*//; s/[[:space:]]*$//')
+                    case "$pv" in
+                      false) found=1; break;;
+                      true) found=0; break;;
+                      *) fail "$target sets a checkout step's credentials opt-out to '${pv}'; it must be exactly false";;
+                    esac
+                  fi
+                  j=$((j + 1))
+                done
+                if [ "$found" -ne 1 ]; then
+                  fail "$target has a checkout step without persist-credentials: false; the token would survive in the workspace across steps"
+                fi
+                i=$j
+                continue
+              fi
+              i=$((i + 1))
+            done
+
+            # 4. Secret reachability. Fork PR runs must not receive caller
+            #    secrets. The reusable workflow's only declared secret bridge
+            #    is `github-token`, which resolves to the same ephemeral
+            #    read-only token; anything else in a file this boundary guards
+            #    is a leak vector.
+            secret_refs=$(grep -Eo 'secrets\.[A-Za-z0-9_.+-]+' "$target" || true)
+            while IFS= read -r ref; do
+              [ -z "$ref" ] && continue
+              case "$ref" in
+                secrets.github-token) ;;
+                *) fail "$target forwards ${ref} into a fork-triggered context; secrets must not cross the fork trust boundary";;
+              esac
+            done <<< "$secret_refs"
+          done
+
+          if [ "$violations" -gt 0 ]; then
+            echo "::error::fork-boundary audit found ${violations} violation(s)"
+            exit 1
+          fi
+          echo "fork-boundary audit passed: ${TARGET_WORKFLOW}"
+
+      - name: Probe the live token write boundary (fails closed)
+        id: token-boundary-probe
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="${GH_API_BASE:-https://api.github.com}"
+          repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required for the boundary probe}"
+          token="${GITHUB_TOKEN:?the ephemeral run token is required for the boundary probe}"
+          # Attempt a write-scoped operation with the run's own token. On a fork
+          # PR (and under this workflow's contents: read grant) the API must
+          # refuse it before evaluating anything else. 404 would mean the token
+          # reached the authorization layer of workflow dispatch — never accept
+          # that as proof of read-only.
+          code=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --request POST \
+            --header "authorization: Bearer ${token}" \
+            --data '{"ref":"fork-boundary-probe-ref-never-exists"}' \
+            "${api}/repos/${repo}/actions/workflows/fork-boundary-probe-never-exists.yml/dispatches")
+          case "$code" in
+            401|403)
+              echo "token boundary holds: write-scoped workflow_dispatch refused with HTTP ${code}"
+              ;;
+            *)
+              echo "::error::expected the read-only fork PR token to be refused with HTTP 401/403 but saw HTTP ${code}; the token boundary is NOT enforced"
+              exit 1
+              ;;
+          esac

@@ -223,6 +223,56 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).toContain("#### Warnings");
     expect(markdown).not.toContain("#### Failures");
   });
+
+  // #350: fixtures/results served from the engine's cache must be called out
+  // so a reader can tell cache reuse from fresh execution.
+  it("renders a replayed-from-cache badge with count and percentage (#350)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", source: "cache" }),
+          result({ testId: "b", surface: "xdr", fixtureId: "b", source: "cache" }),
+          result({ testId: "c", surface: "rpc", fixtureId: "c", source: "live" }),
+          result({ testId: "d", surface: "rpc", fixtureId: "d" }),
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("Replayed from cache");
+    expect(markdown).toContain("2/4 checks (50%)");
+    expect(markdown).toContain("♻️");
+  });
+
+  it("renders no cache badge when nothing was replayed (#350)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          result({ testId: "a", surface: "xdr", fixtureId: "a", source: "live" }),
+          result({ testId: "b", surface: "rpc", fixtureId: "b", source: "live" }),
+        ],
+      }),
+    );
+    expect(markdown).not.toContain("Replayed from cache");
+    expect(markdown).toContain("2/2 applicable checks passed.");
+  });
+
+  it("defaults to zero replayed checks (no badge, no throw) for reports without any replayed field (#350)", () => {
+    // Reports from engines that predate the cache carry no source/replayed
+    // attributes at all; rendering must be unaffected.
+    const markdown = renderSummaryMarkdown(
+      report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", surface: "xdr", fixtureId: "a" })],
+      }),
+    );
+    expect(markdown).not.toContain("Replayed from cache");
+    expect(markdown).toContain("1/1 applicable checks passed.");
+  });
 });
 
 describe("renderExecutionFailureMarkdown", () => {
@@ -303,5 +353,104 @@ describe("renderExecutionFailureMarkdown", () => {
         expect([fence, `${fence}text`]).toContain(line);
       }
     }
+  });
+});
+
+describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
+  const BINARY_SHA = "a".repeat(64);
+  const PACK_DIGEST = "b".repeat(64);
+
+  it("renders a provenance table with the binary SHA-256, pack digest, and engine version", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      binarySha256: BINARY_SHA,
+      packDigest: PACK_DIGEST,
+      engineVersion: "0.1.0",
+    });
+
+    expect(markdown).toContain("### Provenance & Trust");
+    expect(markdown).toContain(`| Canary binary | \`sha256:${BINARY_SHA}\` |`);
+    expect(markdown).toContain(`| Fixture pack | \`sha256:${PACK_DIGEST}\` |`);
+    expect(markdown).toContain("| Engine version | 0.1.0 |");
+  });
+
+  it("states the D-07 trust boundary: digests prove integrity, not author authenticity", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      binarySha256: BINARY_SHA,
+    });
+
+    expect(markdown).toContain("data integrity");
+    expect(markdown).toMatch(/not\D*proof of (the )?release author/i);
+    expect(markdown).toContain("D-07");
+  });
+
+  it("marks missing provenance fields as unverified instead of fabricating digests", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      binarySha256: undefined,
+      packDigest: undefined,
+      engineVersion: "0.1.0",
+    });
+
+    expect(markdown).toContain("### Provenance & Trust");
+    expect(markdown).toContain("| Canary binary | (unverified — no published checksum verified in this run) |");
+    expect(markdown).toContain("| Fixture pack | (unverified — fixture-pack download pipeline not implemented, see #338) |");
+    expect(markdown).not.toContain("| Canary binary | `");
+  });
+
+  it("omits the section entirely when no provenance metadata is plumbed at all", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }));
+    expect(markdown).not.toContain("Provenance & Trust");
+  });
+
+  it("handles omitted provenance metadata cleanly without errors", () => {
+    expect(() => renderSummaryMarkdown(report({ status: "pass" }), {})).not.toThrow();
+    expect(() => renderSummaryMarkdown(report({ status: "fail" }), { engineVersion: "0.2.0" })).not.toThrow();
+  });
+});
+
+describe("renderSummaryMarkdown — reproduction command (#416)", () => {
+  it("renders a collapsed section with the engine version and exact command", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineVersion: "0.2.0",
+      engineArgs: ["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"],
+    });
+
+    expect(markdown).toContain("<details><summary>Reproduction command</summary>");
+    expect(markdown).toContain("Engine version: `0.2.0`");
+    expect(markdown).toContain(
+      "```text\nstellar-canary check --format json --protocol 28 --fixtures-dir fixtures\n```",
+    );
+    expect(markdown).toContain("</details>");
+  });
+
+  it("quotes arguments containing spaces and shell metacharacters", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--fixtures-dir", "fixtures dir", "--config", "$WEIRD;value"],
+    });
+
+    expect(markdown).toContain("--fixtures-dir 'fixtures dir'");
+    expect(markdown).toContain("--config '$WEIRD;value'");
+  });
+
+  it("masks credentials in the --rpc-url argument", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--rpc-url", "https://user:pass@example.com/rpc?token=secret"],
+    });
+
+    expect(markdown).toContain("--rpc-url https://[REDACTED]@example.com/rpc[REDACTED]");
+    expect(markdown).not.toContain("user:pass");
+    expect(markdown).not.toContain("token=secret");
+  });
+
+  it("omits the section when no argument array is available", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineVersion: "0.2.0" })).not.toContain(
+      "Reproduction command",
+    );
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineArgs: [] })).not.toContain(
+      "Reproduction command",
+    );
+  });
+
+  it("does not render the section for pre-#416 callers that pass no provenance", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }))).not.toContain("Reproduction command");
   });
 });

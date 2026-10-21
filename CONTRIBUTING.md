@@ -53,18 +53,58 @@ repository, is the source of truth for the CLI's behavior.
 ```bash
 npm run typecheck    # tsc --noEmit, strict mode
 npm run lint         # eslint
-npm test             # vitest run (unit + integration)
+npm test             # vitest run (unit + integration, includes workflow-policy.test.ts)
 npm run test:coverage  # vitest run with v8 coverage over src/ (text, HTML, and lcov reports in coverage/)
 npm run build         # esbuild bundle to dist/index.js
+actionlint           # static analysis of .github/workflows/
+zizmor .github/workflows # security audit of .github/workflows/
 ```
+
+### Trying the Action locally without GitHub
+
+To see what a change does end to end without pushing a branch, run the
+committed bundle the way a workflow run would:
+
+```bash
+npm run build
+node scripts/run-local.mjs \
+  --engine "$HOME/.cargo/bin/stellar-canary" \
+  --fixtures-dir ./my-fixtures \
+  --protocol 28 \
+  --input version=0.1.1 \
+  --input allow-empty=true
+```
+
+`scripts/run-local.mjs` builds the runner environment the Action reads
+(`INPUT_*` from `--input name=value`, plus `GITHUB_OUTPUT`,
+`GITHUB_STEP_SUMMARY`, `GITHUB_ENV`, `RUNNER_TEMP` and a temporary
+`CARGO_HOME` holding the engine given by `--engine`) in a temporary
+directory, runs `dist/index.js`, and prints the outputs the Action wrote,
+the rendered job summary, the `::`-annotation lines it emitted, and the exit
+code — then exits with that code and removes the temporary directory. It
+never installs an engine (`--engine` is required) and never talks to the
+network. `--help` documents every option; see `tests/unit/run-local.test.ts`
+for the exact contract.
 
 `npm run test:coverage` runs the same suite as `npm test` with coverage
 measurement enabled (via `@vitest/coverage-v8`; configured in
 `vitest.config.ts` to measure `src/` only). It reports line/branch coverage
 per source file in the terminal, and writes HTML and lcov reports to
-`coverage/` (gitignored). There is no coverage threshold gate today —
-consult the report when touching a file to see whether your change is
-exercised by the suite.
+`coverage/` (gitignored).
+
+CI enforces coverage thresholds on Ubuntu pull requests and main pushes. New
+code must not lower test coverage below these minimums:
+
+- Statements: 91%
+- Branches: 84%
+- Functions: 95%
+- Lines: 91%
+
+These thresholds live in `vitest.config.ts` under `test.coverage.thresholds`
+and are set slightly below current baseline measurements to accommodate
+refactoring while preventing regressions. As test coverage increases across
+the codebase, these thresholds are ratcheted upward. Run `npm run test:coverage`
+locally to verify your changes satisfy the coverage gate.
 
 Unit and integration tests must never require network access or a real
 `stellar-canary` binary: they run against
@@ -136,6 +176,36 @@ This project bundles with **esbuild**, not `@vercel/ncc`: the pinned
 `runs.using: node24` action. See `scripts/build.mjs` for the exact
 settings.
 
+## Mutation testing (StrykerJS)
+
+Line coverage says little about whether the tests would notice a behavioural
+change, so this repository has an on-demand mutation testing workflow:
+
+- `.github/workflows/mutation.yml` — runs only on `workflow_dispatch`, so it
+  never gates a pull request. It uses `npx` with pinned (but not saved)
+  `@stryker-mutator/core` and `@stryker-mutator/vitest-runner` versions,
+  mutates `src/`, runs the unit suite against each mutant, and publishes the
+  per-file mutation score and the top surviving mutants to the job summary
+  and as a `mutation-report` artifact.
+- `stryker.config.json` — the StrykerJS configuration: mutates `src/**/*.ts`,
+  uses the Vitest runner against `tests/unit`, and emits JSON, Markdown, and
+  HTML reports.
+
+To run it locally:
+
+```bash
+# Install the Vitest runner once, without saving it to package.json or
+# package-lock.json.
+npm install --no-save @stryker-mutator/vitest-runner@7.7.4
+npx --yes @stryker-mutator/core@7.7.4 stryker run
+```
+
+Reports are written to `reports/mutation/` (gitignored). Mutation survivors
+point at assertions that are too weak to catch a real change: treat a
+surviving mutant as a signal to strengthen the test, not as a reason to
+lower the threshold. A deliberately weakened assertion in a scratch copy
+shows up as a surviving mutant.
+
 ## Coding standards
 
 - Strict TypeScript (`strict: true`); avoid `any`.
@@ -150,6 +220,39 @@ settings.
 - Prefer the typed `CanaryActionError` subclasses in `src/errors.ts` over
   throwing a plain `Error`, so a caller can distinguish, for example, an
   installation failure from an invalid report.
+- Workflow files in `.github/workflows/` must follow repository security policy:
+  every workflow must explicitly declare a top-level `permissions:` block
+  (least privilege), and every external `uses:` action reference must be pinned
+  to a full 40-character commit SHA (with the single documented exception of the
+  reusable workflow calling the action's own `@v1` release tag).
+
+## Workflow linting and security checks
+
+Workflow files are analyzed in CI using `actionlint` and `zizmor`, as well as
+the vitest suite `tests/unit/workflow-policy.test.ts`.
+
+To run these checks locally:
+
+1. **Policy unit tests**:
+   ```bash
+   npm test
+   # or run the policy test specifically:
+   npx vitest run tests/unit/workflow-policy.test.ts
+   ```
+2. **actionlint** (checks syntax, expression schemas, and runner compatibility):
+   ```bash
+   actionlint .github/workflows/*.yml
+   ```
+   (Install via `go install github.com/rhysd/actionlint/cmd/actionlint@latest` or package manager).
+3. **zizmor** (checks for credential persistence, injection risks, and unpinned actions):
+   ```bash
+   zizmor .github/workflows
+   ```
+   (Install via `pip install zizmor` or `cargo install zizmor`).
+
+Prefer fixing findings directly over suppressing them. Any necessary suppression
+must include an explicit `# zizmor: ignore[rule-name]` comment with a clear,
+justified explanation on the affected line.
 
 ## Commit style
 
@@ -193,33 +296,162 @@ exit-code contract:
 4. add a `MOCK_CANARY_SCENARIO` case exercising the new behavior in
    `tests/fixtures/mock-canary.cjs` before wiring the Action to it.
 
+## Running real-engine compatibility tests
+
+The compatibility workflow (`.github/workflows/engine-compat.yml`) tests the
+Action against real builds of `Protocol-Canary` across all supported
+operating systems (`ubuntu-latest`, `windows-latest`, and `macos-latest`).
+Unlike the mock-based integration suite used during standard CI, this workflow
+exercises the actual engine binary, verifying platform-specific behavior such
+as binary naming (`stellar-canary.exe`), path handling, process spawning, and
+timeouts in `src/runner.ts`.
+
+### Running the workflow manually
+
+The workflow runs on `workflow_dispatch` (manual trigger) and is not part of
+required pull request checks because compiling the engine from source across
+all platforms is resource-intensive.
+
+To trigger the workflow manually:
+
+1. **Via the GitHub web interface:** navigate to **Actions** &rarr;
+   **Engine compatibility**, click **Run workflow**, choose the branch, and
+   provide:
+   - `engine_ref`: the Protocol-Canary tag, branch, or commit to test
+     (for example `v0.2.0` or `main`).
+   - `legacy_ref`: an older Protocol-Canary release (e.g. `v0.1.1`) to ensure
+     backward compatibility.
+2. **Via the GitHub CLI:**
+   ```bash
+   gh workflow run engine-compat.yml -f engine_ref=v0.2.0 -f legacy_ref=v0.1.1
+   ```
+
+To run `tests/integration/real-engine.test.ts` locally, point
+`STELLAR_CANARY_BIN` (and optionally `STELLAR_CANARY_LEGACY_BIN`) to compiled
+engine binaries. When these environment variables are absent, the test suite
+skips cleanly with an informative message rather than failing, keeping
+`npm test` fast for routine local development.
+
+### Understanding platform-specific failures
+
+The matrix is configured with `fail-fast: false`, ensuring a failure on one
+operating system does not cancel execution on the others.
+
+When a compatibility test fails on a specific platform (e.g., Windows or
+macOS) while passing on Linux, it points to platform-specific code in the
+Action rather than an engine logic defect:
+
+- **Executable name and resolution:** Windows binaries require the `.exe`
+  extension (`stellar-canary.exe`). If the binary lookup fails on Windows,
+  verify `binaryName()` in `src/canary.ts` and path resolution logic.
+- **Path separators and argument escaping:** Windows uses backslashes (`\`)
+  and drive letters (`C:\...`), while POSIX platforms use forward slashes (`/`).
+  Arguments passed to `child_process.spawn` must never assume POSIX path
+  conventions or shell expansion.
+- **Line endings:** Outputs and summaries generated on Windows runners can use
+  CRLF (`\r\n`) line endings. Any parsing logic must handle both CRLF and LF.
+- **Process spawning and signal forwarding:** Windows does not support POSIX
+  process signals like `SIGTERM` or `SIGINT` in the same manner as Unix.
+  Timeout handling and process termination in `src/runner.ts` must account for
+  these differences.
+
+## Pinning the fixtures pack (weekly live workflow)
+
+`.github/workflows/weekly-live.yml` checks out
+`StellarCanary/ProtocolCanary-Fixtures` at a recorded immutable commit —
+the full commit SHA behind the `protocol-28` tag, written on the
+"Checkout ProtocolCanary-Fixtures" step — so a scheduled canary changes
+only when the network or the pinned inputs change. A fixture merged into
+the fixtures repository's default branch between runs has no effect on
+Monday's result, and every run prints the commit it actually tested in the
+step summary ("Fixtures pack under test"). This is the same reason the
+repository publishes immutable pack tags in the first place.
+
+**When the pin moves:** only when `ProtocolCanary-Fixtures` publishes a new
+pack release (a new immutable tag — a future `protocol-29`, for example)
+*and* this repository decides to start testing that pack. It never moves
+because something landed on the fixtures default branch, because a network
+changed, or as a side effect of an unrelated pull request here. Each pin
+move is its own pull request.
+
+**Who approves it:** the repository maintainer
+([@Hollujay](https://github.com/Hollujay), the [CODEOWNERS](.github/CODEOWNERS)
+owner), recorded as the approving reviewer on that pull request.
+
+**How to move it:**
+
+1. resolve the new tag to its full (dereferenced) commit SHA:
+
+   ```bash
+   git ls-remote https://github.com/StellarCanary/ProtocolCanary-Fixtures.git refs/tags/<tag>
+   ```
+
+   For an annotated tag take the SHA of the `^{}` (peeled) line — that is
+   the commit, not the tag object.
+2. in `.github/workflows/weekly-live.yml`, replace the SHA in `ref:` on the
+   "Checkout ProtocolCanary-Fixtures" step and update that step's comment
+   (tag name and both SHAs) in the same commit, so the pin stays recorded
+   in exactly one place.
+3. if the new pack lives in a different directory, update `fixtures-dir:`
+   (and the workflow name/header comment) in the same commit.
+4. link the fixtures pack release (and its tracking issue, if any) in the
+   pull request description.
+5. run `actionlint .github/workflows/weekly-live.yml` before requesting
+   review.
+
+Manual dispatch runs may override the pin temporarily with the
+`fixtures_ref` input — any tag, branch, or commit, for example to
+candidate-test a pack before moving the pin. Scheduled runs ignore the
+input and always use the recorded SHA. A `fixtures_ref` that does not
+exist fails the job at checkout with the checkout step's own error; that
+is expected and leaves the pin untouched.
+
 ## Release process
 
-1. Update `CHANGELOG.md`. Link every entry to the pull request that
-   introduced it with a trailing `([#123])` reference — e.g.
-   "- Add the annotations input ([#42])." — so the diff and discussion
-   for a change are one click away. Entries that predate the repository's
-   pull-request workflow (everything up to and including `v0.1.1`)
-   reference the commit that introduced the change instead, as
-   `([0de71ec])`, since no pull request exists for them.
-2. Update the supported-versions table in `SECURITY.md`: add the new
-   version as supported and mark every previously released version
-   unsupported, so the table stays in sync with `CHANGELOG.md`'s
+Before creating a release, ensure all metadata values agree. `.github/workflows/release.yml`
+runs `node scripts/verify-release-tag.mjs "$RELEASE_TAG"` before any installation or build
+steps to enforce that the pushed tag matches `package.json` and `CHANGELOG.md`.
+
+Release checklist:
+
+1. **Update `package.json`**: Bump `"version": "X.Y.Z"` to match the intended release.
+2. **Update `CHANGELOG.md`**:
+   - Ensure `CHANGELOG.md` has a heading matching `## [X.Y.Z]` or `## [X.Y.Z] - YYYY-MM-DD`.
+   - Ensure the release date (`YYYY-MM-DD`) is filled in before tagging.
+   - Move relevant items from `## [Unreleased]` under the new version heading.
+   - Link every entry to the pull request that introduced it with a trailing `([#123])` reference — e.g.
+     "- Add the annotations input ([#42])." — so the diff and discussion
+     for a change are one click away. Entries that predate the repository's
+     pull-request workflow (everything up to and including `v0.1.1`)
+     reference the commit that introduced the change instead, as
+     `([0de71ec])`, since no pull request exists for them.
+3. **Update `SECURITY.md`**: Update the supported-versions table by adding the new
+   version as supported and marking previously released versions
+   unsupported, keeping the table in sync with `CHANGELOG.md`'s
    release history.
-3. Tag `vX.Y.Z` on `main` (annotated tag, matching `package.json`'s
-   version). `.github/workflows/release.yml` verifies the build and tests
-   for that tag and publishes a GitHub Release.
-4. The floating major tag (e.g. `v1`) is moved automatically by
+4. **Tag `vX.Y.Z` on `main`**: Create an annotated tag whose name strictly matches
+   `vX.Y.Z` (matching `package.json`'s version with a leading `v`). Pre-release
+   suffixes (such as `-rc.1`) and unpinned or non-semver tags are rejected.
+   `.github/workflows/release.yml` verifies that the tag, `package.json`, and
+   `CHANGELOG.md` match before running tests and publishing a GitHub Release.
+5. **Floating major tag**: The floating major tag (e.g. `v1`) is moved automatically by
    `.github/workflows/release.yml`, in the same job, after the release is
    created. No manual step is required. The workflow only ever moves the
    major tag forward: it is left untouched when the pushed tag is not the
    newest `vX.Y.Z` in that major line (a re-run, or a tag pushed out of
    order), and pre-1.0 releases publish no floating major tag at all.
 
-   If you need to move a major tag by hand for an exceptional case, use an
-   annotated tag and force-push it — but never do this for a pre-1.0
-   release, and never move a major tag backwards:
+5. A post-release smoke test (`smoke-test` job in `.github/workflows/release.yml`)
+   runs immediately after the release is published. It invokes the Action by
+   its published tag against an offline fixture project to exercise the real
+   release artifact the way a consumer does, verifying `status`, check counts,
+   and JSON report generation.
+
+   To re-run the smoke test manually for an existing published release tag
+   without re-publishing:
    ```bash
-   git tag -fa v1 vX.Y.Z -m "Update v1 to vX.Y.Z"
-   git push origin v1 --force
+   gh workflow run release.yml -f release_tag=v0.1.1
    ```
+   or trigger the **Release** workflow from the Actions tab in GitHub and enter
+   the target tag in the `release_tag` input field.
+

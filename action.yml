@@ -13,9 +13,11 @@ inputs:
   protocol:
     description: >-
       Target Stellar protocol version to check compatibility against
-      (forwarded as `stellar-canary check --protocol`). If omitted, the
-      CLI uses the `protocol` field from the project's
-      `.stellar-canary.toml`, or 28 if there is no configuration file.
+      (forwarded as `stellar-canary check --protocol`). Must be a whole
+      number from 1 to 4294967295 inclusive (the engine's `--protocol` is a
+      u32 and rejects 0). If omitted, the CLI uses the `protocol` field from
+      the project's `.stellar-canary.toml`, or 28 if there is no
+      configuration file.
     required: false
 
   config:
@@ -94,14 +96,17 @@ inputs:
       and the Action fails with a timeout error. Also bounds the
       `cargo install` step (floored at one minute, so a very small value
       set purely for the check cannot break installation); see the README's
-      Timeouts section. It is unrelated to GitHub Actions' own
-      job/step-level `timeout-minutes`, which the platform enforces over
-      the whole job: set any surrounding job- or step-level
-      `timeout-minutes` comfortably higher than this value, otherwise
-      GitHub's own timeout can terminate the step first with a generic
-      error and no Canary summary, annotations, or timeout diagnostic.
-      Non-integer values are truncated, not rejected (for example, "15.9"
-      becomes 15).
+      Timeouts section. Must be a whole number of minutes from 1 to 35791:
+      the value is multiplied by 60,000 and passed to Node's `setTimeout`,
+      which clamps any delay above 2,147,483,647 ms (about 35,791 minutes)
+      and would fire the timer after 1 ms, ending the run almost
+      immediately, so larger values are rejected up front. It is unrelated
+      to GitHub Actions' own job/step-level `timeout-minutes`, which the
+      platform enforces over the whole job: set any surrounding job- or
+      step-level `timeout-minutes` comfortably higher than this value,
+      otherwise GitHub's own timeout can terminate the step first with a
+      generic error and no Canary summary, annotations, or timeout
+      diagnostic.
     required: false
     default: "15"
 
@@ -114,6 +119,73 @@ inputs:
       resolved `version` is 0.2.0 or newer. With an older version it has no
       effect, because those versions already pass an empty run and reject the
       flag. Defaults to `false`.
+    required: false
+    default: "false"
+
+  fixtures-pack-version:
+    description: >-
+      Release tag of the fixture pack to run against, for example `v1.2.0`
+      (the leading `v` is optional). Validated for format when set, and an
+      unpinned value such as `latest` or `main` is rejected outright, the
+      same way `version` refuses to track a moving reference.
+      Currently *not forwarded* to Canary: `stellar-canary check` has no
+      fixture-pack flag — its fixture-loading contract accepts a local path
+      via `fixtures-dir` and defines no other loading mechanism — so pinning a
+      pack still means checking out that pack's tag into `fixtures-dir`.
+      The Action logs a note when this input is set.
+    required: false
+
+  fixtures-pack-protocol:
+    description: >-
+      Protocol version the fixture pack is pinned to, as a positive integer,
+      for example `28`. Zero is rejected, as is anything above 4294967295;
+      `protocol` accepts the same 1-to-4294967295 range.
+      Currently *not forwarded* to Canary, for the same reason as
+      `fixtures-pack-version`; the Action logs a note when it is set. The
+      protocol a run actually checks is controlled by `protocol`.
+    required: false
+
+  github-token:
+    description: >-
+      GitHub token used to authenticate read-only GitHub REST API requests
+      to the public `StellarCanary/Protocol-Canary` repository (tag and release
+      lookups). Defaults to the workflow's `github.token`. If set to a non-empty value,
+      it takes precedence over the `GITHUB_TOKEN` environment variable. If empty
+      or unset, the `GITHUB_TOKEN` environment variable is used if present;
+      otherwise unauthenticated requests are made. Requires only `contents: read`
+      permission, which works even in fork pull requests. Set to an empty string
+      (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
+    required: false
+    default: ${{ github.token }}
+  strict-integrity:
+    description: >-
+      Optional fail-closed integrity policy (issue #372). Defaults to `false`,
+      preserving today's behaviour: when the published SHA-256 checksum for
+      the resolved release is missing or does not cover this platform, the
+      Action degrades to commit/tag pinning with a debug note. Set to `true`
+      to abort instead whenever binary integrity cannot be proven - no
+      published checksum manifest, no manifest entry for this platform, or a
+      checksum lookup that could not be completed (for example a redirected
+      or unencrypted manifest request). A checksum mismatch aborts the run in
+      either mode. Be honest about what "proven" means (decision D-07): a
+      checksum verifies data integrity, not the release author's identity or
+      endorsement, and release signing is deferred; the download-redirect
+      allowlist policy (D-11) remains blocked until verified against real
+      release hosts, so no redirect is followed at all today.
+    required: false
+    default: "false"
+
+  generate-receipt:
+    description: >-
+      Generate a machine-readable Execution Receipt (`receiptVersion: 1`)
+      recording the provenance of this run — engine version, engine build
+      commit, fixture-pack digest, target protocol, observed protocol, and
+      timestamp — write it to the runner temp directory, and upload it as
+      the workflow artifact `stellar-canary-receipt-<run-id>`. Defaults to
+      `false`; set to `true` to opt in. The receipt is a lightweight
+      provenance record, not a signed cryptographic attestation. Fields the
+      engine's report does not carry (for example older releases without
+      `engineCommit`/`packDigest`) are recorded as `unknown`.
     required: false
     default: "false"
 
@@ -131,12 +203,43 @@ outputs:
     description: Number of checks that failed a compatibility assertion.
   errors:
     description: Number of checks that could not complete due to an execution error.
+  total:
+    description: >-
+      Total number of checks in the report counts. Explicitly set to `0` on
+      an execution failure, like the other counts.
+  skipped:
+    description: >-
+      Number of checks skipped. Explicitly set to `0` on an execution failure,
+      like the other counts.
+  replayed-count:
+    description: >-
+      Number of checks whose results were replayed from Protocol Canary's
+      result cache instead of executed in this run (a result with
+      `source: "cache"`, or an equivalent replayed/cached flag). Counts
+      results carrying any replayed marker; engines whose reports predate
+      the cache produce `0`. Explicitly set to `0` on an execution failure,
+      like the other counts.
+  engine-version:
+    description: >-
+      Protocol Canary engine version that produced the result, read from the
+      installed binary. On an execution failure, set to the resolved version if
+      installation succeeded, or an empty string if installation failed.
+  observed-protocol:
+    description: >-
+      Stellar protocol version reported by the network during live checks
+      (`network.observedProtocol`), or an empty string when the report has no
+      network object. Explicitly set to an empty string on an execution failure.
   report:
     description: >-
       Absolute path to the generated JSON report file. Only set when Canary
       produced output to parse; empty/unset on an execution failure (when
       status is `execution-failed`), unlike `passed`/`warnings`/`failures`/`errors`,
       which are explicitly set to `0` in that case.
+  receipt-path:
+    description: >-
+      Absolute path to the generated Execution Receipt JSON. Only set when
+      `generate-receipt` is `true` and Canary produced a parseable report;
+      unset otherwise, including on an execution failure.
 
 runs:
   using: node24

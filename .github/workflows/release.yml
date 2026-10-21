@@ -4,23 +4,39 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to smoke test (e.g. v0.1.1). When specified, skips publishing and only runs the smoke test.
+        required: false
+        default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     name: verify and publish
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
+        # zizmor: ignore[artipacked] release job must push floating major tag with repository credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        # zizmor: ignore[cache-poisoning] release workflow runs only on trusted maintainer pushed tags
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           cache: npm
+
+      - name: Verify release tag matches package.json and CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/verify-release-tag.mjs "$RELEASE_TAG"
 
       - name: Install dependencies
         run: npm ci
@@ -45,6 +61,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
+        # zizmor: ignore[superfluous-actions] action-gh-release handles asset uploads and automatic release notes cleanly
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
@@ -87,3 +104,85 @@ jobs:
           git tag -fa "$major" "$commit" -m "Update ${major} to ${RELEASE_TAG}"
           git push origin "refs/tags/${major}" --force
           echo "::notice::Moved ${major} to ${RELEASE_TAG} (${commit})."
+
+  smoke-test:
+    name: smoke test
+    needs: [release]
+    if: always() && (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve release tag
+        id: resolve-tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$REF_NAME}"
+          if [ -z "$tag" ]; then
+            echo "::error::No release tag specified to smoke test"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout fixture project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Checkout published Action release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: StellarCanary/ProtocolCanary-Action
+          ref: ${{ steps.resolve-tag.outputs.tag }}
+          path: .published-action
+          persist-credentials: false
+
+      - name: Setup Node.js
+        # zizmor: ignore[cache-poisoning] smoke-test runs standalone node runtime without caching
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+
+      - name: Run published Action
+        id: canary
+        uses: ./.published-action # zizmor: ignore[self-repository] invokes published release tag checked out at runtime
+        with:
+          config: tests/fixtures/real-engine/offline.stellar-canary.toml
+          fixtures-dir: tests/fixtures/real-engine/fixtures
+          version: "0.1.1"
+          protocol: 28
+          allow-empty: "false"
+
+      - name: Verify smoke test outputs
+        shell: bash
+        env:
+          STATUS: ${{ steps.canary.outputs.status }}
+          PASSED: ${{ steps.canary.outputs.passed }}
+          REPORT: ${{ steps.canary.outputs.report }}
+        run: |
+          set -euo pipefail
+
+          echo "Status: $STATUS"
+          echo "Passed count: $PASSED"
+          echo "Report path: $REPORT"
+
+          if [ "$STATUS" != "pass" ]; then
+            echo "::error::Expected status 'pass', got '$STATUS'"
+            exit 1
+          fi
+
+          if [ -z "$PASSED" ] || [ "$PASSED" -le 0 ]; then
+            echo "::error::Expected passed count > 0, got '$PASSED'"
+            exit 1
+          fi
+
+          if [ -z "$REPORT" ] || [ ! -f "$REPORT" ]; then
+            echo "::error::Report file missing or not found at '$REPORT'"
+            exit 1
+          fi
+
+          echo "Smoke test of published release tag passed successfully."

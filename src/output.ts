@@ -9,6 +9,118 @@ import { InvalidReportError } from "./errors";
  */
 export const SUPPORTED_SCHEMA_VERSION = 1;
 
+/**
+ * Validates that a value is a non-empty string. Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requireNonEmptyString(value: unknown, fieldPath: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an empty "${fieldPath}" field.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a value is a positive integer (>= 1). Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requirePositiveInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected a positive integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a value is a non-negative integer (>= 0). Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requireNonNegativeInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected a non-negative integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates the project object has required name and type fields.
+ */
+function validateProject(project: unknown, fieldPath: string): { readonly name: string; readonly type: string } {
+  if (typeof project !== "object" || project === null) {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an invalid "${fieldPath}" field: expected an object.`);
+  }
+  const p = project as Record<string, unknown>;
+  const name = requireNonEmptyString(p.name, `${fieldPath}.name`);
+  const type = requireNonEmptyString(p.type, `${fieldPath}.type`);
+  return { name, type };
+}
+
+/**
+ * Validates the network object if present.
+ */
+function validateNetwork(network: unknown, fieldPath: string): { readonly name: string; readonly observedProtocol?: number } | undefined {
+  if (network === undefined || network === null) {
+    return undefined;
+  }
+  if (typeof network !== "object") {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected an object or null.`);
+  }
+  const n = network as Record<string, unknown>;
+  const name = requireNonEmptyString(n.name, `${fieldPath}.name`);
+  let observedProtocol: number | undefined;
+  if (n.observedProtocol !== undefined) {
+    observedProtocol = requirePositiveInteger(n.observedProtocol, `${fieldPath}.observedProtocol`);
+  }
+  if (n.error !== undefined && typeof n.error !== "string") {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}.error" field: expected a string.`);
+  }
+  return observedProtocol !== undefined ? { name, observedProtocol } : { name };
+}
+
+/**
+ * Validates the counts object and checks agreement with results/skipped.
+ */
+function validateCounts(
+  counts: unknown,
+  results: readonly CanaryResult[],
+  skipped: readonly CanarySkip[] | undefined,
+  fieldPath: string,
+): CanaryCounts {
+  if (typeof counts !== "object" || counts === null) {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an invalid "${fieldPath}" field: expected an object.`);
+  }
+  const c = counts as Partial<CanaryCounts>;
+  const total = requireNonNegativeInteger(c.total, `${fieldPath}.total`);
+  const passed = requireNonNegativeInteger(c.passed, `${fieldPath}.passed`);
+  const failed = requireNonNegativeInteger(c.failed, `${fieldPath}.failed`);
+  const warnings = requireNonNegativeInteger(c.warnings, `${fieldPath}.warnings`);
+  const errors = requireNonNegativeInteger(c.errors, `${fieldPath}.errors`);
+  const skippedCount = requireNonNegativeInteger(c.skipped, `${fieldPath}.skipped`);
+
+  const validated: CanaryCounts = { total, passed, failed, warnings, errors, skipped: skippedCount };
+
+  // Verify agreement with results and skipped
+  const derived = deriveCounts(results, skipped);
+  if (
+    validated.total !== derived.total ||
+    validated.passed !== derived.passed ||
+    validated.failed !== derived.failed ||
+    validated.warnings !== derived.warnings ||
+    validated.errors !== derived.errors ||
+    validated.skipped !== derived.skipped
+  ) {
+    throw new InvalidReportError(
+      `Canary's JSON output has a "${fieldPath}" field that disagrees with results/skipped: ` +
+        `expected total=${derived.total}, passed=${derived.passed}, failed=${derived.failed}, ` +
+        `warnings=${derived.warnings}, errors=${derived.errors}, skipped=${derived.skipped}; ` +
+        `got total=${validated.total}, passed=${validated.passed}, failed=${validated.failed}, ` +
+        `warnings=${validated.warnings}, errors=${validated.errors}, skipped=${validated.skipped}.`,
+    );
+  }
+
+  return validated;
+}
+
 export type Surface = "xdr" | "rpc" | "soroban";
 export type ResultStatus = "pass" | "warning" | "fail" | "error" | "skipped";
 export type OverallStatus = "pass" | "warning" | "fail" | "error";
@@ -22,6 +134,23 @@ export interface CanaryResult {
   readonly details?: string;
   readonly durationMs: number;
   readonly fixtureId: string | null;
+  /**
+   * Where this result came from, per CF-01 §6/§4 reserved field:
+   * `"live"` (executed in this run), `"cache"` (replayed from the engine's
+   * result cache), or absent/not-recorded (reports from engines that predate
+   * the cache). An unknown value is deliberately typed as a plain `string`
+   * and read as *not recorded*, exactly as the contract prescribes — the
+   * Action must never assume a result was live.
+   */
+  readonly source?: string;
+  /**
+   * Boolean spellings of {@link CanaryResult.source} some engines may emit
+   * for a cached replay. Honored alongside `source: "cache"` so a replayed
+   * result is flagged whichever form the report uses.
+   */
+  readonly replayed?: boolean;
+  /** Boolean companion to {@link CanaryResult.replayed} ("cached: true"). */
+  readonly cached?: boolean;
 }
 
 export interface CanarySkip {
@@ -36,7 +165,7 @@ export interface CanaryCounts {
   readonly failed: number;
   readonly warnings: number;
   readonly errors: number;
-  readonly skipped: number;
+  readonly skipped?: number;
 }
 
 export interface CanaryReport {
@@ -67,7 +196,7 @@ function isCountsShape(value: unknown): value is CanaryCounts {
     typeof candidate.failed === "number" &&
     typeof candidate.warnings === "number" &&
     typeof candidate.errors === "number" &&
-    typeof candidate.skipped === "number"
+    (typeof candidate.skipped === "number" || candidate.skipped === undefined)
   );
 }
 
@@ -198,6 +327,12 @@ export function parseReport(stdout: string): CanaryReport {
     throw new InvalidReportError("Canary's JSON output does not match the documented report shape.");
   }
 
+  // Validate required fields that the renderer and annotation code depend on
+  const toolVersion = requireNonEmptyString(report.toolVersion, "toolVersion");
+  const targetProtocol = requirePositiveInteger(report.targetProtocol, "targetProtocol");
+  const project = validateProject(report.project, "project");
+  const network = validateNetwork(report.network, "network");
+
   const rawResults: unknown[] = report.results;
   for (const [index, entry] of rawResults.entries()) {
     const problem = resultShapeError(entry);
@@ -208,6 +343,25 @@ export function parseReport(stdout: string): CanaryReport {
     }
   }
   const results = rawResults as CanaryResult[];
+
+  // CF-01 section 4: a result is identified inside one report by
+  // `(surface, fixtureId)`, using `testId` when `fixtureId` is absent. A
+  // report in which two results share an identity is invalid and must be
+  // rejected by consumers — otherwise duplicated entries could skew the
+  // derived counts or mask a real failure behind a copy of a passing result.
+  const seenIdentities = new Set<string>();
+  for (const [index, result] of results.entries()) {
+    const id = result.fixtureId ?? result.testId;
+    const identity = `${result.surface}:${id}`;
+    if (seenIdentities.has(identity)) {
+      throw new InvalidReportError(
+        `Canary's JSON output contains a duplicate result identity: ` +
+          `(surface, id) = ("${result.surface}", "${id}") appears more than once ` +
+          `(results[${String(index)}]).`,
+      );
+    }
+    seenIdentities.add(identity);
+  }
 
   if (report.skipped !== undefined && !Array.isArray(report.skipped)) {
     throw new InvalidReportError(
@@ -224,9 +378,63 @@ export function parseReport(stdout: string): CanaryReport {
     }
   }
   const skipped = report.skipped as CanarySkip[] | undefined;
-  const counts = isCountsShape(report.counts) ? report.counts : deriveCounts(results, skipped);
 
-  return { ...report, results, skipped, counts } as CanaryReport;
+  // Validate counts if present and complete; otherwise derive.
+  // A malformed counts field (missing fields, wrong types) is silently
+  // replaced by derived counts, preserving the behavior older engines rely
+  // on. A well-formed counts field that disagrees with results/skipped is
+  // rejected. Engines that predate the `skipped` count omit only that one
+  // field: the rest of their counts are preserved and `skipped` is populated
+  // from the skipped array, exactly as before.
+  const rawCounts = isCountsShape(report.counts) ? report.counts : undefined;
+  let counts: CanaryCounts;
+  if (rawCounts === undefined) {
+    counts = deriveCounts(results, skipped);
+  } else if (rawCounts.skipped === undefined) {
+    counts = { ...rawCounts, skipped: skipped?.length ?? 0 };
+  } else {
+    counts = validateCounts(rawCounts, results, skipped, "counts");
+  }
+
+  // Spread the raw report so reserved/additive fields this Action does not
+  // (yet) model — `engineCommit`, `packDigest`, `network.error`, … — survive
+  // parsing for downstream consumers such as the Execution Receipt. The
+  // validated fields below overwrite their raw counterparts.
+  return {
+    ...report,
+    toolVersion,
+    targetProtocol,
+    project,
+    ...(network !== undefined ? { network } : {}),
+    status: report.status,
+    counts,
+    results,
+    skipped,
+    git: report.git ?? { commit: null, branch: null, isDirty: null },
+  } as CanaryReport;
+}
+
+/**
+ * Whether a result was replayed from the engine's result cache rather than
+ * executed in this run (CF-01 §6). `source: "cache"` is the contract's
+ * spelling; the boolean `replayed`/`cached` attributes are honored too.
+ * Anything else — including an unknown or absent `source` — is *not
+ * recorded*, never assumed live and never counted as replayed.
+ */
+export function isReplayed(result: CanaryResult): boolean {
+  if (result.source === "cache") {
+    return true;
+  }
+  return result.replayed === true || result.cached === true;
+}
+
+/**
+ * How many of the report's results were replayed from cache. Reports from
+ * engines without the cache simply have no replayed results — this counts,
+ * it never throws.
+ */
+export function countReplayed(report: CanaryReport): number {
+  return report.results.filter(isReplayed).length;
 }
 
 export type ExitCodeCategory =
@@ -251,9 +459,18 @@ interface ExitCodeInfo {
  */
 const EXIT_CODES: Readonly<Record<number, ExitCodeInfo>> = {
   0: { category: "pass", description: "Compatibility checks passed." },
-  1: { category: "compatibility_failure", description: "A compatibility check failed." },
-  2: { category: "configuration_error", description: "Canary configuration is invalid." },
-  3: { category: "execution_error", description: "Execution or RPC communication failed." },
+  1: {
+    category: "compatibility_failure",
+    description: "Test failures detected: a compatibility assertion failed.",
+  },
+  2: {
+    category: "configuration_error",
+    description: "Regression gate triggered or Canary configuration is invalid.",
+  },
+  3: {
+    category: "execution_error",
+    description: "Unexpected runtime crash: execution or RPC communication failed.",
+  },
   4: { category: "invalid_fixture", description: "One or more fixtures are invalid." },
   5: { category: "internal_error", description: "Canary encountered an internal error." },
 };

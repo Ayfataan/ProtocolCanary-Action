@@ -16,10 +16,114 @@ export interface ActionInputs {
   readonly timeoutMinutes: number;
   /** Pass `--allow-empty` to engines that support it (0.2.0 and newer). */
   readonly allowEmpty: boolean;
+  /** Release tag of the fixture pack to run against, e.g. `v1.2.0`, kept as
+   * written (leading `v` optional). Validated for format only — see
+   * {@link parseFixturesPackVersion} for why it is not forwarded yet. */
+  readonly fixturesPackVersion: string | undefined;
+  /** Protocol version the fixture pack is pinned to, as a positive integer.
+   * Validated for format only — see {@link parseFixturesPackProtocol}. */
+  readonly fixturesPackProtocol: number | undefined;
+  /** GitHub token for authenticating read-only API calls (tag and checksum lookups). */
+  readonly githubToken: string | undefined;
+  /** Opt in to producing an Execution Receipt (#360) and exporting it as a
+   * workflow artifact (#362). Parses the documented boolean literals strictly
+   * and defaults to `false` when the input is omitted (#361). */
+  readonly generateReceipt: boolean;
+  /** Fail closed whenever binary integrity cannot be proven (issue #372).
+   * Default `false` preserves the historical degrade-to-pinning behaviour. */
+  readonly strictIntegrity: boolean;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;
 const PROTOCOL_LIKE = /^\d+$/;
+
+/** An unsigned decimal integer written with ASCII digits only: no sign, no
+ * decimal point, no exponent, no hex or other prefix, no internal
+ * whitespace. The whole trimmed string must match, so a value such as
+ * "1e3" or "5 minutes" is rejected rather than prefix-parsed. */
+const DECIMAL_INTEGER = /^[0-9]+$/;
+
+/** The engine's `--protocol` is a u32 and the engine rejects 0
+ * ("--protocol must be a positive protocol version number"), so the Action
+ * accepts 1 to 4294967295 inclusive; 0 and anything above u32 max are
+ * rejected up front with a clear, input-naming message. */
+const PROTOCOL_MIN = 1;
+const PROTOCOL_MAX = 4294967295;
+
+/**
+ * Largest whole number of minutes whose millisecond value is at most Node's
+ * `setTimeout` limit (2,147,483,647 ms, about 35,791 minutes).
+ * 35791 * 60_000 = 2,147,460,000 ms fits; 35792 * 60_000 =
+ * 2,147,520,000 ms overflows and Node clamps the timer to fire after 1 ms,
+ * ending the run almost immediately — so larger values are rejected up
+ * front.
+ */
+export const TIMEOUT_MINUTES_MAX = Math.floor(2_147_483_647 / 60_000); // 35791
+const TIMEOUT_MINUTES_MIN = 1;
+
+/**
+ * Parses a decimal integer from the whole trimmed string: ASCII digits only
+ * (`^[0-9]+$`), converted with `Number`, rejected when the result is not a
+ * safe integer or falls outside `[min, max]`. Throws {@link InvalidInputError}
+ * naming the input, quoting the value with `JSON.stringify`, and stating the
+ * accepted range. Leading zeros are accepted ("028" → 28), as they are still
+ * digits. Returns `undefined` for an empty or whitespace-only input.
+ */
+function parseDecimalInteger(
+  raw: string,
+  inputName: string,
+  min: number,
+  max: number,
+): number | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!DECIMAL_INTEGER.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "${inputName}" input: ${JSON.stringify(value)}. ` +
+        `Expected an unsigned decimal integer (ASCII digits only) from ${min} to ${max}, e.g. "28".`,
+    );
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new InvalidInputError(
+      `Invalid "${inputName}" input: ${JSON.stringify(value)}. ` +
+        `Expected an unsigned decimal integer from ${min} to ${max}, e.g. "28".`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Resolves the GitHub token to use for GitHub API requests according to the precedence rules:
+ * 1. Non-empty (after trimming) explicit token / action input value wins.
+ * 2. Otherwise a non-empty `GITHUB_TOKEN` environment variable.
+ * 3. Otherwise `undefined` (unauthenticated). Whitespace-only values count as empty.
+ */
+export function resolveGithubToken(explicitToken?: string): string | undefined {
+  const inputCandidate = explicitToken?.trim();
+  if (inputCandidate !== undefined && inputCandidate !== "") {
+    return inputCandidate;
+  }
+  const envCandidate = process.env.GITHUB_TOKEN?.trim();
+  if (envCandidate !== undefined && envCandidate !== "") {
+    return envCandidate;
+  }
+  return undefined;
+}
+
+/**
+ * A fixture-pack release tag: semver-shaped, with an optional leading `v` and
+ * the optional SemVer prerelease (`-rc.1`) and build (`+sha.abc`) suffixes a
+ * published release may carry.
+ *
+ * Deliberately does *not* accept `latest`, `main`, or any other moving
+ * reference: this repository pins the engine (`version`) and never tracks an
+ * unpinned build, and a reproducibility-oriented pack pin that silently
+ * followed a branch would defeat its own purpose.
+ */
+const PACK_VERSION_LIKE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 /** Reads and validates every Action input. Throws {@link InvalidInputError} or
  * {@link ConfigNotFoundError} on the first problem found. */
@@ -34,6 +138,29 @@ export function getInputs(): ActionInputs {
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
+  const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
+  const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
+  const githubToken = resolveGithubToken(core.getInput("github-token"));
+
+  if (githubToken !== undefined) {
+    core.setSecret(githubToken);
+  }
+  const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+
+  const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
+
+  // A validated input that silently does nothing is worse than a missing one:
+  // it reads as "my pack is pinned" when the run used whatever
+  // `--fixtures-dir` happened to contain. Say so explicitly, the same way an
+  // `allow-empty` that cannot apply to the resolved engine is reported.
+  if (fixturesPackVersion !== undefined || fixturesPackProtocol !== undefined) {
+    core.info(
+      `"fixtures-pack-version"/"fixtures-pack-protocol" are accepted and validated, but not ` +
+        "forwarded to Canary: `stellar-canary check` loads fixtures only from a local " +
+        "--fixtures-dir and has no fixture-pack flag. This run used " +
+        `${JSON.stringify(fixturesDir)} as its fixtures directory.`,
+    );
+  }
 
   return {
     protocol,
@@ -46,7 +173,80 @@ export function getInputs(): ActionInputs {
     annotations,
     timeoutMinutes,
     allowEmpty,
+    fixturesPackVersion,
+    fixturesPackProtocol,
+    githubToken,
+    generateReceipt,
+    strictIntegrity,
   };
+}
+
+/**
+ * Validates the "fixtures-pack-version" input as a published fixture-pack
+ * release tag; `undefined` when unset. Throws {@link InvalidInputError},
+ * naming the input and an accepted example, for anything else.
+ *
+ * The validated value is returned as written (only surrounding whitespace
+ * trimmed) rather than normalized the way `version` is, because it identifies
+ * an already-published pack release: there is no tag to reconstruct from it,
+ * and stripping a leading `v` would lose the caller's exact token.
+ *
+ * **Not forwarded to the CLI.** `stellar-canary check` has no fixture-pack
+ * flag: its fixture-loading contract accepts a local path via `--fixtures-dir`
+ * and states there is "no other loading mechanism — no network fetch, no
+ * package registry, no database", with remote bundles fetched by version
+ * explicitly out of scope upstream for now
+ * (`Protocol-Canary`'s `docs/fixture-contract.md`, sections 1 and 8). Parsing
+ * and validating the input here is what the issue asks for; wiring it to the
+ * invocation has to wait for an upstream flag to forward it to. See the
+ * informational note in {@link getInputs}.
+ */
+function parseFixturesPackVersion(raw: string): string | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!PACK_VERSION_LIKE.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-pack-version" input: ${JSON.stringify(value)}. ` +
+        'Expected a fixture-pack release tag, e.g. "v1.2.0" or "1.2.0" ' +
+        "(an unpinned value such as \"latest\" or \"main\" is not accepted).",
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the "fixtures-pack-protocol" input as a **positive** integer
+ * string; `undefined` when unset. Throws {@link InvalidInputError}, naming the
+ * input and an accepted example, for anything else.
+ *
+ * Unlike the `protocol` input — which accepts `0` because a non-negative
+ * integer is the right shape there — zero is rejected here: a pack pinned to
+ * protocol 0 is not a pack anyone publishes, so accepting it would only defer
+ * the error to somewhere less actionable.
+ *
+ * Not forwarded to the CLI, for the same reason as
+ * {@link parseFixturesPackVersion}.
+ */
+function parseFixturesPackProtocol(raw: string): number | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!PROTOCOL_LIKE.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-pack-protocol" input: ${JSON.stringify(value)}. Expected a positive integer, e.g. "28".`,
+    );
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (parsed <= 0 || !Number.isSafeInteger(parsed)) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-pack-protocol" input: ${JSON.stringify(value)}. ` +
+        "Expected a positive integer that fits in a JavaScript safe integer, e.g. \"28\".",
+    );
+  }
+  return parsed;
 }
 
 /** Normalizes a raw Action input: returns undefined for an empty or
@@ -55,20 +255,11 @@ function optional(value: string): string | undefined {
   return value.trim() === "" ? undefined : value.trim();
 }
 
-/** Validates the "protocol" input as a non-negative integer string (digits
- * only, e.g. "28"); undefined when unset. Throws {@link InvalidInputError}
- * for anything else. */
+/** Validates the "protocol" input as an unsigned decimal integer from 1 to
+ * 4294967295 inclusive (the engine's `--protocol` is a u32 and rejects 0);
+ * undefined when unset. Throws {@link InvalidInputError} for anything else. */
 function parseProtocol(raw: string): number | undefined {
-  const value = optional(raw);
-  if (value === undefined) {
-    return undefined;
-  }
-  if (!PROTOCOL_LIKE.test(value)) {
-    throw new InvalidInputError(
-      `Invalid "protocol" input: ${JSON.stringify(value)}. Expected a non-negative integer, e.g. "28".`,
-    );
-  }
-  return Number.parseInt(value, 10);
+  return parseDecimalInteger(raw, "protocol", PROTOCOL_MIN, PROTOCOL_MAX);
 }
 
 /** Validates the "config" input as a path to an existing regular file,
@@ -165,14 +356,19 @@ function parseBoolean(name: string, raw: string): boolean {
   );
 }
 
-/** Validates the "timeout-minutes" input as a positive integer. Throws
- * {@link InvalidInputError} for zero, negative, or non-numeric input. */
+/** Validates the "timeout-minutes" input as an unsigned decimal integer from
+ * 1 to {@link TIMEOUT_MINUTES_MAX} inclusive (35,791 minutes: the largest
+ * whole number of minutes whose millisecond value fits Node's `setTimeout`
+ * limit). Throws {@link InvalidInputError} for zero, negative, non-numeric,
+ * out-of-range, or non-whole input. The default of 15 and the one-minute
+ * floor for `cargo install` are unchanged. */
 function parseTimeout(raw: string): number {
-  const value = Number.parseInt(raw.trim(), 10);
-  if (!Number.isFinite(value) || value <= 0) {
+  const parsed = parseDecimalInteger(raw, "timeout-minutes", TIMEOUT_MINUTES_MIN, TIMEOUT_MINUTES_MAX);
+  if (parsed === undefined) {
     throw new InvalidInputError(
-      `Invalid "timeout-minutes" input: ${JSON.stringify(raw)}. Expected a positive integer.`,
+      `Invalid "timeout-minutes" input: ${JSON.stringify(raw)}. ` +
+        `Expected an unsigned decimal integer from 1 to ${TIMEOUT_MINUTES_MAX}, e.g. "15".`,
     );
   }
-  return value;
+  return parsed;
 }
