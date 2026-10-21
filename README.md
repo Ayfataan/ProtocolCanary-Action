@@ -476,3 +476,5 @@ comparison, fixture releases, project roots) are specified in
 ## License
 
 [Apache-2.0](LICENSE)
+
+<!-- Tracking note for upstream issue #493: Execution Receipt paths must be unique per invocation to avoid overwrites when RUNNER_TEMP is shared. This note does not implement the fix. -->
