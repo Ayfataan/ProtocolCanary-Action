@@ -6,7 +6,7 @@
  * the MOCK_CANARY_SCENARIO environment variable; MOCK_CANARY_VERSION
  * overrides the version string reported by `version`.
  *
- * Supported scenarios: pass, pass-no-counts, pass-with-result-source, warning,
+ * Supported scenarios: pass, pass-network, pass-no-counts, pass-with-result-source, warning,
  * fail, config-error, empty-run, rpc-error, fixture-error, internal-error,
  * malformed-json, timeout.
  */
@@ -115,6 +115,29 @@ switch (scenario) {
     emit(
       baseReport({
         status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [
+          {
+            testId: "p28-xdr-cap83-empty-tx-set",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "StellarValue round-tripped byte-for-byte",
+            durationMs: 1,
+            fixtureId: "p28-xdr-cap83-empty-tx-set",
+          },
+        ],
+      }),
+      0,
+    );
+    break;
+  }
+
+  case "pass-network": {
+    emit(
+      baseReport({
+        status: "pass",
+        network: { name: "testnet", observedProtocol: 28 },
         counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
         results: [
           {
