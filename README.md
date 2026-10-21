@@ -87,6 +87,32 @@ including that Protocol 28 one, which checks out the real
 one that runs on a self-hosted runner
 ([`examples/self-hosted.yml`](examples/self-hosted.yml)).
 
+## Checking many projects in parallel (matrix examples)
+
+Monorepos that contain several contracts or services usually want to run a
+Canary check for each of them, in parallel, and then see one combined result.
+Two maintained example workflows cover that pattern
+([`.github/workflows/examples/`](.github/workflows/examples/)):
+
+- [`matrix-check.yml`](.github/workflows/examples/matrix-check.yml) runs the
+  Action once per matrix target. Each leg resolves its own `project-root`
+  (fixtures and config are derived from it, so legs never touch the same
+  paths), disables the Action's fixed-name report upload, and uploads the
+  JSON report itself under a target-unique artifact name
+  (`report-${{ matrix.target }}`) so parallel legs can never overwrite each
+  other's results.
+- [`matrix-aggregation.yml`](.github/workflows/examples/matrix-aggregation.yml)
+  adds an `aggregate` job that runs with `if: always()`, downloads every
+  `report-*` artifact without merging them, and renders one consolidated
+  Markdown table into the GitHub job summary. A target whose report never
+  arrived is highlighted as **missing** in the table instead of crashing the
+  aggregation, so a partially-failed matrix still produces a single clear
+  overview.
+
+Both files live under `.github/workflows/examples/`, which GitHub does not
+execute — copy them into your own `.github/workflows/` and replace the
+example matrix entries with your projects' paths.
+
 ## Example workflow
 
 ```yaml
@@ -114,7 +140,7 @@ jobs:
 
 | Input | Description | Default |
 |---|---|---|
-| `protocol` | Target Stellar protocol version (`--protocol`). | (from `.stellar-canary.toml`, or 28) |
+| `protocol` | Target Stellar protocol version (`--protocol`), a whole number from 1 to 4294967295 (the engine rejects 0). | (from `.stellar-canary.toml`, or 28) |
 | `config` | Path to `.stellar-canary.toml` (`--config`). Fails clearly if the given path does not exist, or is not a regular file (e.g. a directory). | (CLI default lookup) |
 | `network` | Network for live RPC/Soroban checks (`--network`). | `testnet` (CLI default) |
 | `rpc-url` | Stellar RPC endpoint (`--rpc-url`). Must be `https://`, or `http://localhost`/`127.0.0.1` for local development. | (none) |
@@ -123,7 +149,10 @@ jobs:
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
-| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
+| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
+| `github-token` | GitHub token used to authenticate read-only requests to `api.github.com` for version resolution and checksum discovery, raising GitHub API rate limits. Defaults to `${{ github.token }}`. Pass an empty string (`""`) to disable authenticated requests. Requires only `contents: read` permission and works on fork pull requests. | `${{ github.token }}` |
+| `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
+| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected, as with `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
 
 There is deliberately no `format` input: the Action always requests
 `--format json` from the CLI (the only way it can build the summary and
@@ -132,7 +161,7 @@ annotations), and never invokes Canary twice to get a second format.
 ## Outputs
 
 All values are strings, as GitHub Actions outputs always are. The counts
-(`passed`, `warnings`, `failures`, `errors`) are decimal-string integers
+(`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are decimal-string integers
 (rendered with `String(n)`), and `status` is one of the five fixed
 literals below.
 
@@ -143,6 +172,11 @@ literals below.
 | `warnings` | Number of checks that produced a warning. | `"1"` |
 | `failures` | Number of checks that failed a compatibility assertion. | `"2"` |
 | `errors` | Number of checks that could not complete due to an execution error. | `"0"` |
+| `total` | Total number of checks in the report counts. Explicitly set to `0` on an execution failure, like the other counts. | `"15"` |
+| `skipped` | Number of checks skipped. Explicitly set to `0` on an execution failure, like the other counts. | `"0"` |
+| `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. Explicitly set to `0` on an execution failure, like the other counts. | `"3"` |
+| `engine-version` | Protocol Canary engine version that produced the result, read from the installed binary. On an execution failure, set to the resolved version if installation succeeded, or an empty string if installation failed. | `"0.1.1"` |
+| `observed-protocol` | Stellar protocol version reported by the network during live checks (`network.observedProtocol`), or an empty string when the report has no network object. Explicitly set to an empty string on an execution failure. | `"28"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
@@ -155,8 +189,9 @@ A concrete consumer, using the outputs to gate a follow-up step:
 - name: React to the result
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
+```
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`) are all explicitly set to the string `"0"`. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol` is set to an empty string `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 
 ## How failures appear
 
@@ -308,7 +343,7 @@ what to do about each.
 
 | Message (step log / job summary) | Meaning | What to do |
 |---|---|---|
-| ``The `cargo` command was not found on this runner. …`` | No Rust toolchain is available, so the Action cannot build Canary from source. | On a self-hosted or non-Ubuntu runner, install a toolchain first — e.g. a `dtolnay/rust-toolchain` step ahead of this Action; [`examples/self-hosted.yml`](examples/self-hosted.yml) shows a complete workflow. GitHub-hosted Ubuntu runners include one by default; seeing this there usually means an earlier step removed it from `PATH`. |
+| ``The `cargo` command was not found on this runner. …`` | This Action prefers a prebuilt Protocol-Canary release binary when one exists for this platform and version and falls back to building from source only when no usable prebuilt asset was found — so this error means neither path is available: no usable prebuilt release (or no checksum manifest for one) and no Rust toolchain. | On a self-hosted or non-Ubuntu runner, install a toolchain first — e.g. a `dtolnay/rust-toolchain` step ahead of this Action; [`examples/self-hosted.yml`](examples/self-hosted.yml) shows a complete workflow. GitHub-hosted Ubuntu runners include one by default; seeing this there usually means an earlier step removed it from `PATH`. |
 | ``` `cargo install` exited with code 101 while installing Protocol-Canary … ``` | The source build failed — most often a Rust toolchain too old for Canary's `Cargo.toml`, a corrupted build cache, or a transient network failure while fetching crates. | Re-run the job once to rule out a transient failure. If it persists, update the runner's Rust toolchain. Cargo's own error output appears in the log above this message; `ACTIONS_STEP_DEBUG: true` adds more detail. |
 | `Stellar Protocol Canary timed out after Ns and was terminated.` | Canary ran longer than `timeout-minutes` (default 15; it bounds only the Canary process, not the whole job) and was killed. | Raise `timeout-minutes` if your fixture set legitimately needs longer. Otherwise check whether a live-RPC check is hanging on an unreachable `rpc-url`. |
 | `` `cargo install` … timed out after Ns and was terminated. `` | The `cargo install` step ran longer than `timeout-minutes` (floored at one minute — see [Timeouts](#timeouts)) and was killed. | Re-run the job; this is usually a stalled network fetch. Raise `timeout-minutes` if a build of this size legitimately needs longer. Cargo's own progress output appears in the log above this message. |
@@ -323,10 +358,32 @@ what to do about each.
 the message itself; see [Inputs](#inputs) for each input's accepted
 values.
 
+### Viewing diagnostics
+
+External process diagnostics are automatically captured, redacted, and formatted
+in GitHub Actions collapsed log groups:
+
+- **Canary diagnostics:** Whenever `stellar-canary check` writes to standard error
+  (on passing runs, failing runs, unexpected errors, or timeouts), the full stderr
+  is printed in a collapsed log group named `Canary diagnostics`.
+- **Cargo install diagnostics:** When `cargo install` fails or times out, the last
+  40 lines (up to 8 KiB) of cargo's standard error are surfaced in the error message,
+  annotation, and job summary, and captured stdout and stderr are printed in
+  `Cargo stdout` and `Cargo stderr` collapsed log groups.
+- **Log safety:** External text is sanitized: recognised secrets (tokens, seeds,
+  credential URLs) are masked, ANSI escape sequences and control characters are
+  stripped, byte/line tail bounds are enforced, and runner command processing is
+  disabled via `::stop-commands::` using fresh random tokens to prevent command
+  injection.
+
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
-long-running operations it controls:
+long-running operations it controls. It must be a whole number from 1 to
+35791 minutes: the value is multiplied by 60,000 and handed to Node's
+`setTimeout`, which clamps any delay above 2,147,483,647 ms and would fire
+the timer after 1 ms, ending the run almost immediately — so values above
+35791 are rejected up front. The default is 15.
 
 - **The Canary process** (`stellar-canary check`): terminated when it runs
   longer than `timeout-minutes`.
@@ -341,6 +398,23 @@ In both cases the hung process is sent `SIGTERM` and, if it ignores that,
 `SIGKILL` after a short grace period, so neither operation can block the job
 until GitHub's much longer job-level `timeout-minutes` steps in with a
 generic error and no Canary diagnostic.
+
+### Bounded stream capture
+
+To protect the runner from unbounded memory exhaustion:
+
+- **stdout limit:** Standard output capture is bounded to 64 MiB
+  (`MAX_STDOUT_CAPTURE_BYTES`). If `stellar-canary check` emits more than 64 MiB,
+  the process is immediately terminated (SIGTERM followed by SIGKILL escalation)
+  and the run fails with a dedicated `CanaryExecutionFailedError` stating that
+  output was truncated. The partial output is never parsed as a valid report.
+- **stderr limit:** Standard error capture is bounded to 1 MiB
+  (`MAX_STDERR_CAPTURE_BYTES`). If stderr exceeds 1 MiB, earlier output is dropped
+  and the tail is retained with a truncation notice (`[... earlier output dropped ...]`)
+  so that the root failure diagnostic remains intact.
+- **UTF-8 stream decoding:** Both streams are decoded statefully as UTF-8, ensuring
+  multi-byte characters (2, 3, and 4-byte UTF-8 sequences) straddling chunk boundaries
+  survive without corruption.
 
 GitHub Actions' own job- and step-level `timeout-minutes` are unrelated: set
 any surrounding job- or step-level timeout comfortably higher than this
@@ -420,6 +494,13 @@ tag like `@v1.2.3` when you need full reproducibility (consistent with the
 |---|---|
 | v1 | `0.1.1` (default; `0.1.0` also installable, but predates the `ContractExecutable` XDR type two current Protocol 28 fixtures require, and its report predates the `counts` field) |
 
+The dated evidence behind each row — the runs, engine tags and fixture
+pack that were executed — lives in
+[`docs/releases.md`](docs/releases.md); no version is added to this table
+before a consumer run with that engine version has actually passed there.
+(`0.2.0` is released upstream but not yet verified end to end from a
+consumer run by this Action; see [`docs/releases.md`](docs/releases.md).)
+
 This table will grow as `Protocol-Canary` cuts new releases; a
 `schemaVersion` change to its JSON report is a breaking change for this
 Action and will be called out here explicitly.
@@ -472,6 +553,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 Interfaces shared with the other two repositories (report, lockfile,
 comparison, fixture releases, project roots) are specified in
 [`docs/contracts.md`](docs/contracts.md).
+
+Repositories that want a single-declaration compatibility check can call the
+maintained reusable workflow; its inputs, outputs, and matrix, monorepo, and
+PR-gating examples are documented in
+[`docs/reusable-workflow.md`](docs/reusable-workflow.md).
+The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail-closed policy are documented in [`docs/integrity-model.md`](docs/integrity-model.md).
 
 ## License
 

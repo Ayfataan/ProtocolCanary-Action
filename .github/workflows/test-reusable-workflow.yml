@@ -1,0 +1,128 @@
+name: Reusable workflow conformance (#370)
+
+# CI conformance suite for the maintained reusable workflow. It calls
+# .github/workflows/reusable-canary-check.yml locally against a sample project
+# directory, then verifies the documented input/output contract and the report
+# artifact end to end. The two embedded bash scripts are executed verbatim by
+# tests/unit/reusable-workflow-conformance.test.ts against fixture trees and a
+# stubbed artifacts API, so a contract regression fails `npm test` — not only
+# CI — and a simulated runner failure fails this workflow closed.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/reusable-canary-check.yml'
+      - '.github/workflows/test-reusable-workflow.yml'
+      - 'action.yml'
+      - 'src/**'
+      - 'dist/**'
+      - 'tests/fixtures/conformance-project/**'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: Call the reusable workflow against the sample project
+    uses: ./.github/workflows/reusable-canary-check.yml # zizmor: ignore[self-repository] local workspace-relative path used for in-repo testing of the reusable workflow
+    with:
+      project-root: tests/fixtures/conformance-project
+      protocol: 28
+
+  conformance:
+    name: Verify the reusable workflow contract (#370)
+    needs: canary
+    if: '!cancelled()'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch the report artifact this run produced
+        id: fetch-report-artifact
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+          api="${GH_API_BASE:-https://api.github.com}"
+          repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required to locate run artifacts}"
+          run_id="${GITHUB_RUN_ID:?GITHUB_RUN_ID is required to locate run artifacts}"
+          token="${GITHUB_TOKEN:?the ephemeral run token is required to read artifacts}"
+          artifact="${REPORT_ARTIFACT_NAME:-stellar-protocol-canary-report}"
+          dest="${REPORT_DIR:-unpacked}"
+          list=$(curl --fail --silent --show-error \
+            --header "authorization: Bearer ${token}" \
+            "${api}/repos/${repo}/actions/artifacts?per_page=100") || fail "could not list this run's artifacts"
+          id=$(printf '%s' "$list" | jq -r --arg run "$run_id" --arg pat "$artifact" \
+            '[.artifacts[]? | select((.workflow_run.id | tostring) == $run) | select(.name | startswith($pat))] | first | .id // empty') || fail "the artifacts listing is not valid JSON"
+          if [ -z "${id:-}" ]; then
+            fail "no '${artifact}' artifact exists for run ${run_id}: the reusable workflow did not upload its report"
+          fi
+          archive=$(mktemp)
+          curl --fail --silent --show-error --location \
+            --header "authorization: Bearer ${token}" \
+            --output "$archive" "${api}/repos/${repo}/actions/artifacts/${id}/zip" || fail "downloading artifact ${id} failed"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q "$archive" -d "$dest" || fail "the artifact archive is not a readable zip"
+          else
+            python3 -m zipfile -e "$archive" "$dest" || fail "the artifact archive is not a readable zip"
+          fi
+          rm -f "$archive"
+          echo "report artifact ${id} unpacked into ${dest}"
+
+      - name: Verify documented outputs end to end
+        id: verify-outputs
+        shell: bash
+        env:
+          CANARY_OUTCOME: ${{ needs.canary.result }}
+          CANARY_EXIT_CODE: ${{ needs.canary.outputs.exit-code }}
+          CANARY_DIFF_VERDICT: ${{ needs.canary.outputs.diff-verdict }}
+          CANARY_REPORT_PATH: ${{ needs.canary.outputs.report-path }}
+          REPORT_DIR: unpacked
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$*"
+            exit 1
+          }
+          outcome="${CANARY_OUTCOME:-success}"
+          code="${CANARY_EXIT_CODE:-}"
+          verdict="${CANARY_DIFF_VERDICT:-}"
+          report="${CANARY_REPORT_PATH:-}"
+          [ "$outcome" = "success" ] || fail "the canary job outcome is '${outcome}': the reusable workflow run did not succeed (real or simulated runner failure)"
+          case "$code" in
+            0|1) ;;
+            *) fail "exit-code output '${code}' is outside the documented contract {0, 1}";;
+          esac
+          case "$verdict" in
+            not-requested|unavailable) ;;
+            *) fail "diff-verdict output '${verdict}' is outside the documented contract {not-requested, unavailable}";;
+          esac
+          if [ "$code" != "0" ]; then
+            fail "the reusable workflow returned exit-code ${code} for the sample project"
+          fi
+          [ -n "$report" ] || fail "exit-code is 0 but the report-path output is empty"
+          dir="${REPORT_DIR:-}"
+          [ -n "$dir" ] || fail "REPORT_DIR must point at the unpacked report artifact"
+          [ -d "$dir" ] || fail "the report artifact directory '${dir}' is missing from the workspace"
+          count=$(find "$dir" -type f -name '*.json' | wc -l)
+          if [ "$count" -lt 1 ]; then
+            fail "the '${dir}' artifact tree contains no JSON report"
+          fi
+          sample=$(find "$dir" -type f -name '*.json' | head -1)
+          grep -q '"protocol"' "$sample" || fail "the downloaded report $(basename "$sample") is not a Protocol Canary JSON report"
+          echo "conformance contract satisfied: exit-code=0 diff-verdict=${verdict} report=$(basename "$report")"

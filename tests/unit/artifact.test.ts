@@ -8,10 +8,11 @@ vi.mock("@actions/artifact", () => ({
   },
 }));
 
-import { ARTIFACT_NAME, fallbackArtifactName, isArtifactNameCollision, uploadReport } from "../../src/artifact";
+import { ARTIFACT_NAME, RECEIPT_ARTIFACT_PREFIX, fallbackArtifactName, isArtifactNameCollision, receiptArtifactName, uploadReceipt, uploadReport } from "../../src/artifact";
 
 const REPORT_PATH = "/tmp/stellar-canary-report.json";
 const REPORT_DIR = "/tmp";
+const RECEIPT_PATH = "/tmp/stellar-canary-receipt.json";
 
 /** The exact error `@actions/artifact` throws for a duplicate name. */
 function conflictError(): Error {
@@ -107,6 +108,13 @@ describe("uploadReport", () => {
     expect(outcome.uploaded).toBe(false);
     expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
   });
+
+  it("handles a non-Error failure reason when upload fails", async () => {
+    uploadArtifactMock.mockRejectedValue("string-rejection-reason");
+    const outcome = await uploadReport(REPORT_PATH, "protocol-28");
+    expect(outcome).toEqual({ uploaded: false, reason: "string-rejection-reason" });
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("fallbackArtifactName", () => {
@@ -134,4 +142,132 @@ describe("isArtifactNameCollision", () => {
     expect(isArtifactNameCollision(new Error("service unavailable"))).toBe(false);
     expect(isArtifactNameCollision(new Error("File /tmp/report.json does not exist"))).toBe(false);
   });
+
+  it("recognizes collisions across Error, string, and object inputs", () => {
+    // Error instances
+    expect(isArtifactNameCollision(new Error("Failed request: (409)"))).toBe(true);
+    expect(isArtifactNameCollision(new Error("Upload conflict detected"))).toBe(true);
+    expect(isArtifactNameCollision(new Error("an artifact with this name already exists"))).toBe(true);
+    expect(isArtifactNameCollision(new Error("something already exists on disk"))).toBe(false);
+    expect(isArtifactNameCollision(new Error("artifact upload timed out"))).toBe(false);
+    expect(isArtifactNameCollision(new Error("unrelated error"))).toBe(false);
+
+    // String error values
+    expect(isArtifactNameCollision("Received HTTP (409)")).toBe(true);
+    expect(isArtifactNameCollision("Conflict: name already registered")).toBe(true);
+    expect(isArtifactNameCollision("an artifact already exists in this run")).toBe(true);
+    expect(isArtifactNameCollision("file already exists")).toBe(false);
+    expect(isArtifactNameCollision("arbitrary string error")).toBe(false);
+
+    // Object values with toString representation
+    expect(isArtifactNameCollision({ toString: () => "status: (409) Conflict" })).toBe(true);
+    expect(isArtifactNameCollision({ toString: () => "Error: Conflict occurred" })).toBe(true);
+    expect(isArtifactNameCollision({ toString: () => "an artifact with this name already exists" })).toBe(true);
+    expect(isArtifactNameCollision({ toString: () => "plain object without collision info" })).toBe(false);
+    expect(isArtifactNameCollision({})).toBe(false);
+  });
 });
+
+/**
+ * #362: the Execution Receipt artifact. Named per workflow run
+ * (`stellar-canary-receipt-<run-id>`), auxiliary like the report artifact —
+ * an upload failure is reported through the outcome and never throws, so it
+ * cannot crash the action (#362 negative testing: "upload failure does not
+ * crash action").
+ */
+describe("uploadReceipt", () => {
+  afterEach(() => {
+    delete process.env.GITHUB_RUN_ID;
+  });
+
+  it("uploads under the run-scoped name when GITHUB_RUN_ID is set", async () => {
+    process.env.GITHUB_RUN_ID = "4321";
+    uploadArtifactMock.mockResolvedValue({ id: 7, size: 10 });
+
+    const outcome = await uploadReceipt(RECEIPT_PATH);
+
+    expect(outcome).toEqual({ uploaded: true });
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
+    expect(uploadArtifactMock).toHaveBeenCalledWith(
+      `${RECEIPT_ARTIFACT_PREFIX}-4321`,
+      [RECEIPT_PATH],
+      REPORT_DIR,
+    );
+  });
+
+  it("still produces a unique run name when GITHUB_RUN_ID is absent", async () => {
+    uploadArtifactMock.mockResolvedValue({ id: 8, size: 10 });
+
+    const outcome = await uploadReceipt(RECEIPT_PATH);
+
+    expect(outcome).toEqual({ uploaded: true });
+    const name = uploadArtifactMock.mock.calls[0]?.[0] as string;
+    expect(name).toMatch(new RegExp(`^${RECEIPT_ARTIFACT_PREFIX}-[a-z0-9]+(-[a-z0-9]+)?$`));
+    expect(name).not.toBe(RECEIPT_ARTIFACT_PREFIX);
+  });
+
+  it("retries once under a unique name when the run-scoped name collides (two invocations, one run)", async () => {
+    process.env.GITHUB_RUN_ID = "4321";
+    uploadArtifactMock.mockRejectedValueOnce(conflictError()).mockResolvedValueOnce({ id: 9, size: 10 });
+
+    const outcome = await uploadReceipt(RECEIPT_PATH);
+
+    expect(outcome).toEqual({ uploaded: true });
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
+    expect(uploadArtifactMock).toHaveBeenNthCalledWith(1, `${RECEIPT_ARTIFACT_PREFIX}-4321`, [RECEIPT_PATH], REPORT_DIR);
+    const retryName = uploadArtifactMock.mock.calls[1]?.[0] as string;
+    expect(retryName).toMatch(new RegExp(`^${RECEIPT_ARTIFACT_PREFIX}-4321-[a-z0-9-]+$`));
+  });
+
+  it("reports a non-collision failure through the outcome and never throws", async () => {
+    process.env.GITHUB_RUN_ID = "4321";
+    uploadArtifactMock.mockRejectedValue(new Error("artifact service down"));
+
+    await expect(uploadReceipt(RECEIPT_PATH)).resolves.toMatchObject({
+      uploaded: false,
+      reason: expect.stringContaining("artifact service down"),
+    });
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never throws when the collision retry also fails", async () => {
+    uploadArtifactMock.mockRejectedValue(conflictError());
+    const outcome = await uploadReceipt(RECEIPT_PATH);
+    expect(outcome.uploaded).toBe(false);
+  });
+
+  it("handles a non-Error failure reason when receipt upload fails", async () => {
+    uploadArtifactMock.mockRejectedValue("string-receipt-rejection");
+    const outcome = await uploadReceipt(RECEIPT_PATH);
+    expect(outcome).toEqual({ uploaded: false, reason: "string-receipt-rejection" });
+  });
+});
+
+describe("receiptArtifactName (#365)", () => {
+  it("embeds a well-formed run id verbatim", () => {
+    expect(receiptArtifactName("4321")).toBe(`${RECEIPT_ARTIFACT_PREFIX}-4321`);
+  });
+
+  it("is deterministic for the same id (a retried step addresses one artifact name)", () => {
+    expect(receiptArtifactName("4321")).toBe(receiptArtifactName("4321"));
+    expect(receiptArtifactName("feat/363 canary!")).toBe(receiptArtifactName("feat/363 canary!"));
+  });
+
+  it("collapses awkward run ids through the same sanitizer as the report differentiator", () => {
+    expect(receiptArtifactName("feat/363 canary!")).toBe(`${RECEIPT_ARTIFACT_PREFIX}-feat-363-canary`);
+    expect(receiptArtifactName("protocol.28_v2")).toBe(`${RECEIPT_ARTIFACT_PREFIX}-protocol.28_v2`);
+  });
+
+  it("falls back to a short unique suffix when the id is absent, empty, or blank", () => {
+    for (const id of [undefined, "", "   "]) {
+      const name = receiptArtifactName(id);
+      expect(name).toMatch(new RegExp(`^${RECEIPT_ARTIFACT_PREFIX}-[a-z0-9]+(-[a-z0-9]+)?$`));
+      expect(name).not.toBe(RECEIPT_ARTIFACT_PREFIX);
+    }
+  });
+
+  it("trims a padded run id to its documented name", () => {
+    expect(receiptArtifactName("  4321  ")).toBe(`${RECEIPT_ARTIFACT_PREFIX}-4321`);
+  });
+});
+

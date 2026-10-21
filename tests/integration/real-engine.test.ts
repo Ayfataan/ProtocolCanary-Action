@@ -99,8 +99,12 @@ function setUp(binary: string, version: string, inputs: Record<string, string>):
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-real-"));
   const cargoHome = path.join(workDir, "cargo-home");
   fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
-  fs.copyFileSync(binary, path.join(cargoHome, "bin", "stellar-canary"));
-  fs.chmodSync(path.join(cargoHome, "bin", "stellar-canary"), 0o755);
+  const exeName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
+  const destPath = path.join(cargoHome, "bin", exeName);
+  fs.copyFileSync(binary, destPath);
+  if (process.platform !== "win32") {
+    fs.chmodSync(destPath, 0o755);
+  }
 
   const runnerTemp = path.join(workDir, "runner-temp");
   fs.mkdirSync(runnerTemp, { recursive: true });
@@ -135,7 +139,8 @@ function setUp(binary: string, version: string, inputs: Record<string, string>):
 }
 
 function readOutputs(outputPath: string): Record<string, string> {
-  const lines = fs.readFileSync(outputPath, "utf8").split("\n");
+  const content = fs.readFileSync(outputPath, "utf8").replace(/\r\n/g, "\n");
+  const lines = content.split("\n");
   const outputs: Record<string, string> = {};
   for (let i = 0; i < lines.length; i++) {
     const match = /^([A-Za-z_][A-Za-z0-9_]*)<<(.+)$/.exec(lines[i] ?? "");
@@ -153,24 +158,50 @@ function readOutputs(outputPath: string): Record<string, string> {
   return outputs;
 }
 
+function resolveBinary(envName: string): string | undefined {
+  const raw = process.env[envName];
+  if (!raw || raw.trim() === "") {
+    return undefined;
+  }
+  let candidate = raw.trim();
+  if (process.platform === "win32" && /^\/[a-zA-Z]\//.test(candidate)) {
+    candidate = `${candidate[1]}:${candidate.slice(2)}`;
+  }
+  if (fs.existsSync(candidate)) {
+    return candidate;
+  }
+  if (process.platform === "win32" && !candidate.toLowerCase().endsWith(".exe") && fs.existsSync(`${candidate}.exe`)) {
+    return `${candidate}.exe`;
+  }
+  return undefined;
+}
+
 function suite(label: string, envName: string): void {
-  const binary = process.env[envName];
-  const enabled = binary !== undefined && binary !== "" && process.platform !== "win32";
+  const rawBinary = process.env[envName];
+  const binary = resolveBinary(envName);
+  const enabled = binary !== undefined;
+  const skipReason = !enabled
+    ? rawBinary && rawBinary.trim() !== ""
+      ? `binary at ${rawBinary} is absent`
+      : `${envName} is not set`
+    : "";
   const version = enabled ? engineVersion(binary) : "0.0.0";
   const modern = engineSupportsAllowEmpty(version);
 
-  describe.skipIf(!enabled)(`Action against a real engine: ${label} (${version})`, () => {
-    let current: Run | undefined;
+  describe.skipIf(!enabled)(
+    `Action against a real engine: ${label}${enabled ? ` (${version})` : ` (skipped: ${skipReason})`}`,
+    () => {
+      let current: Run | undefined;
 
-    afterEach(() => {
-      if (current) fs.rmSync(current.workDir, { recursive: true, force: true });
-      current = undefined;
-      for (const key of ENV_KEYS) delete process.env[key];
-    });
+      afterEach(() => {
+        if (current) fs.rmSync(current.workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        current = undefined;
+        for (const key of ENV_KEYS) delete process.env[key];
+      });
 
-    afterAll(() => {
-      fs.rmSync(SUMMARY_PATH, { force: true });
-    });
+      afterAll(() => {
+        fs.rmSync(SUMMARY_PATH, { force: true, maxRetries: 5, retryDelay: 100 });
+      });
 
     // The engine writes .stellar-canary-cache/ in the project root (the current
     // directory), so every run happens in the scratch directory, never in the

@@ -40,7 +40,7 @@ interface FakePage {
   statusCode?: number;
   body: string;
   /** Raw `Link` header value, when the page has a next page. */
-  link?: string;
+  link?: string | string[];
 }
 
 interface RecordedCall {
@@ -281,6 +281,54 @@ describe("resolveVersion", () => {
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
   });
 
+  it("terminates pagination when a Link header contains relations other than rel=next", async () => {
+    const otherLink =
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=1>; rel="first", ' +
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=3>; rel="last"';
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]), link: otherLink }]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved.commitSha).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("Could not find upstream tag v0.1.0"),
+    );
+  });
+
+  it("supports array-valued Link headers (string[]) from the HTTP response", async () => {
+    const linkArray = [
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=2>; rel="next"',
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=5>; rel="last"',
+    ];
+    const calls = mockHttpsPages([
+      { body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]), link: linkArray },
+      { body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) },
+    ]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved.commitSha).toBe("abc123");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.url).toContain("page=2");
+  });
+
+  it("degrades to commitSha undefined when a Link header carries an invalid URL", async () => {
+    mockHttpsPages([
+      {
+        body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]),
+        link: '<not a valid url>; rel="next"',
+      },
+    ]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved.commitSha).toBeUndefined();
+    expect(vi.mocked(core.debug)).toHaveBeenCalledWith(
+      expect.stringContaining("Could not resolve v0.1.0 to a commit sha"),
+    );
+  });
+
   it("caps pagination at MAX_TAG_PAGES when the Link header never terminates", async () => {
     // A malformed or hostile Link header must spin the page walk forever;
     // every request re-serves this page, so the loop has to stop itself.
@@ -303,5 +351,41 @@ describe("resolveVersion", () => {
     mockHttpsPages([{ body: JSON.stringify(tags) }]);
     const resolved = await resolveVersion("0.1.0");
     expect(resolved).toEqual({ version: "0.1.0", tag: "v0.1.0", commitSha: undefined });
+  });
+
+  it("prefers explicit options.token over GITHUB_TOKEN environment variable", async () => {
+    process.env.GITHUB_TOKEN = "env-token";
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]) }]);
+
+    await resolveVersion("0.1.0", { token: "explicit-token" });
+
+    expect(calls[0]?.headers.Authorization).toBe("Bearer explicit-token");
+  });
+
+  it("falls back to GITHUB_TOKEN when options.token is whitespace-only", async () => {
+    process.env.GITHUB_TOKEN = "env-token";
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]) }]);
+
+    await resolveVersion("0.1.0", { token: "   \t  \n " });
+
+    expect(calls[0]?.headers.Authorization).toBe("Bearer env-token");
+  });
+
+  it("attaches Authorization header only when request host is api.github.com", async () => {
+    const calls = mockHttpsPages([
+      {
+        body: tagsBody([{ name: "v9.9.9", sha: "other" }]),
+        link: '<https://untrusted.host.test/tags?page=2>; rel="next"',
+      },
+      {
+        body: tagsBody([{ name: "v0.1.0", sha: "sha-123" }]),
+      },
+    ]);
+
+    await resolveVersion("0.1.0", { token: "secret-token" });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.headers.Authorization).toBe("Bearer secret-token");
+    expect(calls[1]?.headers.Authorization).toBeUndefined();
   });
 });
