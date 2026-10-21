@@ -245,6 +245,66 @@ function parseConfig(raw: string): string | undefined {
   return resolved;
 }
 
+/**
+ * Validates the "fixtures-dir" input against the filesystem (issue #400): the
+ * resolved path must name an existing directory. Called from `run()` after
+ * input parsing and before version resolution or engine installation, so a
+ * mistyped path fails the job in milliseconds instead of after a full
+ * `cargo install`.
+ *
+ * The path is resolved against the current working directory — the same
+ * working directory the CLI reads `--fixtures-dir` from — and stat'ed in
+ * its normalized form, so `..` segments and relative input can never make
+ * the validated path differ from the forwarded one. `fs.statSync` follows
+ * symbolic links, so a dangling symlink is indistinguishable from a missing
+ * path and gets the same, predictable missing-path treatment (the same
+ * convention `parseConfig` uses for `config`).
+ *
+ * A missing directory is fatal by default, with a message naming the input
+ * and the resolved absolute path. With `allow-empty` enabled it degrades to
+ * a `core.warning` and the run continues — `allow-empty` exists precisely to
+ * tolerate a run that executes no checks — and the directory is never
+ * created behind the user's back. A resolved path that exists but is not a
+ * directory (e.g. a regular file) is always rejected, even with
+ * `allow-empty`: that input excuses an empty fixture set, not a mistyped
+ * path.
+ *
+ * Returns the resolved absolute path that was validated. Throws
+ * {@link InvalidInputError} when the path is not an existing directory and
+ * `allowEmpty` is false.
+ */
+export function validateFixturesDir(fixturesDir: string, allowEmpty: boolean): string {
+  const resolved = path.resolve(fixturesDir);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    // statSync throws for a missing path (ENOENT) — including a dangling
+    // symlink, which it follows to a target that does not exist — and for
+    // paths it cannot stat at all. All of them get the missing-path
+    // treatment rather than being forwarded to the engine to fail there
+    // with a less actionable error.
+    if (allowEmpty) {
+      core.warning(
+        `"fixtures-dir" input: the fixtures directory ${resolved} does not exist. ` +
+          "Continuing because \"allow-empty\" is true; Canary will load no fixtures from it.",
+      );
+      return resolved;
+    }
+    throw new InvalidInputError(
+      `Invalid "fixtures-dir" input: the fixtures directory ${resolved} does not exist. ` +
+        "Provide a path to an existing directory, or set \"allow-empty\" to true to run without one.",
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-dir" input: ${resolved} exists but is not a directory. ` +
+        "\"fixtures-dir\" must point at a directory of fixtures; a regular file is not one.",
+    );
+  }
+  return resolved;
+}
+
 /** Validates the "rpc-url" input as a parseable URL and enforces the scheme
  * allow-list: https:// only, with one deliberate exception — plain http://
  * is accepted for localhost/127.0.0.1 so local development endpoints work.

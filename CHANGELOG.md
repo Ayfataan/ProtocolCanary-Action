@@ -95,6 +95,14 @@ All notable changes to this project are documented in this file.
   moves (only on a new `ProtocolCanary-Fixtures` pack release), who approves
   the move (the CODEOWNERS maintainer), and how to resolve and update the
   SHA (#419).
+- README documents the early `fixtures-dir` validation (#400): the input
+  must point at an existing directory, relative paths are resolved against
+  the job's working directory, invalid directories are detected before
+  engine installation, a missing directory fails with a clear error by
+  default, `allow-empty: true` allows a missing directory with a warning,
+  and a regular file is never a valid fixtures directory. The Quick Start
+  note and the Troubleshooting table now point at the new
+  `Invalid "fixtures-dir" input` message.
 
 ### Added
 
@@ -124,6 +132,22 @@ All notable changes to this project are documented in this file.
   forwarded to the `stellar-canary` CLI, which failed later with a generic,
   less actionable error. `parseConfig` now requires the resolved path to be
   a regular file (`fs.statSync(...).isFile()`) rather than merely existing.
+- `fixtures-dir` is now validated against the filesystem **before** version
+  resolution and engine installation (#400): the path is resolved against
+  the working directory and must name an existing directory. A missing
+  directory fails the run immediately with an `InvalidInput` error naming
+  `fixtures-dir` and the resolved absolute path — previously the Action
+  installed the engine first and only then failed with a less actionable
+  error — while `allow-empty: true` downgrades the missing-directory case
+  to a `core.warning` (naming the input and path) and the run continues.
+  A resolved path that exists but is not a directory (e.g. a regular file)
+  is always rejected with a distinct "is not a directory" message, even
+  with `allow-empty: true`, and a dangling symlink follows the
+  missing-path behavior (`statSync` follows links). Invalid paths no longer
+  trigger unnecessary version resolution, engine installation, or engine
+  execution; the error flows through the existing execution-failure
+  annotation, summary, and outputs like any other reason Canary could not
+  run. The directory is never created behind the user's back.
 
 ### Fixed
 
@@ -194,6 +218,19 @@ All notable changes to this project are documented in this file.
 - Added an `inputs` test pinning that plain `http://` is rejected for the
   IPv6 loopback `http://[::1]`, documenting the current
   `localhost`/`127.0.0.1`-only exemption as a known contract ([#276]).
+- Unit and end-to-end coverage for the early `fixtures-dir` validation
+  (#400): an existing directory is accepted and resolves to an absolute
+  path; a missing directory is rejected with an error naming `fixtures-dir`
+  and the resolved path; a regular file gets the distinct not-a-directory
+  rejection (even with `allow-empty: true`); a dangling symlink follows the
+  missing-path behavior; relative paths and `..` segments are normalized
+  before validation; and `allow-empty: true` warns and continues. The
+  essential regression test spies on `resolveVersion`,
+  `ensureCanaryInstalled`, and `runCheck` and pins that a missing
+  directory (with `allow-empty: false`) fails before any of them run, with
+  the error reaching the existing execution-failure summary and annotation
+  path, while `allow-empty: true` proceeds to normal resolution and
+  installation.
 
 ## [0.1.1]
 

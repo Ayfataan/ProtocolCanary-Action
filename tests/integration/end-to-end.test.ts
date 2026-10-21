@@ -58,6 +58,7 @@ const ENV_KEYS = [
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
+  "INPUT_ALLOW-EMPTY",
 ];
 
 interface Fixture {
@@ -97,7 +98,12 @@ function setUp(scenario: string): Fixture {
   process.env.MOCK_CANARY_VERSION = "0.1.0";
   process.env.INPUT_VERSION = "0.1.0";
   process.env.INPUT_PROTOCOL = "28";
-  process.env["INPUT_FIXTURES-DIR"] = "fixtures";
+  // #400: run() validates fixtures-dir on disk before version resolution
+  // and installation, so the input must point at an existing directory —
+  // an empty one inside the scratch workDir is enough for the mock engine.
+  const fixturesDir = path.join(workDir, "fixtures");
+  fs.mkdirSync(fixturesDir);
+  process.env["INPUT_FIXTURES-DIR"] = fixturesDir;
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env["INPUT_ANNOTATIONS"] = "true";
   process.env["INPUT_TIMEOUT-MINUTES"] = "1";
@@ -455,5 +461,76 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(infoMock.mock.calls.some((call) => String(call[0]).includes("Uploaded stellar-protocol-canary-report artifact."))).toBe(
       true,
     );
+  });
+
+  // #400: fixtures-dir is validated after input parsing and before version
+  // resolution or installation. A missing directory must fail with a clear
+  // error naming the input and its resolved absolute path, reach the
+  // execution-failure annotation and summary, and never reach the engine —
+  // which the empty outputs (no engine-version, no report) prove.
+  it("missing fixtures-dir: fails before installation with an actionable error (#400)", async () => {
+    fixture = setUp("pass");
+    const missing = path.join(fixture.workDir, "no-such-fixtures");
+    process.env["INPUT_FIXTURES-DIR"] = missing;
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const failed = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(failed).toContain('"fixtures-dir"');
+    expect(failed).toContain(path.resolve(missing));
+    expect(failed).toContain("does not exist");
+
+    const outputs = readOutputs(fixture.outputPath);
+    expect(outputs.status).toBe("execution-failed");
+    // No installation happened (no engine version) and no engine ran (no
+    // report file) — both are set whenever the engine was reached.
+    expect(outputs["engine-version"]).toBe("");
+    expect(outputs.report).toBeUndefined();
+
+    // The error also reaches the execution-failure annotation and summary.
+    expect(errorMock).toHaveBeenCalledTimes(1);
+    const annotated = errorMock.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(annotated).toContain('"fixtures-dir"');
+    expect(annotated).toContain(path.resolve(missing));
+    expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain('"fixtures-dir"');
+  });
+
+  // #400, preserved allow-empty exception: a missing directory downgrades to
+  // a warning naming the input and path, and the run continues normally.
+  it("missing fixtures-dir with allow-empty: true warns and the run proceeds (#400)", async () => {
+    fixture = setUp("pass");
+    const missing = path.join(fixture.workDir, "no-such-fixtures");
+    process.env["INPUT_FIXTURES-DIR"] = missing;
+    process.env["INPUT_ALLOW-EMPTY"] = "true";
+    const { run } = await import("../../src/main");
+    await run();
+
+    const warnings = warningMock.mock.calls.map((call) => String(call[0]));
+    expect(
+      warnings.some((message) => message.includes('"fixtures-dir"') && message.includes(path.resolve(missing))),
+    ).toBe(true);
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(readOutputs(fixture.outputPath).status).toBe("pass");
+  });
+
+  // #400: a path that exists but is not a directory is a distinct error,
+  // rejected even with allow-empty — that input excuses an empty fixture
+  // set, not a mistyped path.
+  it("fixtures-dir pointing at a regular file is rejected as not a directory (#400)", async () => {
+    fixture = setUp("pass");
+    const file = path.join(fixture.workDir, "fixtures.toml");
+    fs.writeFileSync(file, "[tests]\n", "utf8");
+    process.env["INPUT_FIXTURES-DIR"] = file;
+    process.env["INPUT_ALLOW-EMPTY"] = "true";
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const failed = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(failed).toContain('"fixtures-dir"');
+    expect(failed).toContain(path.resolve(file));
+    expect(failed).toContain("is not a directory");
+    expect(readOutputs(fixture.outputPath).status).toBe("execution-failed");
   });
 });
