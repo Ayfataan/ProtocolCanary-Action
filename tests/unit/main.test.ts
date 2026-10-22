@@ -127,7 +127,8 @@ const INPUTS: ActionInputs = {
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
-};
+  workingDirectory: path.resolve("."),
+} as ActionInputs;
 
 const PASS_REPORT = report({
   status: "pass",
