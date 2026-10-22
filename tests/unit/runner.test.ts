@@ -1,20 +1,26 @@
 import type * as childProcess from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
+import { CanaryExecutionFailedError, InvalidInputError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
 import {
   MAX_STDERR_CAPTURE_BYTES,
   STDERR_DROPPED_NOTICE,
+  assertBaselineProtocol,
   buildCheckArgs,
   engineSupportsAllowEmpty,
+  engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
+  loadBaselineReport,
   runCheck,
 } from "../../src/runner";
+import { report } from "./helpers";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -56,7 +62,10 @@ const BASE_INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: undefined,
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
   version: "0.1.0",
   uploadReport: true,
@@ -65,6 +74,7 @@ const BASE_INPUTS: ActionInputs = {
   allowEmpty: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
@@ -127,12 +137,117 @@ describe("buildCheckArgs", () => {
     );
   });
 
+  it("forwards passphrase and retry flags to engines that support them", () => {
+    const args = buildCheckArgs(
+      {
+        ...BASE_INPUTS,
+        network: "testnet",
+        networkPassphrase: "Private Network ; October 2026",
+        rpcMaxRetries: 0,
+        rpcRetryDelayMs: 250,
+      },
+      "0.3.0",
+    );
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "--network",
+        "testnet",
+        "--network-passphrase",
+        "Private Network ; October 2026",
+        "--rpc-max-retries",
+        "0",
+        "--rpc-retry-delay-ms",
+        "250",
+      ]),
+    );
+  });
+
+  it("does not pass new flags to older or unknown engines", () => {
+    const inputs = {
+      ...BASE_INPUTS,
+      networkPassphrase: "Private Network ; October 2026",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    };
+    for (const version of ["0.2.0", "", undefined]) {
+      const args = buildCheckArgs(inputs, version);
+      expect(args).not.toContain("--network-passphrase");
+      expect(args).not.toContain("--rpc-max-retries");
+      expect(args).not.toContain("--rpc-retry-delay-ms");
+    }
+  });
+
   it("never concatenates arguments into a single string (command-injection defense)", () => {
     const args = buildCheckArgs({ ...BASE_INPUTS, network: "testnet; rm -rf /" });
     // The dangerous value must appear as exactly one array element, never
     // merged with adjacent flags or split by the shell.
     expect(args).toContain("testnet; rm -rf /");
     expect(args.some((a) => a.includes("--network testnet"))).toBe(false);
+  });
+});
+
+describe("baseline report validation (#344)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(name: string, contents: string): string {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, contents, "utf8");
+    return file;
+  }
+
+  it("loads a complete report and preserves its target protocol", () => {
+    const file = write("baseline.json", JSON.stringify(report({ targetProtocol: 28 })));
+    const baseline = loadBaselineReport(file);
+    expect(baseline.targetProtocol).toBe(28);
+    expect(baseline.schemaVersion).toBe(1);
+  });
+
+  it("rejects an empty file before parsing", () => {
+    const file = write("empty.json", "   \n");
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/baseline report is empty/);
+  });
+
+  it("rejects invalid JSON with a clear baseline parse error", () => {
+    const file = write("broken.json", '{"schemaVersion": 1,');
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/not a valid Protocol Canary report/);
+    expect(() => loadBaselineReport(file)).toThrow(/could not be parsed as JSON/);
+  });
+
+  it("rejects an unsupported schemaVersion", () => {
+    const file = write("future.json", JSON.stringify(report({ schemaVersion: 99 })));
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/schemaVersion 99/);
+  });
+
+  it("rejects a missing or unreadable file", () => {
+    expect(() => loadBaselineReport(path.join(dir, "absent.json"))).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(path.join(dir, "absent.json"))).toThrow(/could not be read/);
+  });
+
+  it("accepts a baseline recorded for the same target protocol", () => {
+    const baseline = report({ targetProtocol: 28 });
+    const current = report({ targetProtocol: 28 });
+    expect(() => assertBaselineProtocol(baseline, current, "baseline.json")).not.toThrow();
+  });
+
+  it("rejects a baseline recorded for a different target protocol with both values named", () => {
+    const baseline = report({ targetProtocol: 27 });
+    const current = report({ targetProtocol: 28 });
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(InvalidInputError);
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(
+      /targets protocol 27, but this run targets protocol 28/,
+    );
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(/Incompatible baseline report/);
   });
 });
 
@@ -178,6 +293,22 @@ describe("allow-empty forwarding", () => {
     [undefined, false],
   ])("engineSupportsAllowEmpty(%j) is %s", (version, expected) => {
     expect(engineSupportsAllowEmpty(version)).toBe(expected);
+  });
+});
+
+describe("network passphrase and RPC retry version gate", () => {
+  it.each([
+    ["0.2.0", false],
+    ["0.2.99", false],
+    ["0.3.0", true],
+    ["0.3.1", true],
+    ["1.0.0", true],
+    ["", false],
+    ["v0.3.0", false],
+    ["0.3.0-rc1", false],
+    [undefined, false],
+  ])("engineSupportsNetworkPassphraseAndRpcRetrySettings(%j) is %s", (version, expected) => {
+    expect(engineSupportsNetworkPassphraseAndRpcRetrySettings(version)).toBe(expected);
   });
 });
 

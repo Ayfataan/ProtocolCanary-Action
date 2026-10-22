@@ -27,7 +27,10 @@ const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
+  "INPUT_RPC-MAX-RETRIES",
+  "INPUT_RPC-RETRY-DELAY-MS",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
@@ -36,6 +39,7 @@ const INPUT_KEYS = [
   "INPUT_ALLOW-EMPTY",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
+  "INPUT_BASELINE-REPORT",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
@@ -45,6 +49,7 @@ function clearInputs(): void {
   for (const key of INPUT_KEYS) {
     delete process.env[key];
   }
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
@@ -60,15 +65,19 @@ describe("getInputs", () => {
       protocol: undefined,
       config: undefined,
       network: undefined,
+      networkPassphrase: undefined,
       rpcUrl: undefined,
+      rpcMaxRetries: undefined,
+      rpcRetryDelayMs: undefined,
       fixturesDir: "fixtures",
-      version: "0.1.1",
+      version: "0.2.0",
       uploadReport: true,
       annotations: true,
       timeoutMinutes: 15,
       allowEmpty: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
+      baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
       strictIntegrity: false,
@@ -106,6 +115,44 @@ describe("getInputs", () => {
   it("rejects a config path that does not exist", () => {
     process.env.INPUT_CONFIG = "/nonexistent/.stellar-canary.toml";
     expect(() => getInputs()).toThrow(ConfigNotFoundError);
+  });
+
+  // #344: a baseline that is supplied but cannot be found must fail before
+  // installation or engine work rather than surfacing as a confusing
+  // execution failure later.
+  it("rejects a baseline report path that does not exist", () => {
+    process.env["INPUT_BASELINE-REPORT"] = "/nonexistent/baseline-report.json";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"baseline-report"/);
+    expect(() => getInputs()).toThrow(/does not exist/);
+  });
+
+  it("rejects a baseline report path that is not a regular file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-dir-"));
+    try {
+      process.env["INPUT_BASELINE-REPORT"] = dir;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/not a regular file/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a baseline report path resolved to an absolute path", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-"));
+    const baselinePath = path.join(dir, "baseline.json");
+    fs.writeFileSync(baselinePath, "{}", "utf8");
+    try {
+      process.env["INPUT_BASELINE-REPORT"] = path.relative(process.cwd(), baselinePath);
+      expect(getInputs().baselineReport).toBe(path.resolve(baselinePath));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a whitespace-only baseline report as unset", () => {
+    process.env["INPUT_BASELINE-REPORT"] = "   ";
+    expect(getInputs().baselineReport).toBeUndefined();
   });
 
   it("returns a config path resolved to an absolute path", () => {
@@ -155,6 +202,61 @@ describe("getInputs", () => {
   it("trims surrounding whitespace from network", () => {
     process.env.INPUT_NETWORK = "  testnet  ";
     expect(getInputs().network).toBe("testnet");
+  });
+
+  it("preserves the exact network passphrase for endpoint identity checks", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "  Local Network ; 2026  ";
+    expect(getInputs().networkPassphrase).toBe("  Local Network ; 2026  ");
+    expect(setSecretMock).toHaveBeenCalledWith("  Local Network ; 2026  ");
+  });
+
+  it("rejects an explicitly empty network passphrase", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"network-passphrase"/);
+  });
+
+  it.each(["line\nbreak", "tab\tvalue", "delete\u007fvalue"])(
+    "rejects control characters in network-passphrase %j",
+    (value) => {
+      process.env["INPUT_NETWORK-PASSPHRASE"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"network-passphrase"/);
+    },
+  );
+
+  it("leaves an omitted network-passphrase unset", () => {
+    expect(getInputs().networkPassphrase).toBeUndefined();
+  });
+
+  it.each([
+    ["0", 0],
+    ["3", 3],
+    ["4294967295", 4294967295],
+  ])("accepts rpc-max-retries %s", (value, expected) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(getInputs().rpcMaxRetries).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "4294967296"])("rejects rpc-max-retries %s", (value) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-max-retries"/);
+  });
+
+  it.each([
+    ["0", 0],
+    ["500", 500],
+    [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+  ])("accepts rpc-retry-delay-ms %s", (value, expected) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(getInputs().rpcRetryDelayMs).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "9007199254740992"])("rejects rpc-retry-delay-ms %s", (value) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-retry-delay-ms"/);
   });
 
   it("trims surrounding whitespace from rpc-url", () => {
@@ -209,6 +311,11 @@ describe("getInputs", () => {
   it("normalizes a version with a leading v", () => {
     process.env.INPUT_VERSION = "v0.1.0";
     expect(getInputs().version).toBe("0.1.0");
+  });
+
+  it("preserves an explicit legacy engine pin for migration compatibility", () => {
+    process.env.INPUT_VERSION = "0.1.1";
+    expect(getInputs().version).toBe("0.1.1");
   });
 
   it("rejects a non-semver version", () => {

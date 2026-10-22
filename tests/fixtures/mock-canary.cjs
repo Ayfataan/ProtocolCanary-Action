@@ -215,7 +215,7 @@ switch (scenario) {
             fixtureId: "p27-xdr-old",
             surface: "xdr",
             reason: "fixture targets protocol 27, this run targets protocol 28",
-            code: "protocol-mismatch",
+            code: "UNSUPPORTED_PROTOCOL",
           },
         ],
       }),
