@@ -44,8 +44,17 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   if (inputs.network !== undefined) {
     args.push("--network", inputs.network);
   }
+  if (inputs.networkPassphrase !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
+    args.push("--network-passphrase", inputs.networkPassphrase);
+  }
   if (inputs.rpcUrl !== undefined) {
     args.push("--rpc-url", inputs.rpcUrl);
+  }
+  if (inputs.rpcMaxRetries !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
+    args.push("--rpc-max-retries", String(inputs.rpcMaxRetries));
+  }
+  if (inputs.rpcRetryDelayMs !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
+    args.push("--rpc-retry-delay-ms", String(inputs.rpcRetryDelayMs));
   }
   if (inputs.config !== undefined) {
     args.push("--config", inputs.config);
@@ -62,24 +71,35 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
  * releases already exit 0 on a run that executes nothing, so the flag is not
  * needed there and would be rejected as an unknown argument. */
 const ALLOW_EMPTY_MIN_VERSION: readonly [number, number, number] = [0, 2, 0];
+const NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION: readonly [number, number, number] = [0, 3, 0];
 
-/** True when `version` (a bare `x.y.z`) is `0.2.0` or newer. An unknown or
- * unparseable version is treated as not supporting the flag, so the Action
- * never passes an argument an older engine would reject. */
-export function engineSupportsAllowEmpty(version: string | undefined): boolean {
+function engineAtLeastVersion(version: string | undefined, minimum: readonly [number, number, number]): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
   if (match === null) {
     return false;
   }
   const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
-  for (let i = 0; i < 3; i++) {
-    const min = ALLOW_EMPTY_MIN_VERSION[i] as number;
-    const part = parts[i] as number;
-    if (part !== min) {
-      return part > min;
+  for (let index = 0; index < minimum.length; index += 1) {
+    const part = parts[index] as number;
+    const minimumPart = minimum[index] as number;
+    if (part !== minimumPart) {
+      return part > minimumPart;
     }
   }
   return true;
+}
+
+/** True when `version` (a bare `x.y.z`) is `0.2.0` or newer. An unknown or
+ * unparseable version is treated as not supporting the flag, so the Action
+ * never passes an argument an older engine would reject. */
+export function engineSupportsAllowEmpty(version: string | undefined): boolean {
+  return engineAtLeastVersion(version, ALLOW_EMPTY_MIN_VERSION);
+}
+
+/** These flags first appear in the Protocol-Canary 0.3.0 development line;
+ * older and unknown engines must never receive flags they would reject. */
+export function engineSupportsNetworkPassphraseAndRpcRetrySettings(version: string | undefined): boolean {
+  return engineAtLeastVersion(version, NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION);
 }
 
 /**

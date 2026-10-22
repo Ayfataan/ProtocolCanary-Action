@@ -8,7 +8,10 @@ export interface ActionInputs {
   readonly protocol: number | undefined;
   readonly config: string | undefined;
   readonly network: string | undefined;
+  readonly networkPassphrase: string | undefined;
   readonly rpcUrl: string | undefined;
+  readonly rpcMaxRetries: number | undefined;
+  readonly rpcRetryDelayMs: number | undefined;
   readonly fixturesDir: string;
   readonly version: string;
   readonly uploadReport: boolean;
@@ -54,6 +57,10 @@ const DECIMAL_INTEGER = /^[0-9]+$/;
  * rejected up front with a clear, input-naming message. */
 const PROTOCOL_MIN = 1;
 const PROTOCOL_MAX = 4294967295;
+const RPC_MAX_RETRIES_MAX = 4294967295;
+const RPC_RETRY_DELAY_MS_MAX = Number.MAX_SAFE_INTEGER;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
+const NETWORK_PASSPHRASE_UNSET = "\u0001";
 
 /**
  * Largest whole number of minutes whose millisecond value is at most Node's
@@ -136,9 +143,22 @@ export function getInputs(): ActionInputs {
   const protocol = parseProtocol(core.getInput("protocol"));
   const config = parseConfig(core.getInput("config"));
   const network = optional(core.getInput("network"));
+  const networkPassphrase = parseNetworkPassphrase(core.getInput("network-passphrase", { trimWhitespace: false }));
   const rpcUrl = parseRpcUrl(core.getInput("rpc-url"));
+  const rpcMaxRetries = parseDecimalInteger(
+    core.getInput("rpc-max-retries"),
+    "rpc-max-retries",
+    0,
+    RPC_MAX_RETRIES_MAX,
+  );
+  const rpcRetryDelayMs = parseDecimalInteger(
+    core.getInput("rpc-retry-delay-ms"),
+    "rpc-retry-delay-ms",
+    0,
+    RPC_RETRY_DELAY_MS_MAX,
+  );
   const fixturesDir = core.getInput("fixtures-dir") || "fixtures";
-  const version = parseVersion(core.getInput("version") || "0.1.1");
+  const version = parseVersion(core.getInput("version") || "0.2.0");
   const uploadReport = parseBoolean("upload-report", core.getInput("upload-report") || "true");
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
@@ -150,6 +170,9 @@ export function getInputs(): ActionInputs {
 
   if (githubToken !== undefined) {
     core.setSecret(githubToken);
+  }
+  if (networkPassphrase !== undefined) {
+    core.setSecret(networkPassphrase);
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
 
@@ -172,7 +195,10 @@ export function getInputs(): ActionInputs {
     protocol,
     config,
     network,
+    networkPassphrase,
     rpcUrl,
+    rpcMaxRetries,
+    rpcRetryDelayMs,
     fixturesDir,
     version,
     uploadReport,
@@ -186,6 +212,27 @@ export function getInputs(): ActionInputs {
     generateReceipt,
     strictIntegrity,
   };
+}
+
+/** Validates an explicitly supplied passphrase without trimming it: spaces
+ * can be part of a network identity, while control characters are never safe
+ * in an Action input or CLI argument. An omitted input remains undefined. */
+function parseNetworkPassphrase(raw: string): string | undefined {
+  if (raw === NETWORK_PASSPHRASE_UNSET) {
+    return undefined;
+  }
+  if (raw === "") {
+    throw new InvalidInputError(
+      'Invalid "network-passphrase" input: "". Expected a non-empty passphrase without control characters.',
+    );
+  }
+  if (CONTROL_CHARACTERS.test(raw)) {
+    throw new InvalidInputError(
+      `Invalid "network-passphrase" input: ${JSON.stringify(raw)}. ` +
+        "Control characters are not allowed in a network passphrase.",
+    );
+  }
+  return raw;
 }
 
 /**

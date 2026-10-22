@@ -42,6 +42,30 @@ inputs:
       Soroban checks.
     required: false
 
+  network-passphrase:
+    description: >-
+      Expected Stellar network passphrase for RPC identity verification.
+      Forwarded as `--network-passphrase` by Protocol-Canary 0.3.0 and newer.
+      An explicit passphrase overrides the well-known passphrase for `network`;
+      use it for private networks or intentional endpoint overrides. Must not
+      be empty or contain control characters.
+    required: false
+    default: "\u0001"
+
+  rpc-max-retries:
+    description: >-
+      Maximum retries after a failed RPC attempt (`--rpc-max-retries`), from
+      0 to 4294967295. Zero disables retries. Forwarded by Protocol-Canary
+      0.3.0 and newer; otherwise the engine default applies.
+    required: false
+
+  rpc-retry-delay-ms:
+    description: >-
+      Base delay in milliseconds between RPC retries (`--rpc-retry-delay-ms`),
+      from 0 to 9007199254740991. The engine uses linear backoff. Forwarded by
+      Protocol-Canary 0.3.0 and newer; otherwise the engine default applies.
+    required: false
+
   rpc-url:
     description: >-
       Stellar RPC endpoint to use for live checks. Forwarded as
@@ -66,7 +90,7 @@ inputs:
       `StellarCanary/Protocol-Canary`. Reproducibility matters: this
       Action never tracks `main` or an unpinned "latest" build.
     required: false
-    default: 0.1.1
+    default: 0.2.0
 
   upload-report:
     description: >-
@@ -160,14 +184,13 @@ inputs:
     description: >-
       GitHub token used to authenticate read-only GitHub REST API requests
       to the public `StellarCanary/Protocol-Canary` repository (tag and release
-      lookups). Defaults to the workflow's `github.token`. If set to a non-empty value,
+      lookups). If set to a non-empty value,
       it takes precedence over the `GITHUB_TOKEN` environment variable. If empty
       or unset, the `GITHUB_TOKEN` environment variable is used if present;
       otherwise unauthenticated requests are made. Requires only `contents: read`
       permission, which works even in fork pull requests. Set to an empty string
       (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
     required: false
-    default: ${{ github.token }}
   strict-integrity:
     description: >-
       Optional fail-closed integrity policy (issue #372). Defaults to `false`,

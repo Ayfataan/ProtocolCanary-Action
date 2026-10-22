@@ -1,8 +1,8 @@
 {
   "measuredAt": "2026-10-22",
-  "committedBundleBytes": 1831138,
-  "sizeBudgetBytes": 2197366,
-  "sizeBudgetNote": "About 20% above the committed dist/index.js size (1,831,138 bytes) measured on 2026-10-22: 1,831,138 * 1.2 = 2,197,366 (rounded). Raise deliberately, with a reason, when the bundle legitimately grows.",
+  "committedBundleBytes": 1832859,
+  "sizeBudgetBytes": 2198983,
+  "sizeBudgetNote": "About 20% above the committed dist/index.js size (1,832,486 bytes) measured on 2026-10-22: 1,832,486 * 1.2 = 2,198,983.2 (rounded). Raise deliberately, with a reason, when the bundle legitimately grows.",
   "allowedUrlHosts": [
     { "host": "127.0.0.1", "from": "This action's rpc-url local-loopback check (src/inputs.ts) and the Azure Storage emulator connection string" },
     { "host": "api.github.com", "from": "@actions/core (tag lookup), @actions/artifact, @actions/cache, @actions/exec (GitHub REST API)" },
