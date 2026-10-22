@@ -188,8 +188,27 @@ export async function run(): Promise<void> {
   }
 
   const reportPath = reportFilePath();
+  let reportWritten = false;
+  let reportWriteError: string | undefined;
+
   if (execution.stdout.trim() !== "") {
-    fs.writeFileSync(reportPath, execution.stdout, "utf8");
+    try {
+      fs.writeFileSync(reportPath, execution.stdout, "utf8");
+      reportWritten = true;
+    } catch (error) {
+      const err = error as { code?: string };
+      reportWriteError = typeof err?.code === "string" ? err.code : describeError(error);
+      core.warning(
+        `Failed to write JSON report to ${reportPath} (${reportWriteError}): report artifact will not be uploaded.`,
+      );
+      try {
+        if (fs.existsSync(reportPath)) {
+          fs.rmSync(reportPath, { force: true });
+        }
+      } catch {
+        // Cleanup failure must never abort execution
+      }
+    }
   }
 
   if (execution.exitCode === null) {
@@ -275,6 +294,7 @@ export async function run(): Promise<void> {
         // Reproduction command (issue #416): the exact argument array the
         // engine was invoked with, so a reader can rerun the same check.
         engineArgs,
+        reportWriteError,
       }),
     );
   } catch (error) {
@@ -301,9 +321,11 @@ export async function run(): Promise<void> {
   core.setOutput("pack-protocol", packIdentity.protocol === undefined ? "" : String(packIdentity.protocol));
   core.setOutput("pack-version", packIdentity.version ?? "");
   core.setOutput("pack-digest", packIdentity.digest ?? "");
-  core.setOutput("report", reportPath);
+  if (reportWritten) {
+    core.setOutput("report", reportPath);
+  }
 
-  if (inputs.uploadReport) {
+  if (inputs.uploadReport && reportWritten) {
     await uploadReport(reportPath, artifactDifferentiator(inputs));
   }
 

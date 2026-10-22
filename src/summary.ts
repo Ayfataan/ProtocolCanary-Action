@@ -156,6 +156,8 @@ export interface SummaryProvenance {
   /** Argument array the engine was invoked with (issue #416). When present,
    * the summary renders a collapsed "Reproduction command" section. */
   readonly engineArgs?: readonly string[] | undefined;
+  /** Code describing a report write persistence failure (issue #508). */
+  readonly reportWriteError?: string | undefined;
 }
 
 const UNVERIFIED_BINARY_ROW =
@@ -238,6 +240,13 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
     const percent = total > 0 ? Math.round((replayed / total) * 100) : 0;
     lines.push(
       `> ♻️ **Replayed from cache:** ${String(replayed)}/${String(total)} checks (${String(percent)}%) came from the engine's result cache rather than being executed in this run.`,
+      "",
+    );
+  }
+
+  if (provenance?.reportWriteError !== undefined) {
+    lines.push(
+      `> ⚠️ **Report persistence warning:** Could not write the JSON report to disk (${escapeInline(provenance.reportWriteError)}). The report artifact was not uploaded.`,
       "",
     );
   }

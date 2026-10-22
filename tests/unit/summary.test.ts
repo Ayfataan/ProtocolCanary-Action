@@ -418,6 +418,16 @@ describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
   const BINARY_SHA = "a".repeat(64);
   const PACK_DIGEST = "b".repeat(64);
 
+  it("renders a report persistence warning callout note when reportWriteError is present (#508)", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      reportWriteError: "EACCES",
+    });
+
+    expect(markdown).toContain("Report persistence warning");
+    expect(markdown).toContain("EACCES");
+    expect(markdown).toContain("report artifact was not uploaded");
+  });
+
   it("renders a provenance table with the binary SHA-256, pack digest, and engine version", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
       binarySha256: BINARY_SHA,
