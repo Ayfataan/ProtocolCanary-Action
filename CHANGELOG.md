@@ -36,6 +36,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Redact recognized secrets, strip control characters, and bound engine diagnostics
+  in failure annotations and execution-failure summaries. Sanitize failure reasons
+  as well, and redact before selecting or truncating diagnostic text (#499).
+
 - Execution-failure job summaries no longer break when the raw diagnostic
   (Canary's stderr, a timeout notice) itself contains a ``` sequence, e.g.
   a compiler or panic message quoting a code block: the diagnostic fence is
