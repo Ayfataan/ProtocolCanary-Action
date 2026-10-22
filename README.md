@@ -569,3 +569,8 @@ The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail
 ## License
 
 [Apache-2.0](LICENSE)
+
+
+### Optional pull request comment (experimental)
+
+Set `pr-comment: "true"` to request a bounded copy of the existing escaped job summary as a pull request comment. The default is `false`. Same-repository `pull_request` jobs require `pull-requests: write`; fork PRs and non-PR events do not post comments. Missing permissions cause a warning without failing the check. The comment is capped at 60,000 characters and updates an existing bot-authored comment for the workflow/job where found. This feature is pending maintainer security approval and is not ready for production use.
