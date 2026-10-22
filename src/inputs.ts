@@ -23,6 +23,11 @@ export interface ActionInputs {
   /** Protocol version the fixture pack is pinned to, as a positive integer.
    * Validated for format only — see {@link parseFixturesPackProtocol}. */
   readonly fixturesPackProtocol: number | undefined;
+  /** Absolute path to a previous JSON report to validate against (#344).
+   * The engine's `diff` command is not released, so this is validated for
+   * existence, report shape, and target-protocol compatibility only; it is
+   * never claimed to have produced a regression verdict. */
+  readonly baselineReport: string | undefined;
   /** GitHub token for authenticating read-only API calls (tag and checksum lookups). */
   readonly githubToken: string | undefined;
   /** Opt in to producing an Execution Receipt (#360) and exporting it as a
@@ -140,6 +145,7 @@ export function getInputs(): ActionInputs {
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
   const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
   const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
+  const baselineReport = parseBaselineReport(core.getInput("baseline-report"));
   const githubToken = resolveGithubToken(core.getInput("github-token"));
 
   if (githubToken !== undefined) {
@@ -175,6 +181,7 @@ export function getInputs(): ActionInputs {
     allowEmpty,
     fixturesPackVersion,
     fixturesPackProtocol,
+    baselineReport,
     githubToken,
     generateReceipt,
     strictIntegrity,
@@ -247,6 +254,45 @@ function parseFixturesPackProtocol(raw: string): number | undefined {
     );
   }
   return parsed;
+}
+
+/**
+ * Validates the "baseline-report" input as a path to an existing regular
+ * file, resolved against the current working directory; `undefined` when
+ * unset. Throws {@link InvalidInputError} naming the input and the path as
+ * written when it is missing or is not a file (for example a directory).
+ *
+ * Only the path is checked here. Reading and validating the report contents —
+ * JSON syntax, schemaVersion, and target protocol — happens in
+ * `runner.loadBaselineReport` once the Action is committed to using it, so a
+ * missing path fails before any installation or engine work (#344).
+ *
+ * Returns the resolved path for the same reason as {@link parseConfig}: the
+ * file that was validated and the file the Action reads must be one path by
+ * construction.
+ */
+function parseBaselineReport(raw: string): string | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  const resolved = path.resolve(value);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(value)}. ` +
+        "Expected a path to an existing JSON report, but the file does not exist.",
+    );
+  }
+  if (!stats.isFile()) {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(value)}. ` +
+        "Expected a path to a JSON report file, but the path is not a regular file.",
+    );
+  }
+  return resolved;
 }
 
 /** Normalizes a raw Action input: returns undefined for an empty or

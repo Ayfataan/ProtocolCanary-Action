@@ -45,8 +45,9 @@ on:
         default: false
       baseline-report:
         description: >-
-          Path to a previous report to compare against. Accepted for forward
-          compatibility; the diff engine is not available yet, so the
+          Path to a previous report to validate against. The Action checks
+          that the file is a schemaVersion 1 report for the same target
+          protocol; the diff engine is not available yet, so the
           `diff-verdict` output is `unavailable` when this is set.
         required: false
         type: string
@@ -119,6 +120,7 @@ jobs:
           config: ${{ steps.paths.outputs.config }}
           fixtures-dir: ${{ steps.paths.outputs.fixtures-dir }}
           fixtures-pack-version: ${{ inputs.fixtures-version }}
+          baseline-report: ${{ inputs.baseline-report }}
           upload-report: "true"
           annotations: "true"
         env:
@@ -144,7 +146,7 @@ jobs:
             code=1
           fi
           if [ -n "$BASELINE_REPORT" ]; then
-            echo "::warning::baseline-report is accepted, but diffing a baseline is not available yet; the run was not compared."
+            echo "::warning::baseline-report was validated by the Action, but diffing a baseline is not available yet; the run was not compared."
             verdict="unavailable"
           else
             verdict="not-requested"
