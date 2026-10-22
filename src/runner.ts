@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 
 import type { ActionInputs } from "./inputs";
-import { CanaryExecutionFailedError, TimeoutError } from "./errors";
+import { CanaryExecutionFailedError, InvalidInputError, TimeoutError, describeError } from "./errors";
+import { parseReport } from "./output";
+import type { CanaryReport } from "./output";
 
 /**
  * Result of running `stellar-canary check`.
@@ -77,6 +80,66 @@ export function engineSupportsAllowEmpty(version: string | undefined): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Reads and validates a `baseline-report` file (#344).
+ *
+ * The file must be a complete, schemaVersion-1 Canary report: the same
+ * validation applied to the engine's own stdout is reused here, so a baseline
+ * cannot smuggle in a shape the summary/receipt code would not accept. All
+ * failures are raised as {@link InvalidInputError} naming the
+ * `baseline-report` input, because the problem is the caller-supplied file,
+ * not the engine run.
+ *
+ * This does not diff anything. The engine's `diff` command is not released
+ * (#335), so a valid baseline proves only that the file is usable as a
+ * baseline — the Action never reports a regression verdict from it.
+ */
+export function loadBaselineReport(filePath: string): CanaryReport {
+  let contents: string;
+  try {
+    contents = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(filePath)}. ` +
+        `The file could not be read: ${describeError(error)}`,
+    );
+  }
+  if (contents.trim() === "") {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(filePath)}. The baseline report is empty.`,
+    );
+  }
+  try {
+    return parseReport(contents);
+  } catch (error) {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(filePath)}. ` +
+        `The baseline is not a valid Protocol Canary report: ${describeError(error)}`,
+    );
+  }
+}
+
+/**
+ * Rejects a baseline recorded for a different target protocol (#344). A
+ * report for protocol 27 says nothing about a run targeting protocol 28, so
+ * comparing them — once diffing exists — would be meaningless. The message
+ * names both protocols so the caller can fix the baseline or the `protocol`
+ * input without digging through the run log.
+ */
+export function assertBaselineProtocol(
+  baseline: CanaryReport,
+  current: CanaryReport,
+  baselinePath: string,
+): void {
+  if (baseline.targetProtocol !== current.targetProtocol) {
+    throw new InvalidInputError(
+      `Incompatible baseline report: ${JSON.stringify(baselinePath)} targets protocol ` +
+        `${String(baseline.targetProtocol)}, but this run targets protocol ${String(current.targetProtocol)}. ` +
+        "A baseline can only be compared with a report for the same target protocol.",
+    );
+  }
 }
 
 const SIGNALS_TO_FORWARD: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];

@@ -1,20 +1,25 @@
 import type * as childProcess from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
+import { CanaryExecutionFailedError, InvalidInputError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
 import {
   MAX_STDERR_CAPTURE_BYTES,
   STDERR_DROPPED_NOTICE,
+  assertBaselineProtocol,
   buildCheckArgs,
   engineSupportsAllowEmpty,
   extractDiagnostic,
+  loadBaselineReport,
   runCheck,
 } from "../../src/runner";
+import { report } from "./helpers";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -65,6 +70,7 @@ const BASE_INPUTS: ActionInputs = {
   allowEmpty: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
@@ -133,6 +139,71 @@ describe("buildCheckArgs", () => {
     // merged with adjacent flags or split by the shell.
     expect(args).toContain("testnet; rm -rf /");
     expect(args.some((a) => a.includes("--network testnet"))).toBe(false);
+  });
+});
+
+describe("baseline report validation (#344)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(name: string, contents: string): string {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, contents, "utf8");
+    return file;
+  }
+
+  it("loads a complete report and preserves its target protocol", () => {
+    const file = write("baseline.json", JSON.stringify(report({ targetProtocol: 28 })));
+    const baseline = loadBaselineReport(file);
+    expect(baseline.targetProtocol).toBe(28);
+    expect(baseline.schemaVersion).toBe(1);
+  });
+
+  it("rejects an empty file before parsing", () => {
+    const file = write("empty.json", "   \n");
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/baseline report is empty/);
+  });
+
+  it("rejects invalid JSON with a clear baseline parse error", () => {
+    const file = write("broken.json", '{"schemaVersion": 1,');
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/not a valid Protocol Canary report/);
+    expect(() => loadBaselineReport(file)).toThrow(/could not be parsed as JSON/);
+  });
+
+  it("rejects an unsupported schemaVersion", () => {
+    const file = write("future.json", JSON.stringify(report({ schemaVersion: 99 })));
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/schemaVersion 99/);
+  });
+
+  it("rejects a missing or unreadable file", () => {
+    expect(() => loadBaselineReport(path.join(dir, "absent.json"))).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(path.join(dir, "absent.json"))).toThrow(/could not be read/);
+  });
+
+  it("accepts a baseline recorded for the same target protocol", () => {
+    const baseline = report({ targetProtocol: 28 });
+    const current = report({ targetProtocol: 28 });
+    expect(() => assertBaselineProtocol(baseline, current, "baseline.json")).not.toThrow();
+  });
+
+  it("rejects a baseline recorded for a different target protocol with both values named", () => {
+    const baseline = report({ targetProtocol: 27 });
+    const current = report({ targetProtocol: 28 });
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(InvalidInputError);
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(
+      /targets protocol 27, but this run targets protocol 28/,
+    );
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(/Incompatible baseline report/);
   });
 });
 

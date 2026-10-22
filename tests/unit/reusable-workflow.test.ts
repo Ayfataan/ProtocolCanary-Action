@@ -155,6 +155,7 @@ describe("reusable-canary-check workflow (#366)", () => {
     expect(SOURCE).toContain("protocol: ${{ inputs.protocol }}");
     expect(SOURCE).toContain("fixtures-dir: ${{ steps.paths.outputs.fixtures-dir }}");
     expect(SOURCE).toContain("fixtures-pack-version: ${{ inputs.fixtures-version }}");
+    expect(SOURCE).toContain("baseline-report: ${{ inputs.baseline-report }}");
     expect(SOURCE).toContain("FAIL_ON_WARNING: ${{ inputs.fail-on-warning }}");
     expect(SOURCE).toContain("BASELINE_REPORT: ${{ inputs.baseline-report }}");
   });
