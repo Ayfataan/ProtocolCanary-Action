@@ -111,7 +111,10 @@ const INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: "testnet",
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
   version: "0.1.0",
   uploadReport: false,
@@ -194,6 +197,37 @@ describe("run", () => {
     await run();
     expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--allow-empty");
     expect(infoMock).toHaveBeenCalledWith(expect.stringContaining('"allow-empty" has no effect with Canary 0.1.1'));
+  });
+
+  it("warns about each new setting ignored by an older engine without exposing the passphrase", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      version: "0.2.0",
+      networkPassphrase: "Private Network ; secret value",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('"network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"'),
+    );
+    expect(warningMock.mock.calls.flat().join(" ")).not.toContain("secret value");
+    expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--network-passphrase");
+  });
+
+  it("does not warn about new settings when the resolved engine supports them", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({ ...INPUTS, version: "0.3.0", rpcMaxRetries: 0 });
+
+    await run();
+
+    expect(warningMock).not.toHaveBeenCalledWith(expect.stringContaining("rpc-max-retries"));
+    expect(runCheckMock.mock.calls[0]?.[1]).toEqual(
+      expect.arrayContaining(["--rpc-max-retries", "0"]),
+    );
   });
 
   // #65: run() derives the install bound from timeout-minutes and hands it to
