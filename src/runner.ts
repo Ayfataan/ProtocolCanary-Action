@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
+import * as fs from "node:fs";
 
 import type { ActionInputs } from "./inputs";
-import { CanaryExecutionFailedError, TimeoutError } from "./errors";
+import { CanaryExecutionFailedError, InvalidInputError, TimeoutError, describeError } from "./errors";
+import { parseReport } from "./output";
+import type { CanaryReport } from "./output";
 
 /**
  * Result of running `stellar-canary check`.
@@ -41,8 +44,17 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   if (inputs.network !== undefined) {
     args.push("--network", inputs.network);
   }
+  if (inputs.networkPassphrase !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
+    args.push("--network-passphrase", inputs.networkPassphrase);
+  }
   if (inputs.rpcUrl !== undefined) {
     args.push("--rpc-url", inputs.rpcUrl);
+  }
+  if (inputs.rpcMaxRetries !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
+    args.push("--rpc-max-retries", String(inputs.rpcMaxRetries));
+  }
+  if (inputs.rpcRetryDelayMs !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
+    args.push("--rpc-retry-delay-ms", String(inputs.rpcRetryDelayMs));
   }
   if (inputs.config !== undefined) {
     args.push("--config", inputs.config);
@@ -59,24 +71,95 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
  * releases already exit 0 on a run that executes nothing, so the flag is not
  * needed there and would be rejected as an unknown argument. */
 const ALLOW_EMPTY_MIN_VERSION: readonly [number, number, number] = [0, 2, 0];
+const NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION: readonly [number, number, number] = [0, 3, 0];
 
-/** True when `version` (a bare `x.y.z`) is `0.2.0` or newer. An unknown or
- * unparseable version is treated as not supporting the flag, so the Action
- * never passes an argument an older engine would reject. */
-export function engineSupportsAllowEmpty(version: string | undefined): boolean {
+function engineAtLeastVersion(version: string | undefined, minimum: readonly [number, number, number]): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
   if (match === null) {
     return false;
   }
   const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
-  for (let i = 0; i < 3; i++) {
-    const min = ALLOW_EMPTY_MIN_VERSION[i] as number;
-    const part = parts[i] as number;
-    if (part !== min) {
-      return part > min;
+  for (let index = 0; index < minimum.length; index += 1) {
+    const part = parts[index] as number;
+    const minimumPart = minimum[index] as number;
+    if (part !== minimumPart) {
+      return part > minimumPart;
     }
   }
   return true;
+}
+
+/** True when `version` (a bare `x.y.z`) is `0.2.0` or newer. An unknown or
+ * unparseable version is treated as not supporting the flag, so the Action
+ * never passes an argument an older engine would reject. */
+export function engineSupportsAllowEmpty(version: string | undefined): boolean {
+  return engineAtLeastVersion(version, ALLOW_EMPTY_MIN_VERSION);
+}
+
+/** These flags first appear in the Protocol-Canary 0.3.0 development line;
+ * older and unknown engines must never receive flags they would reject. */
+export function engineSupportsNetworkPassphraseAndRpcRetrySettings(version: string | undefined): boolean {
+  return engineAtLeastVersion(version, NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION);
+}
+
+/**
+ * Reads and validates a `baseline-report` file (#344).
+ *
+ * The file must be a complete, schemaVersion-1 Canary report: the same
+ * validation applied to the engine's own stdout is reused here, so a baseline
+ * cannot smuggle in a shape the summary/receipt code would not accept. All
+ * failures are raised as {@link InvalidInputError} naming the
+ * `baseline-report` input, because the problem is the caller-supplied file,
+ * not the engine run.
+ *
+ * This does not diff anything. The engine's `diff` command is not released
+ * (#335), so a valid baseline proves only that the file is usable as a
+ * baseline — the Action never reports a regression verdict from it.
+ */
+export function loadBaselineReport(filePath: string): CanaryReport {
+  let contents: string;
+  try {
+    contents = fs.readFileSync(filePath, "utf8");
+  } catch (error) {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(filePath)}. ` +
+        `The file could not be read: ${describeError(error)}`,
+    );
+  }
+  if (contents.trim() === "") {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(filePath)}. The baseline report is empty.`,
+    );
+  }
+  try {
+    return parseReport(contents);
+  } catch (error) {
+    throw new InvalidInputError(
+      `Invalid "baseline-report" input: ${JSON.stringify(filePath)}. ` +
+        `The baseline is not a valid Protocol Canary report: ${describeError(error)}`,
+    );
+  }
+}
+
+/**
+ * Rejects a baseline recorded for a different target protocol (#344). A
+ * report for protocol 27 says nothing about a run targeting protocol 28, so
+ * comparing them — once diffing exists — would be meaningless. The message
+ * names both protocols so the caller can fix the baseline or the `protocol`
+ * input without digging through the run log.
+ */
+export function assertBaselineProtocol(
+  baseline: CanaryReport,
+  current: CanaryReport,
+  baselinePath: string,
+): void {
+  if (baseline.targetProtocol !== current.targetProtocol) {
+    throw new InvalidInputError(
+      `Incompatible baseline report: ${JSON.stringify(baselinePath)} targets protocol ` +
+        `${String(baseline.targetProtocol)}, but this run targets protocol ${String(current.targetProtocol)}. ` +
+        "A baseline can only be compared with a report for the same target protocol.",
+    );
+  }
 }
 
 const SIGNALS_TO_FORWARD: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
@@ -89,6 +172,16 @@ const SIGNALS_TO_FORWARD: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
  * and in the execution-failure summary.
  */
 export const MAX_DIAGNOSTIC_LENGTH = 500;
+
+/**
+ * Node clamps `setTimeout` delays above this value (2,147,483,647 ms, about
+ * 35,791 minutes) and fires them after 1 ms instead, so a timeout beyond it
+ * would silently end the run almost immediately. `runCheck` rejects any
+ * `timeoutMs` above it — or not a positive finite number — before spawning,
+ * so direct callers and future inputs can never hand the engine an
+ * immediate-firing timer.
+ */
+export const MAX_TIMER_MS = 2_147_483_647;
 
 /** Lines that read as the engine's root failure message, in priority order. */
 const ROOT_DIAGNOSTIC = /^(?:error|panic|fatal|failed|failure|no checks ran|invalid|unknown|unsupported|could not|cannot)\b/i;
@@ -190,6 +283,14 @@ export function runCheck(
   timeoutMs: number,
   sigkillGraceMs: number = SIGKILL_GRACE_MS,
 ): Promise<CheckExecutionResult> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_MS) {
+    return Promise.reject(
+      new Error(
+        `Invalid timeoutMs ${String(timeoutMs)}: expected a positive finite number of milliseconds not ` +
+          `exceeding ${MAX_TIMER_MS} (Node's setTimeout limit).`,
+      ),
+    );
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 

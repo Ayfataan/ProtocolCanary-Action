@@ -37,6 +37,28 @@ network access beyond the Action's own GitHub API call, no credentials.
 Not verified: an install through `cargo install --git ... --tag v0.2.0`, because
 the tag does not exist. That check belongs after publication.
 
+## Update after publication (2026-10-20)
+
+The tags now exist and the post-publication check has been attempted and
+recorded in [`docs/releases.md`](releases.md) (issue #439). Summary of
+what changed in that record, with no plan decision edited:
+
+- The verification now covered by runs, all evidence in `docs/releases.md`:
+  engines built from source at `v0.2.0` and `v0.1.1` pass this repository's
+  real-engine suite (the pinned engine-compat job), and the new
+  exit-code/skip suite (issue #438) passes against a real 0.2.0 engine.
+- The **install through `cargo install ... --tag v0.2.0` step of sequence
+  step 2 is still NOT recorded as passing**, and 0.2.0 is therefore NOT
+  added to the README compatibility table: every consumer-style run
+  (`uses: ./`) fails to load the Action itself before any install is
+  attempted, because the `github-token` input in `action.yml` uses
+  `${{ github.token }}`, an expression context action-metadata input
+  defaults do not allow. Run URLs and the exact runner errors are in
+  `docs/releases.md`; the one-line metadata fix belongs in its own PR,
+  after which those runs should be repeated and the table updated together
+  (never a first-row claim without a recorded passing run).
+- Step 3 items are unaffected. Step 4 remains a separate maintainer decision.
+
 ## Proposed sequence
 
 1. **Do nothing to defaults.** Users who want 0.2.0 set `version: 0.2.0`. Add a

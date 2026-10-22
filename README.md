@@ -140,19 +140,23 @@ jobs:
 
 | Input | Description | Default |
 |---|---|---|
-| `protocol` | Target Stellar protocol version (`--protocol`). | (from `.stellar-canary.toml`, or 28) |
+| `protocol` | Target Stellar protocol version (`--protocol`), a whole number from 1 to 4294967295 (the engine rejects 0). | (from `.stellar-canary.toml`, or 28) |
 | `config` | Path to `.stellar-canary.toml` (`--config`). Fails clearly if the given path does not exist, or is not a regular file (e.g. a directory). | (CLI default lookup) |
 | `network` | Network for live RPC/Soroban checks (`--network`). | `testnet` (CLI default) |
+| `network-passphrase` | Expected network identity for RPC verification (`--network-passphrase`). Preserved exactly, must be non-empty and contain no control characters. An explicit value overrides the passphrase associated with `network`. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | (none) |
 | `rpc-url` | Stellar RPC endpoint (`--rpc-url`). Must be `https://`, or `http://localhost`/`127.0.0.1` for local development. | (none) |
+| `rpc-max-retries` | Maximum retries after a failed RPC request (`--rpc-max-retries`). `0` disables retries; accepted range is 0 to 4294967295. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | Engine default (3) |
+| `rpc-retry-delay-ms` | Linear-backoff base delay between RPC retries (`--rpc-retry-delay-ms`), in milliseconds; accepted range is 0 to 9007199254740991. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | Engine default (500) |
 | `fixtures-dir` | Path to a directory of fixtures, e.g. a checkout of `ProtocolCanary-Fixtures` (`--fixtures-dir`). | `fixtures` |
-| `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.1.1` |
+| `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.2.0` |
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
-| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
-| `github-token` | GitHub token used to authenticate read-only requests to `api.github.com` for version resolution and checksum discovery, raising GitHub API rate limits. Defaults to `${{ github.token }}`. Pass an empty string (`""`) to disable authenticated requests. Requires only `contents: read` permission and works on fork pull requests. | `${{ github.token }}` |
+| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
+| `github-token` | Optional token for read-only requests to `api.github.com` for version resolution and checksum discovery. Set it to `${{ github.token }}` to authenticate (requires `contents: read`); otherwise requests are unauthenticated unless `GITHUB_TOKEN` is present in the environment. Pass an empty string (`""`) to disable authentication. | (none) |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
-| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected here, unlike `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
+| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected, as with `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
+| `baseline-report` | Path to a previous Protocol Canary JSON report. The file must exist and be a schemaVersion 1 report for the same target protocol as this run. **Validated only**: the engine's `diff` command is not released yet (#335), so no regression verdict is produced. A missing, malformed, or protocol-incompatible baseline fails the run with an actionable annotation. | (none) |
 
 There is deliberately no `format` input: the Action always requests
 `--format json` from the CLI (the only way it can build the summary and
@@ -177,6 +181,9 @@ literals below.
 | `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. Explicitly set to `0` on an execution failure, like the other counts. | `"3"` |
 | `engine-version` | Protocol Canary engine version that produced the result, read from the installed binary. On an execution failure, set to the resolved version if installation succeeded, or an empty string if installation failed. | `"0.1.1"` |
 | `observed-protocol` | Stellar protocol version reported by the network during live checks (`network.observedProtocol`), or an empty string when the report has no network object. Explicitly set to an empty string on an execution failure. | `"28"` |
+| `pack-protocol` | Protocol version of the resolved fixture pack, from `fixturePack.protocol` in the report or the `fixtures-pack-protocol` input. Empty when no pack identity is recorded. | `"28"` |
+| `pack-version` | Release tag/version of the resolved fixture pack, from `fixturePack.version`/`tag` or the `fixtures-pack-version` input. Empty when no pack identity is recorded. | `"v1.2.0"` |
+| `pack-digest` | Canonical content digest of the resolved fixture pack, formatted as `sha256:<64 lowercase hex>`, when the report records one. Empty when no digest is recorded or the recorded value is malformed; the Action never fabricates a digest. | `"sha256:…"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
@@ -191,7 +198,7 @@ A concrete consumer, using the outputs to gate a follow-up step:
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
 ```
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol` is set to an empty string `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol`, `pack-protocol`, `pack-version`, and `pack-digest` are set to empty strings `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 
 ## How failures appear
 
@@ -253,7 +260,9 @@ Canary version: 0.1.1
 
 <details><summary>Skipped fixtures</summary>
 
-- `p27-xdr-legacy` (xdr) — fixture targets protocol 27, this run targets protocol 28
+| Reason code | Fixture | Surface | Reason |
+|---|---|---|---|
+| `UNSUPPORTED_PROTOCOL` — Unsupported protocol | `p27-xdr-legacy` | xdr | fixture targets protocol 27, this run targets protocol 28 |
 
 </details>
 ```
@@ -379,7 +388,11 @@ in GitHub Actions collapsed log groups:
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
-long-running operations it controls:
+long-running operations it controls. It must be a whole number from 1 to
+35791 minutes: the value is multiplied by 60,000 and handed to Node's
+`setTimeout`, which clamps any delay above 2,147,483,647 ms and would fire
+the timer after 1 ms, ending the run almost immediately — so values above
+35791 are rejected up front. The default is 15.
 
 - **The Canary process** (`stellar-canary check`): terminated when it runs
   longer than `timeout-minutes`.
@@ -484,11 +497,23 @@ Prefer `@v1` to receive fixes automatically within `v1`; pin to an exact
 tag like `@v1.2.3` when you need full reproducibility (consistent with the
 `version` input, which is pinned and never tracks `main`).
 
-### Supported Canary versions
+### Engine defaults and compatibility status
 
-| Action | Protocol-Canary |
-|---|---|
-| v1 | `0.1.1` (default; `0.1.0` also installable, but predates the `ContractExecutable` XDR type two current Protocol 28 fixtures require, and its report predates the `counts` field) |
+| Action line | Engine default | Compatibility status |
+|---|---|---|
+| v1 | `0.1.1` | Legacy default. `0.1.0` is installable but predates the `ContractExecutable` XDR type required by current Protocol 28 fixtures and its report predates `counts`. |
+| v2 (prepared) | `0.2.0` | Migration target; end-to-end consumer verification is pending. |
+
+The dated evidence behind compatibility claims — the runs, engine tags and
+fixture pack that were executed — lives in [`docs/releases.md`](docs/releases.md).
+The offline engine suites passed for `0.1.1` and `0.2.0`, but neither consumer
+workflow passed its action-load/install path as of the recorded runs; the
+versions above are defaults, not a claim of end-to-end consumer verification.
+The v2 line changes the default engine and must be released under the `v2`
+major tag; do not retarget the floating `v1` tag. See the [v2 migration
+guide](docs/migrating-to-v2.md) before opting into it. Consumer-style checks
+have not yet passed with either engine version; the recorded 2026-10-20 runs
+and their loader error are in [`docs/releases.md`](docs/releases.md).
 
 This table will grow as `Protocol-Canary` cuts new releases; a
 `schemaVersion` change to its JSON report is a breaking change for this
