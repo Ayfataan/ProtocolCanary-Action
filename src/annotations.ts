@@ -49,6 +49,17 @@ export function emitExecutionFailureAnnotation(reason: string, diagnostic?: stri
 }
 
 /**
+ * Emits a workflow-level error annotation when a supplied `baseline-report`
+ * cannot be used (#344): the file is missing, is not a Canary report, or was
+ * recorded for a different target protocol. Kept distinct from the
+ * execution-failure annotation because Canary itself ran successfully; the
+ * failure is in the comparison input, not the engine.
+ */
+export function emitBaselineFailureAnnotation(reason: string): void {
+  core.error(`Protocol Canary baseline validation failed: ${reason}`, { title: TITLE });
+}
+
+/**
  * The engine exit code arrived, but the run did not pass (#351): turn the
  * exit code into an explicit classification plus the engine's own root
  * diagnostic, instead of a bare "Process exited with code N".
