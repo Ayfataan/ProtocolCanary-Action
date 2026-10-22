@@ -22,6 +22,7 @@ import {
   assertBaselineProtocol,
   buildCheckArgs,
   engineSupportsAllowEmpty,
+  engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
   loadBaselineReport,
   runCheck,
@@ -163,6 +164,19 @@ export async function run(): Promise<void> {
     core.info(
       `"allow-empty" has no effect with Canary ${resolved.version}: that version already passes a run that executes nothing.`,
     );
+  }
+  if (!engineSupportsNetworkPassphraseAndRpcRetrySettings(resolved.version)) {
+    const ignoredInputs = [
+      inputs.networkPassphrase === undefined ? undefined : "network-passphrase",
+      inputs.rpcMaxRetries === undefined ? undefined : "rpc-max-retries",
+      inputs.rpcRetryDelayMs === undefined ? undefined : "rpc-retry-delay-ms",
+    ].filter((input): input is string => input !== undefined);
+    if (ignoredInputs.length > 0) {
+      core.warning(
+        `The ${ignoredInputs.map((input) => `"${input}"`).join(", ")} input(s) are not supported by Canary ` +
+          `${resolved.version} and were ignored. Use Canary 0.3.0 or newer.`,
+      );
+    }
   }
 
   core.info(`Protocol: ${inputs.protocol !== undefined ? String(inputs.protocol) : "(from configuration)"}`);

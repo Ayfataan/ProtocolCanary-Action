@@ -66,6 +66,7 @@ const ENV_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
@@ -95,7 +96,7 @@ function engineVersion(binary: string): string {
   return match[1] as string;
 }
 
-function setUp(binary: string, version: string, inputs: Record<string, string>): Run {
+function setUp(binary: string, version: string, inputs: Record<string, string>, omitVersion = false): Run {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-real-"));
   const cargoHome = path.join(workDir, "cargo-home");
   fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
@@ -115,11 +116,14 @@ function setUp(binary: string, version: string, inputs: Record<string, string>):
   fs.writeFileSync(SUMMARY_PATH, "");
 
   for (const key of ENV_KEYS) delete process.env[key];
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   process.env.CARGO_HOME = cargoHome;
   process.env.RUNNER_TEMP = runnerTemp;
   process.env.GITHUB_OUTPUT = outputPath;
   process.env.GITHUB_STEP_SUMMARY = SUMMARY_PATH;
-  process.env.INPUT_VERSION = version;
+  if (!omitVersion) {
+    process.env.INPUT_VERSION = version;
+  }
   process.env.INPUT_PROTOCOL = "28";
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env.INPUT_ANNOTATIONS = "true";
@@ -236,6 +240,16 @@ function suite(label: string, envName: string): void {
       expect(report.toolVersion).toBe(version);
       expect(report.counts.total).toBe(1);
     });
+
+    if (version === "0.2.0") {
+      it("uses the v2 default engine version when version is omitted", async () => {
+        current = setUp(binary as string, version, {}, true);
+        await runAction();
+
+        expect(setFailedMock).not.toHaveBeenCalled();
+        expect(readOutputs(current.outputPath)["engine-version"]).toBe("0.2.0");
+      });
+    }
 
     it("allow-empty: true passes an empty run on this engine, whether or not it knows the flag", async () => {
       current = setUp(binary as string, version, { "fixtures-dir": "$EMPTY", "allow-empty": "true" });
