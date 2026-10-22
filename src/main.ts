@@ -278,7 +278,14 @@ export async function run(): Promise<void> {
       });
     await writeSummary(summaryMarkdown);
     if (inputs.prComment) {
-      const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")) as { pull_request?: { number?: number; head?: { repo?: { fork?: boolean } } } };
+      let event: { pull_request?: { number?: number; head?: { repo?: { fork?: boolean } } } } = {};
+      try {
+        if (process.env.GITHUB_EVENT_PATH) {
+          event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")) as typeof event;
+        }
+      } catch {
+        core.warning("PR comment skipped: event payload could not be read.");
+      }
       await postPullRequestComment(summaryMarkdown, inputs.githubToken, {
         eventName: process.env.GITHUB_EVENT_NAME ?? "",
         repository: process.env.GITHUB_REPOSITORY ?? "",
