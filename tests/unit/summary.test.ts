@@ -406,3 +406,51 @@ describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
     expect(() => renderSummaryMarkdown(report({ status: "fail" }), { engineVersion: "0.2.0" })).not.toThrow();
   });
 });
+
+describe("renderSummaryMarkdown — reproduction command (#416)", () => {
+  it("renders a collapsed section with the engine version and exact command", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineVersion: "0.2.0",
+      engineArgs: ["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"],
+    });
+
+    expect(markdown).toContain("<details><summary>Reproduction command</summary>");
+    expect(markdown).toContain("Engine version: `0.2.0`");
+    expect(markdown).toContain(
+      "```text\nstellar-canary check --format json --protocol 28 --fixtures-dir fixtures\n```",
+    );
+    expect(markdown).toContain("</details>");
+  });
+
+  it("quotes arguments containing spaces and shell metacharacters", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--fixtures-dir", "fixtures dir", "--config", "$WEIRD;value"],
+    });
+
+    expect(markdown).toContain("--fixtures-dir 'fixtures dir'");
+    expect(markdown).toContain("--config '$WEIRD;value'");
+  });
+
+  it("masks credentials in the --rpc-url argument", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--rpc-url", "https://user:pass@example.com/rpc?token=secret"],
+    });
+
+    expect(markdown).toContain("--rpc-url https://[REDACTED]@example.com/rpc[REDACTED]");
+    expect(markdown).not.toContain("user:pass");
+    expect(markdown).not.toContain("token=secret");
+  });
+
+  it("omits the section when no argument array is available", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineVersion: "0.2.0" })).not.toContain(
+      "Reproduction command",
+    );
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineArgs: [] })).not.toContain(
+      "Reproduction command",
+    );
+  });
+
+  it("does not render the section for pre-#416 callers that pass no provenance", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }))).not.toContain("Reproduction command");
+  });
+});

@@ -13,9 +13,11 @@ inputs:
   protocol:
     description: >-
       Target Stellar protocol version to check compatibility against
-      (forwarded as `stellar-canary check --protocol`). If omitted, the
-      CLI uses the `protocol` field from the project's
-      `.stellar-canary.toml`, or 28 if there is no configuration file.
+      (forwarded as `stellar-canary check --protocol`). Must be a whole
+      number from 1 to 4294967295 inclusive (the engine's `--protocol` is a
+      u32 and rejects 0). If omitted, the CLI uses the `protocol` field from
+      the project's `.stellar-canary.toml`, or 28 if there is no
+      configuration file.
     required: false
 
   config:
@@ -94,14 +96,17 @@ inputs:
       and the Action fails with a timeout error. Also bounds the
       `cargo install` step (floored at one minute, so a very small value
       set purely for the check cannot break installation); see the README's
-      Timeouts section. It is unrelated to GitHub Actions' own
-      job/step-level `timeout-minutes`, which the platform enforces over
-      the whole job: set any surrounding job- or step-level
-      `timeout-minutes` comfortably higher than this value, otherwise
-      GitHub's own timeout can terminate the step first with a generic
-      error and no Canary summary, annotations, or timeout diagnostic.
-      Non-integer values are truncated, not rejected (for example, "15.9"
-      becomes 15).
+      Timeouts section. Must be a whole number of minutes from 1 to 35791:
+      the value is multiplied by 60,000 and passed to Node's `setTimeout`,
+      which clamps any delay above 2,147,483,647 ms (about 35,791 minutes)
+      and would fire the timer after 1 ms, ending the run almost
+      immediately, so larger values are rejected up front. It is unrelated
+      to GitHub Actions' own job/step-level `timeout-minutes`, which the
+      platform enforces over the whole job: set any surrounding job- or
+      step-level `timeout-minutes` comfortably higher than this value,
+      otherwise GitHub's own timeout can terminate the step first with a
+      generic error and no Canary summary, annotations, or timeout
+      diagnostic.
     required: false
     default: "15"
 
@@ -133,8 +138,8 @@ inputs:
   fixtures-pack-protocol:
     description: >-
       Protocol version the fixture pack is pinned to, as a positive integer,
-      for example `28`. Zero is rejected, unlike `protocol`, which accepts a
-      non-negative integer.
+      for example `28`. Zero is rejected, as is anything above 4294967295;
+      `protocol` accepts the same 1-to-4294967295 range.
       Currently *not forwarded* to Canary, for the same reason as
       `fixtures-pack-version`; the Action logs a note when it is set. The
       protocol a run actually checks is controlled by `protocol`.

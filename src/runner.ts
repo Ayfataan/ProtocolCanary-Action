@@ -90,6 +90,16 @@ const SIGNALS_TO_FORWARD: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
  */
 export const MAX_DIAGNOSTIC_LENGTH = 500;
 
+/**
+ * Node clamps `setTimeout` delays above this value (2,147,483,647 ms, about
+ * 35,791 minutes) and fires them after 1 ms instead, so a timeout beyond it
+ * would silently end the run almost immediately. `runCheck` rejects any
+ * `timeoutMs` above it — or not a positive finite number — before spawning,
+ * so direct callers and future inputs can never hand the engine an
+ * immediate-firing timer.
+ */
+export const MAX_TIMER_MS = 2_147_483_647;
+
 /** Lines that read as the engine's root failure message, in priority order. */
 const ROOT_DIAGNOSTIC = /^(?:error|panic|fatal|failed|failure|no checks ran|invalid|unknown|unsupported|could not|cannot)\b/i;
 
@@ -190,6 +200,14 @@ export function runCheck(
   timeoutMs: number,
   sigkillGraceMs: number = SIGKILL_GRACE_MS,
 ): Promise<CheckExecutionResult> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_MS) {
+    return Promise.reject(
+      new Error(
+        `Invalid timeoutMs ${String(timeoutMs)}: expected a positive finite number of milliseconds not ` +
+          `exceeding ${MAX_TIMER_MS} (Node's setTimeout limit).`,
+      ),
+    );
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 

@@ -60,6 +60,32 @@ actionlint           # static analysis of .github/workflows/
 zizmor .github/workflows # security audit of .github/workflows/
 ```
 
+### Trying the Action locally without GitHub
+
+To see what a change does end to end without pushing a branch, run the
+committed bundle the way a workflow run would:
+
+```bash
+npm run build
+node scripts/run-local.mjs \
+  --engine "$HOME/.cargo/bin/stellar-canary" \
+  --fixtures-dir ./my-fixtures \
+  --protocol 28 \
+  --input version=0.1.1 \
+  --input allow-empty=true
+```
+
+`scripts/run-local.mjs` builds the runner environment the Action reads
+(`INPUT_*` from `--input name=value`, plus `GITHUB_OUTPUT`,
+`GITHUB_STEP_SUMMARY`, `GITHUB_ENV`, `RUNNER_TEMP` and a temporary
+`CARGO_HOME` holding the engine given by `--engine`) in a temporary
+directory, runs `dist/index.js`, and prints the outputs the Action wrote,
+the rendered job summary, the `::`-annotation lines it emitted, and the exit
+code — then exits with that code and removes the temporary directory. It
+never installs an engine (`--engine` is required) and never talks to the
+network. `--help` documents every option; see `tests/unit/run-local.test.ts`
+for the exact contract.
+
 `npm run test:coverage` runs the same suite as `npm test` with coverage
 measurement enabled (via `@vitest/coverage-v8`; configured in
 `vitest.config.ts` to measure `src/` only). It reports line/branch coverage
@@ -149,6 +175,36 @@ This project bundles with **esbuild**, not `@vercel/ncc`: the pinned
 `ncc`'s webpack-based bundler cannot resolve into a CommonJS
 `runs.using: node24` action. See `scripts/build.mjs` for the exact
 settings.
+
+## Mutation testing (StrykerJS)
+
+Line coverage says little about whether the tests would notice a behavioural
+change, so this repository has an on-demand mutation testing workflow:
+
+- `.github/workflows/mutation.yml` — runs only on `workflow_dispatch`, so it
+  never gates a pull request. It uses `npx` with pinned (but not saved)
+  `@stryker-mutator/core` and `@stryker-mutator/vitest-runner` versions,
+  mutates `src/`, runs the unit suite against each mutant, and publishes the
+  per-file mutation score and the top surviving mutants to the job summary
+  and as a `mutation-report` artifact.
+- `stryker.config.json` — the StrykerJS configuration: mutates `src/**/*.ts`,
+  uses the Vitest runner against `tests/unit`, and emits JSON, Markdown, and
+  HTML reports.
+
+To run it locally:
+
+```bash
+# Install the Vitest runner once, without saving it to package.json or
+# package-lock.json.
+npm install --no-save @stryker-mutator/vitest-runner@7.7.4
+npx --yes @stryker-mutator/core@7.7.4 stryker run
+```
+
+Reports are written to `reports/mutation/` (gitignored). Mutation survivors
+point at assertions that are too weak to catch a real change: treat a
+surviving mutant as a signal to strengthen the test, not as a reason to
+lower the threshold. A deliberately weakened assertion in a scratch copy
+shows up as a surviving mutant.
 
 ## Coding standards
 

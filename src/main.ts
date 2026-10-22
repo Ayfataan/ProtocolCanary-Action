@@ -135,9 +135,12 @@ export async function run(): Promise<void> {
   core.info(`Protocol: ${inputs.protocol !== undefined ? String(inputs.protocol) : "(from configuration)"}`);
   core.info("Running compatibility checks...");
 
+  // Build the engine arguments for the reproduction command display
+  const engineArgs = buildCheckArgs(inputs, resolved.version);
+
   let execution;
   try {
-    execution = await runCheck(installed.binaryPath, buildCheckArgs(inputs, resolved.version), inputs.timeoutMinutes * 60_000);
+    execution = await runCheck(installed.binaryPath, engineArgs, inputs.timeoutMinutes * 60_000);
   } catch (error) {
     const diagnostic = error instanceof TimeoutError && error.stderr ? error.stderr : "";
     if (error instanceof TimeoutError && error.stderr.trim() !== "") {
@@ -218,6 +221,9 @@ export async function run(): Promise<void> {
       renderSummaryMarkdown(report, {
         ...(binarySha256 !== undefined ? { binarySha256 } : {}),
         engineVersion: installed.version,
+        // Reproduction command (issue #416): the exact argument array the
+        // engine was invoked with, so a reader can rerun the same check.
+        engineArgs,
       }),
     );
   } catch (error) {
