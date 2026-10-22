@@ -34,6 +34,25 @@ inputs:
       the CLI reads are always the same.
     required: false
 
+  working-directory:
+    description: >-
+      Directory to treat as the project root of the run, forwarded as
+      `stellar-canary check --project-root` so a monorepo can check one
+      subdirectory or workspace member. Relative paths are resolved against
+      the workspace, and a path that does not exist or is not a directory
+      (for example a regular file) fails the run before Canary is invoked,
+      with the value as written and the resolved path in the error. Defaults
+      to `.` — the workspace itself, which is what Canary already uses — and
+      that default is validated but not forwarded, so runs that never set
+      this input send exactly the arguments they always did. When a value
+      *is* given, relative paths such as `--fixtures-dir` are resolved
+      against it by the engine, and it requires an engine release that
+      supports `--project-root` (Protocol-Canary E-010): older releases such
+      as the default `version` reject the unknown argument with a clear
+      usage error rather than silently checking the wrong directory.
+    required: false
+    default: "."
+
   network:
     description: >-
       Stellar network to run live RPC/Soroban checks against (for example

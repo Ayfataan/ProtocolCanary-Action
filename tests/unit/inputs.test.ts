@@ -26,6 +26,7 @@ import { getInputs } from "../../src/inputs";
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
+  "INPUT_WORKING-DIRECTORY",
   "INPUT_NETWORK",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
@@ -59,6 +60,7 @@ describe("getInputs", () => {
     expect(inputs).toEqual({
       protocol: undefined,
       config: undefined,
+      workingDirectory: process.cwd(),
       network: undefined,
       rpcUrl: undefined,
       fixturesDir: "fixtures",

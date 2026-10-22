@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import * as path from "node:path";
 
 import type { ActionInputs } from "./inputs";
 import { CanaryExecutionFailedError, TimeoutError } from "./errors";
@@ -46,6 +47,19 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   }
   if (inputs.config !== undefined) {
     args.push("--config", inputs.config);
+  }
+  // #348: `--project-root` is forwarded only when `working-directory` is not
+  // the directory the engine already defaults to — the current working
+  // directory. A run that never sets the input therefore sends
+  // byte-identical arguments to every engine release, including the ones
+  // that predate the flag (Protocol-Canary E-010 / #404, which no published
+  // release carries yet: v0.1.1 and v0.2.0 reject an unknown argument with
+  // exit code 2). An explicit directory that differs from the workspace is
+  // precisely the case that needs the flag, and failing loudly there — an
+  // engine without the flag reports a clear usage error — beats silently
+  // checking the wrong directory.
+  if (inputs.workingDirectory !== undefined && inputs.workingDirectory !== path.resolve(".")) {
+    args.push("--project-root", inputs.workingDirectory);
   }
   args.push("--fixtures-dir", inputs.fixturesDir);
   if (inputs.allowEmpty && engineSupportsAllowEmpty(engineVersion)) {
