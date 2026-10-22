@@ -34,7 +34,7 @@ describe("PR comments", () => {
       .mockResolvedValueOnce({ ok: true });
     await postPullRequestComment("summary", "token", context, request);
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request.mock.calls[1][1].method).toBe("POST");
+    expect(request.mock.calls[1]![1]!.method).toBe("POST");
   });
 
   it("updates an existing bot comment", async () => {
@@ -45,8 +45,8 @@ describe("PR comments", () => {
       })
       .mockResolvedValueOnce({ ok: true });
     await postPullRequestComment("new", "token", context, request);
-    expect(request.mock.calls[1][1].method).toBe("PATCH");
-    expect(request.mock.calls[1][0]).toContain("/issues/comments/7");
+    expect(request.mock.calls[1]![1]!.method).toBe("PATCH");
+    expect(request.mock.calls[1]![0]).toContain("/issues/comments/7");
   });
 
   it("does not fail when permission is denied", async () => {
