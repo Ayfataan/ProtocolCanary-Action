@@ -186,6 +186,14 @@ inputs:
     required: false
     default: "false"
 
+  pr-comment:
+    description: >-
+      Opt in to a bounded pull request summary comment. Requires pull-requests: write
+      on same-repository pull_request workflows. Fork PRs and other events are skipped.
+      Permission failures are warnings, not failed checks. Defaults to false.
+    required: false
+    default: "false"
+
   generate-receipt:
     description: >-
       Generate a machine-readable Execution Receipt (`receiptVersion: 1`)
