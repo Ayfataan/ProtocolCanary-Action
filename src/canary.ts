@@ -750,8 +750,8 @@ async function extractPrebuiltArchive(archivePath: string, destDir: string): Pro
 }
 
 interface DiscoveryResult {
-  binaryPath?: string;
-  errorReason?: string;
+  binaryPath?: string | undefined;
+  errorReason?: string | undefined;
 }
 
 /**
