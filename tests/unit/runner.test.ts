@@ -3,7 +3,7 @@ import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
@@ -561,5 +561,66 @@ describe("UTF-8 stream decoding and bounded capture (issue #427)", () => {
     expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
     expect(result.stderr).toContain("FINAL ROOT DIAGNOSTIC ERROR");
     expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_STDERR_CAPTURE_BYTES);
+  });
+});
+
+describe("runCheck timeoutMs guard (#456)", () => {
+  beforeEach(() => {
+    spawnMock.mockClear();
+  });
+
+  it("rejects a timeoutMs above the Node timer limit instead of starting a timer", async () => {
+    await expect(
+      runCheck("fake-canary", ["check"], 2_147_483_648),
+    ).rejects.toThrow(/timeoutMs/);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, NaN, Infinity])(
+    "rejects a non-positive or non-finite timeoutMs %j",
+    async (timeoutMs) => {
+      await expect(runCheck("fake-canary", ["check"], timeoutMs)).rejects.toThrow(
+        /timeoutMs/,
+      );
+      expect(spawnMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("passes a sub-limit delay to setTimeout for 35791 minutes and does not fire immediately", async () => {
+    // Regression: timeout-minutes: 40000 used to be multiplied by 60,000 and
+    // handed to setTimeout, which clamped delays above 2,147,483,647 ms to
+    // fire after 1 ms and terminate the engine almost immediately. The largest
+    // accepted value (35791 minutes) must keep a real, sub-limit delay.
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild(false); // ignores SIGTERM: only the timer can settle it
+      spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+      const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+      let settled = false;
+      const pending = runCheck("fake-canary", ["check"], 35791 * 60_000);
+      pending.then(() => {
+        settled = true;
+      }, () => {
+        settled = true;
+      });
+
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      const [, delay] = setTimeoutSpy.mock.lastCall as [unknown, number];
+      expect(delay).toBe(35791 * 60_000);
+      expect(delay).toBeLessThan(2_147_483_647);
+
+      // Advancing 1 ms must not settle the promise: the timer is honoured,
+      // not clamped to fire immediately.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(false);
+
+      // Letting the timer fire proves the delay is real: SIGTERM is sent, the
+      // child ignores it, and SIGKILL after the grace period settles it.
+      await vi.advanceTimersByTimeAsync(35791 * 60_000 + 6_000);
+      await expect(pending).rejects.toThrow(TimeoutError);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

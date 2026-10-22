@@ -132,6 +132,18 @@ All notable changes to this project are documented in this file.
   forwarded to the `stellar-canary` CLI, which failed later with a generic,
   less actionable error. `parseConfig` now requires the resolved path to be
   a regular file (`fs.statSync(...).isFile()`) rather than merely existing.
+- Numeric inputs are strictly validated before any process is started:
+  `protocol` accepts 1 to 4294967295 inclusive (0 is rejected; the engine
+  rejects `--protocol 0` too, so no working configuration changes) and
+  `timeout-minutes` accepts 1 to 35791 minutes — 35,791 * 60,000 ms is the
+  largest delay below Node's 2,147,483,647 ms `setTimeout` limit, above
+  which Node clamps the timer to fire after 1 ms and end the run almost
+  immediately. Loosely formatted values such as "1e3", "5 minutes", "1.9",
+  or "+5" are now rejected with a message that names the input, quotes the
+  value, and states the accepted range, instead of silently becoming a
+  different timeout or an invalid engine argument. The superseded behaviors
+  (fractional `timeout-minutes` truncation, `protocol` "0") are rejected
+  outright; see #456.
 - `fixtures-dir` is now validated against the filesystem **before** version
   resolution and engine installation (#400): the path is resolved against
   the working directory and must name an existing directory. A missing

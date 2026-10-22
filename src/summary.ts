@@ -2,6 +2,7 @@ import * as core from "@actions/core";
 
 import { SummaryPublishFailedError } from "./errors";
 import { countReplayed } from "./output";
+import { codeSpan, escapeInline, fencedBlock, maskRpcUrl, quoteForShell } from "./markdown";
 import type { CanaryReport, OverallStatus, Surface } from "./output";
 
 const SURFACE_HEADINGS: Readonly<Record<Surface, string>> = {
@@ -42,15 +43,9 @@ function notablyList(report: CanaryReport, statuses: readonly ("fail" | "error" 
   return report.results
     .filter((r) => (statuses as readonly string[]).includes(r.status))
     .map((r) => {
-      const lines = [`- \`${r.testId}\` (${r.surface}) — ${r.summary}`];
+      const lines = [`- ${codeSpan(r.testId)} (${escapeInline(r.surface)}) — ${escapeInline(r.summary)}`];
       if (r.details !== undefined && r.details.trim() !== "") {
-        lines.push(
-          r.details
-            .trim()
-            .split("\n")
-            .map((line) => `  ${line}`)
-            .join("\n"),
-        );
+        lines.push(fencedBlock(r.details.trim()));
       }
       return lines.join("\n");
     });
@@ -74,6 +69,9 @@ export interface SummaryProvenance {
   readonly packDigest?: string | undefined;
   /** Engine version the run executed. */
   readonly engineVersion?: string | undefined;
+  /** Argument array the engine was invoked with (issue #416). When present,
+   * the summary renders a collapsed "Reproduction command" section. */
+  readonly engineArgs?: readonly string[] | undefined;
 }
 
 const UNVERIFIED_BINARY_ROW =
@@ -118,19 +116,22 @@ function provenanceLines(provenance: SummaryProvenance): string[] {
 
 /** Pure Markdown rendering, kept separate from `core.summary` so it can be
  * golden/snapshot-tested without a GitHub Actions runtime. `provenance`
- * renders the Provenance & Trust section (issue #373); omitting it renders
- * no section, keeping every pre-provenance consumer's output identical. */
+ * renders the Provenance & Trust section (issue #373) and the reproduction
+ * command (issue #416); omitting it renders no section, keeping every
+ * pre-provenance consumer's output identical. */
 export function renderSummaryMarkdown(report: CanaryReport, provenance?: SummaryProvenance): string {
   const lines: string[] = [];
   lines.push("## Stellar Protocol Canary", "");
-  lines.push(`Protocol: ${String(report.targetProtocol)}`);
-  lines.push(`Project: ${report.project.name} (${report.project.type})`);
+  lines.push(`Protocol: ${escapeInline(String(report.targetProtocol))}`);
+  lines.push(`Project: ${escapeInline(report.project.name)} (${escapeInline(report.project.type)})`);
   if (report.network !== undefined) {
     const observed =
-      report.network.observedProtocol !== undefined ? ` — observed protocol ${String(report.network.observedProtocol)}` : "";
-    lines.push(`Network: ${report.network.name}${observed}`);
+      report.network.observedProtocol !== undefined
+        ? ` — observed protocol ${escapeInline(String(report.network.observedProtocol))}`
+        : "";
+    lines.push(`Network: ${escapeInline(report.network.name)}${observed}`);
   }
-  lines.push(`Canary version: ${report.toolVersion}`, "");
+  lines.push(`Canary version: ${escapeInline(report.toolVersion)}`, "");
 
   const rows = SURFACE_ORDER.map((surface) => surfaceRowLabel(report.results, surface)).filter(
     (row): row is string => row !== undefined,
@@ -175,14 +176,70 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
     lines.push(
       "<details><summary>Skipped fixtures</summary>",
       "",
-      ...report.skipped.map((s) => `- \`${s.fixtureId}\` (${s.surface}) — ${s.reason}`),
+      ...report.skipped.map((s) => `- ${codeSpan(s.fixtureId)} (${escapeInline(s.surface)}) — ${escapeInline(s.reason)}`),
       "",
       "</details>",
       "",
     );
   }
 
+  // Reproduction command section (issue #416)
+  if (provenance?.engineArgs !== undefined && provenance.engineArgs.length > 0) {
+    lines.push(renderReproductionCommand(provenance.engineArgs, provenance.engineVersion));
+  }
+
   return lines.join("\n");
+}
+
+/**
+ * Renders a collapsed <details> section with the engine version and a
+ * copy-pasteable `stellar-canary check` command.
+ *
+ * Arguments are quoted for POSIX shell safety. The --rpc-url value is
+ * masked when it contains userinfo, a query string, or a fragment, using
+ * the same parsing as src/redact.ts.
+ */
+function renderReproductionCommand(args: readonly string[], engineVersion?: string): string {
+  const lines: string[] = [];
+  lines.push("<details><summary>Reproduction command</summary>", "");
+
+  if (engineVersion !== undefined) {
+    lines.push(`Engine version: ${codeSpan(engineVersion)}`, "");
+  }
+
+  // Build the command string with POSIX shell quoting
+  const command = buildCommandString(args);
+  lines.push(fencedBlock(command), "", "</details>", "");
+
+  return lines.join("\n");
+}
+
+/**
+ * Builds a POSIX-shell-safe command string from the argument array.
+ *
+ * Masks the --rpc-url value when it contains userinfo, query string, or fragment.
+ * Quotes arguments that contain spaces, quotes, or shell metacharacters.
+ */
+function buildCommandString(args: readonly string[]): string {
+  const parts: string[] = ["stellar-canary"];
+
+  let i = 0;
+  while (i < args.length) {
+    const arg = args[i]!; // i < args.length guaranteed by loop condition
+    const nextArg = args[i + 1];
+
+    // Mask --rpc-url value if it contains credentials, query, or fragment
+    if (arg === "--rpc-url" && nextArg !== undefined) {
+      parts.push(arg, maskRpcUrl(nextArg));
+      i += 2; // Skip the next argument since we handled it
+      continue;
+    }
+
+    parts.push(quoteForShell(arg));
+    i++;
+  }
+
+  return parts.join(" ");
 }
 
 /**
