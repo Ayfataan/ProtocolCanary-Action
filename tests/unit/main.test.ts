@@ -142,6 +142,7 @@ const INPUTS: ActionInputs = {
   allowEmpty: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
@@ -646,6 +647,7 @@ describe("run", () => {
       expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
     });
   });
+
   // #400: fixtures-dir is validated after input parsing and before version
   // resolution or installation. The regression test is the execution-order
   // one: under the original behavior, a missing fixtures directory went
@@ -876,5 +878,115 @@ describe("run", () => {
       expect(uploadReportMock).toHaveBeenCalledWith(reportPath, expect.any(String));
     });
   });
-});
 
+  describe("issue #340: fixture-pack identity outputs", () => {
+    it("sets pack-protocol, pack-version and pack-digest from the report and inputs", async () => {
+      const digest = `sha256:${"b".repeat(64)}`;
+      const testReport = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+        fixturePack: { digest, protocol: 28 },
+      });
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesPackVersion: "v1.2.0", fixturesPackProtocol: 28 });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "28");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "v1.2.0");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", digest);
+    });
+
+    it("sets empty pack outputs when no external pack is in use", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+
+    it("clears pack outputs on an execution failure instead of leaking a stale identity", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+  });
+
+  describe("issue #344: baseline report failure modes", () => {
+    function baselineFile(contents: string): string {
+      const file = path.join(runnerTemp, "baseline.json");
+      fs.writeFileSync(file, contents, "utf8");
+      return file;
+    }
+
+    it("fails before installation on an invalid JSON baseline with a parse annotation", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baselineFile('{"schemaVersion": 1,') });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("baseline-report");
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("could not be parsed as JSON");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("baseline validation failed"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+    });
+
+    it("fails before installation when the baseline schemaVersion is unsupported", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ schemaVersion: 99 }))),
+      });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("schemaVersion 99");
+    });
+
+    it("halts with an incompatibility diagnostic when the baseline targets another protocol", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ targetProtocol: 27 }))),
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failure = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failure).toContain("Incompatible baseline report");
+      expect(failure).toContain("targets protocol 27, but this run targets protocol 28");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("targets protocol 27"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+      // No regression claim is made and no compatibility outputs are published.
+      expect(setOutputMock).not.toHaveBeenCalledWith("status", expect.anything());
+    });
+
+    it("validates a matching baseline without claiming a regression verdict", async () => {
+      const baseline = baselineFile(JSON.stringify(report({ targetProtocol: 28 })));
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baseline });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("validated for protocol 28"));
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("no regression verdict"));
+    });
+  });
+});
