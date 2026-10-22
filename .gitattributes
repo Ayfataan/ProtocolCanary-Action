@@ -5,5 +5,6 @@
 # diffs for these minified multi-MB files.
 *.ts text eol=lf
 *.tsx text eol=lf
+tests/golden/*.md text eol=lf
 dist/index.js text eol=lf linguist-generated=true -diff
 dist/index.js.map text eol=lf linguist-generated=true -diff
