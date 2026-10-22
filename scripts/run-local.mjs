@@ -159,6 +159,8 @@ function buildEnvironment(enginePath, fixes) {
   }
 
   const overridden = new Set();
+  env[inputEnvName("network-passphrase")] = "\u0001";
+  overridden.add(inputEnvName("network-passphrase"));
   for (const [name, value] of fixes) {
     env[inputEnvName(name)] = value;
     overridden.add(inputEnvName(name));

@@ -9,6 +9,118 @@ import { InvalidReportError } from "./errors";
  */
 export const SUPPORTED_SCHEMA_VERSION = 1;
 
+/**
+ * Validates that a value is a non-empty string. Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requireNonEmptyString(value: unknown, fieldPath: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an empty "${fieldPath}" field.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a value is a positive integer (>= 1). Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requirePositiveInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected a positive integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates that a value is a non-negative integer (>= 0). Throws {@link InvalidReportError}
+ * with the given field path if not.
+ */
+function requireNonNegativeInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected a non-negative integer.`);
+  }
+  return value;
+}
+
+/**
+ * Validates the project object has required name and type fields.
+ */
+function validateProject(project: unknown, fieldPath: string): { readonly name: string; readonly type: string } {
+  if (typeof project !== "object" || project === null) {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an invalid "${fieldPath}" field: expected an object.`);
+  }
+  const p = project as Record<string, unknown>;
+  const name = requireNonEmptyString(p.name, `${fieldPath}.name`);
+  const type = requireNonEmptyString(p.type, `${fieldPath}.type`);
+  return { name, type };
+}
+
+/**
+ * Validates the network object if present.
+ */
+function validateNetwork(network: unknown, fieldPath: string): { readonly name: string; readonly observedProtocol?: number } | undefined {
+  if (network === undefined || network === null) {
+    return undefined;
+  }
+  if (typeof network !== "object") {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}" field: expected an object or null.`);
+  }
+  const n = network as Record<string, unknown>;
+  const name = requireNonEmptyString(n.name, `${fieldPath}.name`);
+  let observedProtocol: number | undefined;
+  if (n.observedProtocol !== undefined) {
+    observedProtocol = requirePositiveInteger(n.observedProtocol, `${fieldPath}.observedProtocol`);
+  }
+  if (n.error !== undefined && typeof n.error !== "string") {
+    throw new InvalidReportError(`Canary's JSON output has an invalid "${fieldPath}.error" field: expected a string.`);
+  }
+  return observedProtocol !== undefined ? { name, observedProtocol } : { name };
+}
+
+/**
+ * Validates the counts object and checks agreement with results/skipped.
+ */
+function validateCounts(
+  counts: unknown,
+  results: readonly CanaryResult[],
+  skipped: readonly CanarySkip[] | undefined,
+  fieldPath: string,
+): CanaryCounts {
+  if (typeof counts !== "object" || counts === null) {
+    throw new InvalidReportError(`Canary's JSON output is missing or has an invalid "${fieldPath}" field: expected an object.`);
+  }
+  const c = counts as Partial<CanaryCounts>;
+  const total = requireNonNegativeInteger(c.total, `${fieldPath}.total`);
+  const passed = requireNonNegativeInteger(c.passed, `${fieldPath}.passed`);
+  const failed = requireNonNegativeInteger(c.failed, `${fieldPath}.failed`);
+  const warnings = requireNonNegativeInteger(c.warnings, `${fieldPath}.warnings`);
+  const errors = requireNonNegativeInteger(c.errors, `${fieldPath}.errors`);
+  const skippedCount = requireNonNegativeInteger(c.skipped, `${fieldPath}.skipped`);
+
+  const validated: CanaryCounts = { total, passed, failed, warnings, errors, skipped: skippedCount };
+
+  // Verify agreement with results and skipped
+  const derived = deriveCounts(results, skipped);
+  if (
+    validated.total !== derived.total ||
+    validated.passed !== derived.passed ||
+    validated.failed !== derived.failed ||
+    validated.warnings !== derived.warnings ||
+    validated.errors !== derived.errors ||
+    validated.skipped !== derived.skipped
+  ) {
+    throw new InvalidReportError(
+      `Canary's JSON output has a "${fieldPath}" field that disagrees with results/skipped: ` +
+        `expected total=${derived.total}, passed=${derived.passed}, failed=${derived.failed}, ` +
+        `warnings=${derived.warnings}, errors=${derived.errors}, skipped=${derived.skipped}; ` +
+        `got total=${validated.total}, passed=${validated.passed}, failed=${validated.failed}, ` +
+        `warnings=${validated.warnings}, errors=${validated.errors}, skipped=${validated.skipped}.`,
+    );
+  }
+
+  return validated;
+}
+
 export type Surface = "xdr" | "rpc" | "soroban";
 export type ResultStatus = "pass" | "warning" | "fail" | "error" | "skipped";
 export type OverallStatus = "pass" | "warning" | "fail" | "error";
@@ -45,6 +157,33 @@ export interface CanarySkip {
   readonly fixtureId: string;
   readonly surface: string;
   readonly reason: string;
+  /**
+   * Stable machine-readable skip reason (CF-01): one of
+   * `UNSUPPORTED_PROTOCOL`, `SURFACE_DISABLED`, `MISSING_CAPABILITY`,
+   * `OFFLINE`, `NETWORK_MISMATCH`, or `UNKNOWN`. Absent in reports written
+   * before the field existed; an unrecognized value is read as `UNKNOWN` by
+   * consumers rather than rejected.
+   */
+  readonly code?: string;
+}
+
+export interface CanaryFixturePack {
+  /** Canonical `sha256:<64 lowercase hex>` digest of the fixture pack. */
+  readonly digest?: string;
+  /** Protocol the pack is pinned to, when recorded. */
+  readonly protocol?: number;
+  /** Pack release tag/version, when recorded. */
+  readonly version?: string;
+  /** Alias some report producers use for the release tag. */
+  readonly tag?: string;
+  /** Fixture registry format version. */
+  readonly registryVersion?: number;
+  /** `"directory"` or `"release"`, when recorded. */
+  readonly source?: string;
+  /** Full git revision of the pack source, or null. */
+  readonly revision?: string | null;
+  /** Alias some producers use for the canonical digest. */
+  readonly packDigest?: string;
 }
 
 export interface CanaryCounts {
@@ -66,6 +205,10 @@ export interface CanaryReport {
   readonly counts: CanaryCounts;
   readonly results: readonly CanaryResult[];
   readonly skipped?: readonly CanarySkip[];
+  /** Reserved additive CF-02 pack identity; absent for local/unrecorded packs. */
+  readonly fixturePack?: CanaryFixturePack;
+  /** Legacy/top-level alias for the pack digest used by early receipt drafts. */
+  readonly packDigest?: string;
   readonly git: {
     readonly commit: string | null;
     readonly branch: string | null;
@@ -147,6 +290,9 @@ function skipShapeError(entry: unknown): string | undefined {
   if (typeof skip.reason !== "string") {
     return 'missing or non-string "reason"';
   }
+  if (skip.code !== undefined && typeof skip.code !== "string") {
+    return 'non-string "code" when present';
+  }
   return undefined;
 }
 
@@ -215,6 +361,12 @@ export function parseReport(stdout: string): CanaryReport {
     throw new InvalidReportError("Canary's JSON output does not match the documented report shape.");
   }
 
+  // Validate required fields that the renderer and annotation code depend on
+  const toolVersion = requireNonEmptyString(report.toolVersion, "toolVersion");
+  const targetProtocol = requirePositiveInteger(report.targetProtocol, "targetProtocol");
+  const project = validateProject(report.project, "project");
+  const network = validateNetwork(report.network, "network");
+
   const rawResults: unknown[] = report.results;
   for (const [index, entry] of rawResults.entries()) {
     const problem = resultShapeError(entry);
@@ -238,7 +390,7 @@ export function parseReport(stdout: string): CanaryReport {
     if (seenIdentities.has(identity)) {
       throw new InvalidReportError(
         `Canary's JSON output contains a duplicate result identity: ` +
-          `(surface, id) = (\"${result.surface}\", \"${id}\") appears more than once ` +
+          `(surface, id) = ("${result.surface}", "${id}") appears more than once ` +
           `(results[${String(index)}]).`,
       );
     }
@@ -260,13 +412,128 @@ export function parseReport(stdout: string): CanaryReport {
     }
   }
   const skipped = report.skipped as CanarySkip[] | undefined;
-  const rawCounts = isCountsShape(report.counts) ? report.counts : deriveCounts(results, skipped);
-  const counts: CanaryCounts = {
-    ...rawCounts,
-    skipped: typeof rawCounts.skipped === "number" ? rawCounts.skipped : (skipped?.length ?? 0),
-  };
 
-  return { ...report, results, skipped, counts } as CanaryReport;
+  // Validate counts if present and complete; otherwise derive.
+  // A malformed counts field (missing fields, wrong types) is silently
+  // replaced by derived counts, preserving the behavior older engines rely
+  // on. A well-formed counts field that disagrees with results/skipped is
+  // rejected. Engines that predate the `skipped` count omit only that one
+  // field: the rest of their counts are preserved and `skipped` is populated
+  // from the skipped array, exactly as before.
+  const rawCounts = isCountsShape(report.counts) ? report.counts : undefined;
+  let counts: CanaryCounts;
+  if (rawCounts === undefined) {
+    counts = deriveCounts(results, skipped);
+  } else if (rawCounts.skipped === undefined) {
+    counts = { ...rawCounts, skipped: skipped?.length ?? 0 };
+  } else {
+    counts = validateCounts(rawCounts, results, skipped, "counts");
+  }
+
+  // Spread the raw report so reserved/additive fields this Action does not
+  // (yet) model — `engineCommit`, `packDigest`, `network.error`, … — survive
+  // parsing for downstream consumers such as the Execution Receipt. The
+  // validated fields below overwrite their raw counterparts.
+  return {
+    ...report,
+    toolVersion,
+    targetProtocol,
+    project,
+    ...(network !== undefined ? { network } : {}),
+    status: report.status,
+    counts,
+    results,
+    skipped,
+    git: report.git ?? { commit: null, branch: null, isDirty: null },
+  } as CanaryReport;
+}
+
+/** Inputs that may carry a fixture-pack pin even when the report does not. */
+export interface PackIdentitySource {
+  readonly fixturesPackVersion?: string | undefined;
+  readonly fixturesPackProtocol?: number | undefined;
+}
+
+/** Pack provenance available for the Action outputs (#340). */
+export interface ResolvedPackIdentity {
+  /** Canonical `sha256:<64 lowercase hex>` digest, when known. */
+  readonly digest?: string;
+  /** Integer protocol the pack is pinned to, when known. */
+  readonly protocol?: number;
+  /** Release tag/version of the pack, when known. */
+  readonly version?: string;
+}
+
+const CANONICAL_DIGEST = /^(?:sha256:)?([0-9a-fA-F]{64})$/;
+
+/**
+ * Normalizes a pack digest to the documented `sha256:<64 lowercase hex>`
+ * form. Accepts a bare 64-hex digest as a convenience, but returns
+ * `undefined` for anything else instead of emitting a loosely shaped output.
+ */
+function canonicalPackDigest(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const match = CANONICAL_DIGEST.exec(value.trim());
+  const hex = match?.[1];
+  return hex === undefined ? undefined : `sha256:${hex.toLowerCase()}`;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
+}
+
+/**
+ * Resolves the fixture-pack identity this run can honestly report (#340).
+ *
+ * The CF-02 pack identity is an additive report field (`fixturePack`), and
+ * the engine releases that emit it are still rolling out. The Action
+ * therefore reads it defensively, falls back to the validated
+ * `fixtures-pack-version` / `fixtures-pack-protocol` inputs when a caller
+ * pinned a pack explicitly, and returns an empty identity when no external
+ * pack is in play. A pack digest is only surfaced in the canonical
+ * `sha256:<64 lowercase hex>` form; a malformed value is ignored rather than
+ * echoed into an output. This function never throws for a malformed optional
+ * field — reports are untrusted input.
+ */
+export function resolvePackIdentity(
+  report: CanaryReport,
+  source: PackIdentitySource = {},
+): ResolvedPackIdentity {
+  const rawFixturePack = (report as { readonly fixturePack?: unknown }).fixturePack;
+  const fixturePack =
+    typeof rawFixturePack === "object" && rawFixturePack !== null && !Array.isArray(rawFixturePack)
+      ? (rawFixturePack as Record<string, unknown>)
+      : undefined;
+  const rawTopLevelDigest = (report as { readonly packDigest?: unknown }).packDigest;
+
+  const digest =
+    canonicalPackDigest(fixturePack?.digest) ??
+    canonicalPackDigest(fixturePack?.packDigest) ??
+    canonicalPackDigest(rawTopLevelDigest);
+  const version =
+    nonEmptyString(fixturePack?.version) ??
+    nonEmptyString(fixturePack?.tag) ??
+    nonEmptyString(source.fixturesPackVersion);
+  const protocol =
+    positiveInteger(fixturePack?.protocol) ??
+    positiveInteger(source.fixturesPackProtocol) ??
+    (digest !== undefined ? positiveInteger(report.targetProtocol) : undefined);
+
+  const identity: { digest?: string; protocol?: number; version?: string } = {};
+  if (digest !== undefined) identity.digest = digest;
+  if (protocol !== undefined) identity.protocol = protocol;
+  if (version !== undefined) identity.version = version;
+  return identity;
 }
 
 /**

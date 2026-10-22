@@ -107,14 +107,22 @@ the codebase, these thresholds are ratcheted upward. Run `npm run test:coverage`
 locally to verify your changes satisfy the coverage gate.
 
 Unit and integration tests must never require network access or a real
-`stellar-canary` binary: they run against
+`stellar-canary` binary by default: they run against
 [`tests/fixtures/mock-canary.cjs`](tests/fixtures/mock-canary.cjs), a fake
 CLI that simulates every documented result state (`pass`, `warning`,
 `fail`, `config-error`, `rpc-error`, `fixture-error`, `internal-error`,
 `malformed-json`, `timeout`) via the `MOCK_CANARY_SCENARIO` environment
-variable. `.github/workflows/integration.yml` is the only place this
-repository talks to a real Canary build and a real Testnet endpoint, and it
-never gates a pull request.
+variable. Real-engine checks run separately: `.github/workflows/weekly-live.yml`
+runs on a weekly schedule or manual dispatch against a real Canary build and
+live Testnet/Futurenet endpoints (network required);
+`.github/workflows/engine-compat.yml` runs only on manual dispatch, builds
+real engines from source, and exercises offline scenarios without network
+access; `tests/integration/real-engine.test.ts` is skipped unless
+`STELLAR_CANARY_BIN` points to a real engine. The `smoke-test` job in
+`.github/workflows/release.yml` runs the published Action with a real engine
+after a version-tag release or on manual dispatch. None of these real-engine
+workflows gates a pull request; `.github/workflows/ci.yml` provides the
+required pull-request checks.
 
 For tests that need to observe what the Action reports through
 `@actions/core`, use the partial-mock convention described in [Mocking
@@ -175,6 +183,36 @@ This project bundles with **esbuild**, not `@vercel/ncc`: the pinned
 `ncc`'s webpack-based bundler cannot resolve into a CommonJS
 `runs.using: node24` action. See `scripts/build.mjs` for the exact
 settings.
+
+## Mutation testing (StrykerJS)
+
+Line coverage says little about whether the tests would notice a behavioural
+change, so this repository has an on-demand mutation testing workflow:
+
+- `.github/workflows/mutation.yml` — runs only on `workflow_dispatch`, so it
+  never gates a pull request. It uses `npx` with pinned (but not saved)
+  `@stryker-mutator/core` and `@stryker-mutator/vitest-runner` versions,
+  mutates `src/`, runs the unit suite against each mutant, and publishes the
+  per-file mutation score and the top surviving mutants to the job summary
+  and as a `mutation-report` artifact.
+- `stryker.config.json` — the StrykerJS configuration: mutates `src/**/*.ts`,
+  uses the Vitest runner against `tests/unit`, and emits JSON, Markdown, and
+  HTML reports.
+
+To run it locally:
+
+```bash
+# Install the Vitest runner once, without saving it to package.json or
+# package-lock.json.
+npm install --no-save @stryker-mutator/vitest-runner@7.7.4
+npx --yes @stryker-mutator/core@7.7.4 stryker run
+```
+
+Reports are written to `reports/mutation/` (gitignored). Mutation survivors
+point at assertions that are too weak to catch a real change: treat a
+surviving mutant as a signal to strengthen the test, not as a reason to
+lower the threshold. A deliberately weakened assertion in a scratch copy
+shows up as a surviving mutant.
 
 ## Coding standards
 

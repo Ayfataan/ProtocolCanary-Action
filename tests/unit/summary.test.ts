@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import type { CanarySkip } from "../../src/output";
 import { report, result } from "./helpers";
 
 describe("renderSummaryMarkdown", () => {
@@ -105,6 +106,63 @@ describe("renderSummaryMarkdown", () => {
     );
     expect(markdown).toContain("<details><summary>Skipped fixtures</summary>");
     expect(markdown).toContain("p27-xdr-legacy");
+  });
+
+  it("renders a structured skipped-fixtures table grouped by reason code (#341)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        skipped: [
+          {
+            fixtureId: "p28-rpc-missing",
+            surface: "rpc",
+            reason: "project does not declare the rpc capability",
+            code: "MISSING_CAPABILITY",
+          },
+          {
+            fixtureId: "p27-xdr-old",
+            surface: "xdr",
+            reason: "fixture targets protocol 27, this run targets protocol 28",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+          {
+            fixtureId: "p27-rpc-old",
+            surface: "rpc",
+            reason: "fixture targets protocol 27",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("| Reason code | Fixture | Surface | Reason |");
+    expect(markdown).toContain("| `UNSUPPORTED_PROTOCOL` — Unsupported protocol |");
+    expect(markdown).toContain("| `MISSING_CAPABILITY` — Missing capability |");
+    // Group order is deterministic: unsupported protocol rows precede the
+    // missing-capability row, and equal codes sort by fixture id.
+    const unsupported = markdown.indexOf("p27-rpc-old");
+    const unsupported2 = markdown.indexOf("p27-xdr-old");
+    const missing = markdown.indexOf("p28-rpc-missing");
+    expect(unsupported).toBeGreaterThanOrEqual(0);
+    expect(unsupported).toBeLessThan(unsupported2);
+    expect(unsupported2).toBeLessThan(missing);
+  });
+
+  it("renders safe UNKNOWN fallbacks when skip codes or fields are missing (#341)", () => {
+    const skipped = [
+      { fixtureId: "unrecorded", surface: "xdr", reason: "older engine wrote no code" },
+      { fixtureId: "future", surface: "rpc", reason: "a newer code", code: "FROM_THE_FUTURE" },
+      { fixtureId: "", surface: "", reason: "", code: "" },
+    ] as unknown as CanarySkip[];
+
+    const markdown = renderSummaryMarkdown(report({ skipped }));
+
+    expect(markdown).toContain("`UNKNOWN` — Unknown reason");
+    expect(markdown).toContain("older engine wrote no code");
+    expect(markdown).toContain("a newer code");
+    expect(markdown).not.toContain("FROM_THE_FUTURE");
+    expect(markdown).toContain("(unknown fixture)");
+    expect(markdown).toContain("unknown surface");
+    expect(markdown).toContain("no reason recorded");
   });
 
   it("omits the skipped-fixtures section when skipped is an empty array (#264)", () => {
@@ -404,5 +462,53 @@ describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
   it("handles omitted provenance metadata cleanly without errors", () => {
     expect(() => renderSummaryMarkdown(report({ status: "pass" }), {})).not.toThrow();
     expect(() => renderSummaryMarkdown(report({ status: "fail" }), { engineVersion: "0.2.0" })).not.toThrow();
+  });
+});
+
+describe("renderSummaryMarkdown — reproduction command (#416)", () => {
+  it("renders a collapsed section with the engine version and exact command", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineVersion: "0.2.0",
+      engineArgs: ["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"],
+    });
+
+    expect(markdown).toContain("<details><summary>Reproduction command</summary>");
+    expect(markdown).toContain("Engine version: `0.2.0`");
+    expect(markdown).toContain(
+      "```text\nstellar-canary check --format json --protocol 28 --fixtures-dir fixtures\n```",
+    );
+    expect(markdown).toContain("</details>");
+  });
+
+  it("quotes arguments containing spaces and shell metacharacters", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--fixtures-dir", "fixtures dir", "--config", "$WEIRD;value"],
+    });
+
+    expect(markdown).toContain("--fixtures-dir 'fixtures dir'");
+    expect(markdown).toContain("--config '$WEIRD;value'");
+  });
+
+  it("masks credentials in the --rpc-url argument", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--rpc-url", "https://user:pass@example.com/rpc?token=secret"],
+    });
+
+    expect(markdown).toContain("--rpc-url https://[REDACTED]@example.com/rpc[REDACTED]");
+    expect(markdown).not.toContain("user:pass");
+    expect(markdown).not.toContain("token=secret");
+  });
+
+  it("omits the section when no argument array is available", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineVersion: "0.2.0" })).not.toContain(
+      "Reproduction command",
+    );
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineArgs: [] })).not.toContain(
+      "Reproduction command",
+    );
+  });
+
+  it("does not render the section for pre-#416 callers that pass no provenance", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }))).not.toContain("Reproduction command");
   });
 });

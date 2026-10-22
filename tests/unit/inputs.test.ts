@@ -27,7 +27,10 @@ const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
+  "INPUT_RPC-MAX-RETRIES",
+  "INPUT_RPC-RETRY-DELAY-MS",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
@@ -36,6 +39,7 @@ const INPUT_KEYS = [
   "INPUT_ALLOW-EMPTY",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
+  "INPUT_BASELINE-REPORT",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
@@ -45,6 +49,7 @@ function clearInputs(): void {
   for (const key of INPUT_KEYS) {
     delete process.env[key];
   }
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
@@ -60,15 +65,19 @@ describe("getInputs", () => {
       protocol: undefined,
       config: undefined,
       network: undefined,
+      networkPassphrase: undefined,
       rpcUrl: undefined,
+      rpcMaxRetries: undefined,
+      rpcRetryDelayMs: undefined,
       fixturesDir: "fixtures",
-      version: "0.1.1",
+      version: "0.2.0",
       uploadReport: true,
       annotations: true,
       timeoutMinutes: 15,
       allowEmpty: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
+      baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
       strictIntegrity: false,
@@ -80,9 +89,14 @@ describe("getInputs", () => {
     expect(getInputs().protocol).toBe(28);
   });
 
-  it("accepts protocol '0' as a valid non-negative integer", () => {
+  it("rejects protocol 0, which the engine rejects too (#456)", () => {
+    // `protocol` now accepts 1 to 4294967295 inclusive: 0 was accepted by the
+    // Action but is rejected by the engine ("--protocol must be a positive
+    // protocol version number"), so no working configuration changes.
     process.env.INPUT_PROTOCOL = "0";
-    expect(getInputs().protocol).toBe(0);
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"protocol"/);
+    expect(() => getInputs()).toThrow(/from 1 to 4294967295/);
   });
 
   it("rejects a non-numeric protocol", () => {
@@ -101,6 +115,44 @@ describe("getInputs", () => {
   it("rejects a config path that does not exist", () => {
     process.env.INPUT_CONFIG = "/nonexistent/.stellar-canary.toml";
     expect(() => getInputs()).toThrow(ConfigNotFoundError);
+  });
+
+  // #344: a baseline that is supplied but cannot be found must fail before
+  // installation or engine work rather than surfacing as a confusing
+  // execution failure later.
+  it("rejects a baseline report path that does not exist", () => {
+    process.env["INPUT_BASELINE-REPORT"] = "/nonexistent/baseline-report.json";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"baseline-report"/);
+    expect(() => getInputs()).toThrow(/does not exist/);
+  });
+
+  it("rejects a baseline report path that is not a regular file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-dir-"));
+    try {
+      process.env["INPUT_BASELINE-REPORT"] = dir;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/not a regular file/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a baseline report path resolved to an absolute path", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-"));
+    const baselinePath = path.join(dir, "baseline.json");
+    fs.writeFileSync(baselinePath, "{}", "utf8");
+    try {
+      process.env["INPUT_BASELINE-REPORT"] = path.relative(process.cwd(), baselinePath);
+      expect(getInputs().baselineReport).toBe(path.resolve(baselinePath));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a whitespace-only baseline report as unset", () => {
+    process.env["INPUT_BASELINE-REPORT"] = "   ";
+    expect(getInputs().baselineReport).toBeUndefined();
   });
 
   it("returns a config path resolved to an absolute path", () => {
@@ -150,6 +202,61 @@ describe("getInputs", () => {
   it("trims surrounding whitespace from network", () => {
     process.env.INPUT_NETWORK = "  testnet  ";
     expect(getInputs().network).toBe("testnet");
+  });
+
+  it("preserves the exact network passphrase for endpoint identity checks", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "  Local Network ; 2026  ";
+    expect(getInputs().networkPassphrase).toBe("  Local Network ; 2026  ");
+    expect(setSecretMock).toHaveBeenCalledWith("  Local Network ; 2026  ");
+  });
+
+  it("rejects an explicitly empty network passphrase", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"network-passphrase"/);
+  });
+
+  it.each(["line\nbreak", "tab\tvalue", "delete\u007fvalue"])(
+    "rejects control characters in network-passphrase %j",
+    (value) => {
+      process.env["INPUT_NETWORK-PASSPHRASE"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"network-passphrase"/);
+    },
+  );
+
+  it("leaves an omitted network-passphrase unset", () => {
+    expect(getInputs().networkPassphrase).toBeUndefined();
+  });
+
+  it.each([
+    ["0", 0],
+    ["3", 3],
+    ["4294967295", 4294967295],
+  ])("accepts rpc-max-retries %s", (value, expected) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(getInputs().rpcMaxRetries).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "4294967296"])("rejects rpc-max-retries %s", (value) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-max-retries"/);
+  });
+
+  it.each([
+    ["0", 0],
+    ["500", 500],
+    [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+  ])("accepts rpc-retry-delay-ms %s", (value, expected) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(getInputs().rpcRetryDelayMs).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "9007199254740992"])("rejects rpc-retry-delay-ms %s", (value) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-retry-delay-ms"/);
   });
 
   it("trims surrounding whitespace from rpc-url", () => {
@@ -206,6 +313,11 @@ describe("getInputs", () => {
     expect(getInputs().version).toBe("0.1.0");
   });
 
+  it("preserves an explicit legacy engine pin for migration compatibility", () => {
+    process.env.INPUT_VERSION = "0.1.1";
+    expect(getInputs().version).toBe("0.1.1");
+  });
+
   it("rejects a non-semver version", () => {
     process.env.INPUT_VERSION = "latest";
     expect(() => getInputs()).toThrow(InvalidInputError);
@@ -236,8 +348,100 @@ describe("getInputs", () => {
     expect(getInputs().timeoutMinutes).toBe(30);
   });
 
-  it("truncates a fractional timeout to an integer", () => {
+  it("rejects a fractional timeout instead of silently truncating it (#456)", () => {
+    // A truncated timeout silently runs a different timeout than the user
+    // wrote, so "15.9" is rejected outright rather than becoming 15.
     process.env["INPUT_TIMEOUT-MINUTES"] = "15.9";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"timeout-minutes"/);
+    expect(() => getInputs()).toThrow(/from 1 to 35791/);
+  });
+
+  it.each([
+    ["1", 1],
+    ["15", 15],
+    [" 15 ", 15],
+    ["35791", 35791],
+  ])("accepts timeout-minutes %j as %i minutes (#456)", (raw, expected) => {
+    process.env["INPUT_TIMEOUT-MINUTES"] = raw;
+    expect(getInputs().timeoutMinutes).toBe(expected);
+  });
+
+  it.each([
+    ["0", 1, 35791],
+    ["35792", 1, 35791],
+    ["40000", 1, 35791],
+    ["9".repeat(400), 1, 35791],
+  ])(
+    "rejects timeout-minutes %j (#456)",
+    (raw, min, max) => {
+      process.env["INPUT_TIMEOUT-MINUTES"] = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"timeout-minutes"/);
+      expect(() => getInputs()).toThrow(new RegExp(`from ${min} to ${max}`));
+    },
+  );
+
+  it.each([
+    ["1", 1],
+    ["28", 28],
+    [" 28 ", 28],
+    ["028", 28],
+    ["4294967295", 4294967295],
+  ])("accepts protocol %j as %i (#456)", (raw, expected) => {
+    process.env.INPUT_PROTOCOL = raw;
+    expect(getInputs().protocol).toBe(expected);
+  });
+
+  it.each([
+    ["0", 1, 4294967295],
+    ["4294967296", 1, 4294967295],
+    ["9".repeat(20), 1, 4294967295],
+    ["9".repeat(400), 1, 4294967295],
+  ])(
+    "rejects protocol %j (#456)",
+    (raw, min, max) => {
+      process.env.INPUT_PROTOCOL = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"protocol"/);
+      expect(() => getInputs()).toThrow(new RegExp(`from ${min} to ${max}`));
+    },
+  );
+
+  it("treats an empty or whitespace-only protocol as unset (#456)", () => {
+    process.env.INPUT_PROTOCOL = "";
+    expect(getInputs().protocol).toBeUndefined();
+    process.env.INPUT_PROTOCOL = "   ";
+    expect(getInputs().protocol).toBeUndefined();
+  });
+
+  it.each([
+    "1e3",
+    "5 minutes",
+    "1.9",
+    "+5",
+    "-1",
+    "0x10",
+    "1_000",
+    "٣",
+    "5 5",
+  ])(
+    "rejects %j for both protocol and timeout-minutes, naming the input and range (#456)",
+    (raw) => {
+      process.env.INPUT_PROTOCOL = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"protocol"/);
+      expect(() => getInputs()).toThrow(/from 1 to 4294967295/);
+
+      delete process.env.INPUT_PROTOCOL;
+      process.env["INPUT_TIMEOUT-MINUTES"] = raw;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"timeout-minutes"/);
+      expect(() => getInputs()).toThrow(/from 1 to 35791/);
+    },
+  );
+
+  it("keeps the default timeout-minutes of 15 when unset (#456)", () => {
     expect(getInputs().timeoutMinutes).toBe(15);
   });
 
@@ -366,14 +570,15 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
     expect(getInputs().fixturesPackProtocol).toBe(expected);
   });
 
-  it("rejects fixtures-pack-protocol 0, unlike the protocol input", () => {
-    // The two inputs differ deliberately: `protocol` accepts 0 because a
-    // non-negative integer is the right shape there, while a pack "pinned to
-    // protocol 0" is not something anyone publishes. Pin that difference so a
-    // future refactor cannot silently unify the two validators.
+  it("rejects fixtures-pack-protocol 0, as does the protocol input (#456)", () => {
+    // `protocol` now rejects 0 too (the engine rejects `--protocol 0`), so no
+    // working configuration changes. Pin that the two validators stay strict
+    // and independent rather than silently unifying around a shared shape.
     process.env.INPUT_PROTOCOL = "0";
-    expect(getInputs().protocol).toBe(0);
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"protocol"/);
 
+    delete process.env.INPUT_PROTOCOL;
     process.env["INPUT_FIXTURES-PACK-PROTOCOL"] = "0";
     expect(() => getInputs()).toThrow(InvalidInputError);
     expect(() => getInputs()).toThrow(/"fixtures-pack-protocol"/);
