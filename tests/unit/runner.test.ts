@@ -518,7 +518,7 @@ describe("extractDiagnostic", () => {
     const long = `error: ${"x".repeat(5_000)}`;
     const diagnostic = extractDiagnostic(long);
     expect(diagnostic.length).toBe(500);
-    expect(diagnostic.startsWith("error: ")).toBe(true);
+    expect(diagnostic.startsWith("[... earlier output truncated ...]\n")).toBe(true);
   });
 });
 

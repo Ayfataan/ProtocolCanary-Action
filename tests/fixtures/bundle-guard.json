@@ -1,6 +1,6 @@
 {
   "measuredAt": "2026-10-22",
-  "committedBundleBytes": 1831138,
+  "committedBundleBytes": 1831137,
   "sizeBudgetBytes": 2197366,
   "sizeBudgetNote": "About 20% above the committed dist/index.js size (1,831,138 bytes) measured on 2026-10-22: 1,831,138 * 1.2 = 2,197,366 (rounded). Raise deliberately, with a reason, when the bundle legitimately grows.",
   "allowedUrlHosts": [

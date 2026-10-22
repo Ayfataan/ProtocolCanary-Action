@@ -384,7 +384,7 @@ describe("renderExecutionFailureMarkdown", () => {
     }
 
     // The verbatim diagnostic content survives inside the single block.
-    expect(markdown).toContain("```rust");
+    expect(markdown).toContain("\\`\\`\\`rust");
     expect(markdown).toContain("// quoted code from the panic message");
     expect(markdown).toContain("stack backtrace:");
   });

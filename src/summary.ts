@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 
+import { formatSafeDiagnosticTail } from "./log-block";
 import { SummaryPublishFailedError } from "./errors";
 import { countReplayed } from "./output";
 import { codeSpan, escapeInline, fencedBlock, maskRpcUrl, quoteForShell } from "./markdown";
@@ -331,7 +332,11 @@ const MAX_EMBEDDED_FENCE_LENGTH = 20;
  * Markdown rendering of an execution failure — the "Canary could not run
  * at all" case, distinct from a compatibility failure the report describes.
  *
- * The diagnostic is embedded verbatim inside a fenced code block, but it is
+ * Reasons and diagnostic blocks each retain at most 40 tail lines plus
+ * the truncation notice, within 8 KiB UTF-8 including that notice (#499).
+ * Markdown scaffolding is outside this content budget.
+ *
+ * The sanitized diagnostic is embedded inside a fenced code block, but it is
  * raw text from an external process (stderr, a timeout notice), so it may
  * itself contain ``` (e.g. a compiler/panic message quoting a code block).
  * A fixed fence would be closed early by that sequence, and the rest of the
@@ -341,7 +346,7 @@ const MAX_EMBEDDED_FENCE_LENGTH = 20;
  * content.
  */
 export function renderExecutionFailureMarkdown(reason: string, diagnostic: string): string {
-  const trimmed = diagnostic.trim();
+  const trimmed = formatSafeDiagnosticTail(diagnostic).trim();
   // Longest run of backticks anywhere in the diagnostic, in characters.
   // Also covers the closing fence the diagnostic text may already contain,
   // because a closing fence of length n is itself a run of n backticks.
@@ -360,7 +365,7 @@ export function renderExecutionFailureMarkdown(reason: string, diagnostic: strin
     "",
     "Protocol Canary could not be executed.",
     "",
-    `Reason: ${reason}`,
+    `Reason: ${formatSafeDiagnosticTail(reason)}`,
     "",
     fence + "text",
     trimmed === "" ? "(no diagnostic output)" : trimmed,

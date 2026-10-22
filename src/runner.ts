@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 
+import { sanitizeLogText, truncateLogTail } from "./log-block";
 import type { ActionInputs } from "./inputs";
 import { CanaryExecutionFailedError, InvalidInputError, TimeoutError, describeError } from "./errors";
 import { parseReport } from "./output";
@@ -145,11 +146,10 @@ export function assertBaselineProtocol(
 const SIGNALS_TO_FORWARD: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 
 /**
- * Longest root diagnostic kept from the engine's stderr (#351). Everything
- * beyond this (full backtraces, repeated retries) is dropped from the
- * annotation, which is meant to show the one message that explains the
- * failure, not the whole log — the full stderr still lands in the job log
- * and in the execution-failure summary.
+ * Maximum UTF-8 bytes of the sanitized root diagnostic tail, including the
+ * truncation notice (#499). The first root-error line is still selected,
+ * but oversized lines keep their end. Full stderr is handled separately
+ * by the bounded log group and execution-failure summary.
  */
 export const MAX_DIAGNOSTIC_LENGTH = 500;
 
@@ -175,7 +175,9 @@ const ROOT_DIAGNOSTIC = /^(?:error|panic|fatal|failed|failure|no checks ran|inva
  * of annotating an empty diagnostic.
  */
 export function extractDiagnostic(stderr: string): string {
-  const lines = stderr
+  // Redact the entire input before line selection: environment secrets may
+  // span lines, and selecting first would expose fragments.
+  const lines = sanitizeLogText(stderr)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line !== "");
@@ -186,7 +188,7 @@ export function extractDiagnostic(stderr: string): string {
   if (root === undefined) {
     return "";
   }
-  return root.length > MAX_DIAGNOSTIC_LENGTH ? `${root.slice(0, MAX_DIAGNOSTIC_LENGTH - 1)}…` : root;
+  return truncateLogTail(root, 1, MAX_DIAGNOSTIC_LENGTH).text;
 }
 
 /**
