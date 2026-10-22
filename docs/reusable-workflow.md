@@ -51,7 +51,7 @@ single-step Action (see the README's
 | `protocol` | number | `28` | Target Stellar protocol version, forwarded as the Action's `protocol` input. |
 | `fixtures-version` | string | `""` | Fixture-pack release tag, e.g. `v1.2.0`. Validated by the Action, but **not forwarded to the engine**: `stellar-canary` has no fixture-pack flag, so the run still reads `<project-root>/fixtures`. Check that pack out into `fixtures-dir` to pin it. |
 | `fail-on-warning` | boolean | `false` | Promote a `warning` result to a failed calling job. |
-| `baseline-report` | string | `""` | Path to a previous report. Accepted for forward compatibility; the engine's diff command is not released, so a supplied baseline leaves `diff-verdict` as `unavailable` and the run is not compared. |
+| `baseline-report` | string | `""` | Path to a previous report. The Action validates that the file exists and is a schemaVersion 1 report for the same target protocol; the engine's diff command is not released, so a supplied baseline leaves `diff-verdict` as `unavailable` and the run is not compared. |
 
 `config` is not an input: the workflow passes `<project-root>/.stellar-canary.toml`
 only when that file exists, so a project without a configuration file keeps
@@ -92,9 +92,11 @@ jobs:
 
 ## Limitations
 
-- `baseline-report` and `fixtures-version` are declared and validated, but
-  the current engine release has no `diff` or fixture-pack command to forward
-  them to. The workflow warns rather than silently pretending they applied.
+- `baseline-report` is validated by the Action (existence, report shape, and
+  target protocol), but the current engine release has no `diff` command, so
+  no regression verdict is produced. `fixtures-version` is validated but has
+  no fixture-pack command to forward to. The workflow warns rather than
+  silently pretending they applied.
 - `project-root` currently scopes configuration and fixture discovery only;
   the Action has no `working-directory` input yet (issue #348). A project
   whose `.stellar-canary.toml` and fixtures live outside those paths needs

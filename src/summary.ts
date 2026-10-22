@@ -3,7 +3,7 @@ import * as core from "@actions/core";
 import { SummaryPublishFailedError } from "./errors";
 import { countReplayed } from "./output";
 import { codeSpan, escapeInline, fencedBlock, maskRpcUrl, quoteForShell } from "./markdown";
-import type { CanaryReport, OverallStatus, Surface } from "./output";
+import type { CanaryReport, CanarySkip, OverallStatus, Surface } from "./output";
 
 const SURFACE_HEADINGS: Readonly<Record<Surface, string>> = {
   xdr: "XDR",
@@ -19,6 +19,90 @@ const OVERALL_LABEL: Readonly<Record<OverallStatus, string>> = {
   fail: "❌ **NOT READY**",
   error: "🚫 **ERROR**",
 };
+
+/** Human-readable labels for CF-01 skip reason codes. */
+const SKIP_CODE_LABELS: Readonly<Record<string, string>> = {
+  UNSUPPORTED_PROTOCOL: "Unsupported protocol",
+  SURFACE_DISABLED: "Surface disabled",
+  MISSING_CAPABILITY: "Missing capability",
+  OFFLINE: "Offline",
+  NETWORK_MISMATCH: "Network mismatch",
+  UNKNOWN: "Unknown reason",
+};
+
+/** Render order for skip groups; unknown/unrecorded codes always come last. */
+const SKIP_CODE_ORDER: readonly string[] = [
+  "UNSUPPORTED_PROTOCOL",
+  "SURFACE_DISABLED",
+  "MISSING_CAPABILITY",
+  "OFFLINE",
+  "NETWORK_MISMATCH",
+  "UNKNOWN",
+];
+
+/**
+ * Reads a skip reason code per CF-01: an absent or unrecognized code is
+ * `UNKNOWN`, never the raw value and never an empty string. This mirrors the
+ * engine's own `SkipCode::parse` fallback so the summary groups reports from
+ * older and newer engines the same way.
+ */
+function normalizeSkipCode(code: unknown): string {
+  return typeof code === "string" && Object.prototype.hasOwnProperty.call(SKIP_CODE_LABELS, code)
+    ? code
+    : "UNKNOWN";
+}
+
+function skipCodeRank(code: string): number {
+  const index = SKIP_CODE_ORDER.indexOf(code);
+  return index === -1 ? SKIP_CODE_ORDER.length : index;
+}
+
+/**
+ * Renders skipped fixtures as one table grouped by stable reason code
+ * (#341). Rows are sorted by code rank, then fixture id and surface, so
+ * repeated runs over the same report produce identical Markdown. Every
+ * engine-supplied value is escaped; missing values get explicit fallbacks
+ * rather than throwing or rendering an empty cell.
+ */
+function skippedFixtureLines(skipped: readonly CanarySkip[]): string[] {
+  const rows = skipped.map((skip) => {
+    const fixtureId =
+      typeof skip.fixtureId === "string" && skip.fixtureId.trim() !== ""
+        ? skip.fixtureId.trim()
+        : "(unknown fixture)";
+    const surface =
+      typeof skip.surface === "string" && skip.surface.trim() !== ""
+        ? skip.surface.trim()
+        : "(unknown surface)";
+    const reason =
+      typeof skip.reason === "string" && skip.reason.trim() !== ""
+        ? skip.reason.trim()
+        : "(no reason recorded)";
+    return { code: normalizeSkipCode(skip.code), fixtureId, surface, reason };
+  });
+  rows.sort((a, b) => {
+    const byCode = skipCodeRank(a.code) - skipCodeRank(b.code);
+    if (byCode !== 0) return byCode;
+    if (a.fixtureId !== b.fixtureId) return a.fixtureId < b.fixtureId ? -1 : 1;
+    if (a.surface !== b.surface) return a.surface < b.surface ? -1 : 1;
+    return 0;
+  });
+
+  return [
+    "<details><summary>Skipped fixtures</summary>",
+    "",
+    "| Reason code | Fixture | Surface | Reason |",
+    "|---|---|---|---|",
+    ...rows.map(
+      (row) =>
+        `| ${codeSpan(row.code)} — ${escapeInline(SKIP_CODE_LABELS[row.code] ?? "Unknown reason")} | ` +
+        `${codeSpan(row.fixtureId)} | ${escapeInline(row.surface)} | ${escapeInline(row.reason)} |`,
+    ),
+    "",
+    "</details>",
+    "",
+  ];
+}
 
 /** Aggregates one surface's results into its summary table row. Returns
  * `undefined` when no results match the surface, which is how
@@ -173,14 +257,7 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
   }
 
   if (report.skipped !== undefined && report.skipped.length > 0) {
-    lines.push(
-      "<details><summary>Skipped fixtures</summary>",
-      "",
-      ...report.skipped.map((s) => `- ${codeSpan(s.fixtureId)} (${escapeInline(s.surface)}) — ${escapeInline(s.reason)}`),
-      "",
-      "</details>",
-      "",
-    );
+    lines.push(...skippedFixtureLines(report.skipped));
   }
 
   // Reproduction command section (issue #416)

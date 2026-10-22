@@ -61,6 +61,30 @@ inputs:
       Soroban checks.
     required: false
 
+  network-passphrase:
+    description: >-
+      Expected Stellar network passphrase for RPC identity verification.
+      Forwarded as `--network-passphrase` by Protocol-Canary 0.3.0 and newer.
+      An explicit passphrase overrides the well-known passphrase for `network`;
+      use it for private networks or intentional endpoint overrides. Must not
+      be empty or contain control characters.
+    required: false
+    default: "\u0001"
+
+  rpc-max-retries:
+    description: >-
+      Maximum retries after a failed RPC attempt (`--rpc-max-retries`), from
+      0 to 4294967295. Zero disables retries. Forwarded by Protocol-Canary
+      0.3.0 and newer; otherwise the engine default applies.
+    required: false
+
+  rpc-retry-delay-ms:
+    description: >-
+      Base delay in milliseconds between RPC retries (`--rpc-retry-delay-ms`),
+      from 0 to 9007199254740991. The engine uses linear backoff. Forwarded by
+      Protocol-Canary 0.3.0 and newer; otherwise the engine default applies.
+    required: false
+
   rpc-url:
     description: >-
       Stellar RPC endpoint to use for live checks. Forwarded as
@@ -85,7 +109,7 @@ inputs:
       `StellarCanary/Protocol-Canary`. Reproducibility matters: this
       Action never tracks `main` or an unpinned "latest" build.
     required: false
-    default: 0.1.1
+    default: 0.2.0
 
   upload-report:
     description: >-
@@ -164,18 +188,28 @@ inputs:
       protocol a run actually checks is controlled by `protocol`.
     required: false
 
+  baseline-report:
+    description: >-
+      Path to a previous Protocol Canary JSON report to validate against, for
+      example a report uploaded from the base branch of a pull request. The
+      file must exist and be a complete schemaVersion 1 report recorded for
+      the same target protocol as this run. The engine's `diff` command is not
+      released yet (#335), so the Action validates the baseline and fails
+      clearly on a missing, malformed, or protocol-incompatible file, but it
+      does not produce a regression verdict. Empty by default.
+    required: false
+
   github-token:
     description: >-
       GitHub token used to authenticate read-only GitHub REST API requests
       to the public `StellarCanary/Protocol-Canary` repository (tag and release
-      lookups). Defaults to the workflow's `github.token`. If set to a non-empty value,
+      lookups). If set to a non-empty value,
       it takes precedence over the `GITHUB_TOKEN` environment variable. If empty
       or unset, the `GITHUB_TOKEN` environment variable is used if present;
       otherwise unauthenticated requests are made. Requires only `contents: read`
       permission, which works even in fork pull requests. Set to an empty string
       (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
     required: false
-    default: ${{ github.token }}
   strict-integrity:
     description: >-
       Optional fail-closed integrity policy (issue #372). Defaults to `false`,
@@ -248,6 +282,23 @@ outputs:
       Stellar protocol version reported by the network during live checks
       (`network.observedProtocol`), or an empty string when the report has no
       network object. Explicitly set to an empty string on an execution failure.
+  pack-protocol:
+    description: >-
+      Protocol version of the resolved fixture pack, as an integer string,
+      when a pack identity is recorded in the report or pinned with the
+      `fixtures-pack-protocol` input. Empty when no external fixture pack is
+      in use or the identity is not recorded.
+  pack-version:
+    description: >-
+      Release tag/version of the resolved fixture pack, when recorded in the
+      report or pinned with the `fixtures-pack-version` input. Empty when no
+      external fixture pack is in use or the identity is not recorded.
+  pack-digest:
+    description: >-
+      Canonical content digest of the resolved fixture pack, formatted as
+      `sha256:<64 lowercase hex>`, when the report records one. Empty when no
+      external fixture pack is in use, the digest is not recorded, or the
+      recorded value is malformed; the Action never fabricates a digest.
   report:
     description: >-
       Absolute path to the generated JSON report file. Only set when Canary
