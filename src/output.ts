@@ -157,6 +157,33 @@ export interface CanarySkip {
   readonly fixtureId: string;
   readonly surface: string;
   readonly reason: string;
+  /**
+   * Stable machine-readable skip reason (CF-01): one of
+   * `UNSUPPORTED_PROTOCOL`, `SURFACE_DISABLED`, `MISSING_CAPABILITY`,
+   * `OFFLINE`, `NETWORK_MISMATCH`, or `UNKNOWN`. Absent in reports written
+   * before the field existed; an unrecognized value is read as `UNKNOWN` by
+   * consumers rather than rejected.
+   */
+  readonly code?: string;
+}
+
+export interface CanaryFixturePack {
+  /** Canonical `sha256:<64 lowercase hex>` digest of the fixture pack. */
+  readonly digest?: string;
+  /** Protocol the pack is pinned to, when recorded. */
+  readonly protocol?: number;
+  /** Pack release tag/version, when recorded. */
+  readonly version?: string;
+  /** Alias some report producers use for the release tag. */
+  readonly tag?: string;
+  /** Fixture registry format version. */
+  readonly registryVersion?: number;
+  /** `"directory"` or `"release"`, when recorded. */
+  readonly source?: string;
+  /** Full git revision of the pack source, or null. */
+  readonly revision?: string | null;
+  /** Alias some producers use for the canonical digest. */
+  readonly packDigest?: string;
 }
 
 export interface CanaryCounts {
@@ -178,6 +205,10 @@ export interface CanaryReport {
   readonly counts: CanaryCounts;
   readonly results: readonly CanaryResult[];
   readonly skipped?: readonly CanarySkip[];
+  /** Reserved additive CF-02 pack identity; absent for local/unrecorded packs. */
+  readonly fixturePack?: CanaryFixturePack;
+  /** Legacy/top-level alias for the pack digest used by early receipt drafts. */
+  readonly packDigest?: string;
   readonly git: {
     readonly commit: string | null;
     readonly branch: string | null;
@@ -258,6 +289,9 @@ function skipShapeError(entry: unknown): string | undefined {
   }
   if (typeof skip.reason !== "string") {
     return 'missing or non-string "reason"';
+  }
+  if (skip.code !== undefined && typeof skip.code !== "string") {
+    return 'non-string "code" when present';
   }
   return undefined;
 }
@@ -412,6 +446,94 @@ export function parseReport(stdout: string): CanaryReport {
     skipped,
     git: report.git ?? { commit: null, branch: null, isDirty: null },
   } as CanaryReport;
+}
+
+/** Inputs that may carry a fixture-pack pin even when the report does not. */
+export interface PackIdentitySource {
+  readonly fixturesPackVersion?: string | undefined;
+  readonly fixturesPackProtocol?: number | undefined;
+}
+
+/** Pack provenance available for the Action outputs (#340). */
+export interface ResolvedPackIdentity {
+  /** Canonical `sha256:<64 lowercase hex>` digest, when known. */
+  readonly digest?: string;
+  /** Integer protocol the pack is pinned to, when known. */
+  readonly protocol?: number;
+  /** Release tag/version of the pack, when known. */
+  readonly version?: string;
+}
+
+const CANONICAL_DIGEST = /^(?:sha256:)?([0-9a-fA-F]{64})$/;
+
+/**
+ * Normalizes a pack digest to the documented `sha256:<64 lowercase hex>`
+ * form. Accepts a bare 64-hex digest as a convenience, but returns
+ * `undefined` for anything else instead of emitting a loosely shaped output.
+ */
+function canonicalPackDigest(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const match = CANONICAL_DIGEST.exec(value.trim());
+  const hex = match?.[1];
+  return hex === undefined ? undefined : `sha256:${hex.toLowerCase()}`;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
+}
+
+/**
+ * Resolves the fixture-pack identity this run can honestly report (#340).
+ *
+ * The CF-02 pack identity is an additive report field (`fixturePack`), and
+ * the engine releases that emit it are still rolling out. The Action
+ * therefore reads it defensively, falls back to the validated
+ * `fixtures-pack-version` / `fixtures-pack-protocol` inputs when a caller
+ * pinned a pack explicitly, and returns an empty identity when no external
+ * pack is in play. A pack digest is only surfaced in the canonical
+ * `sha256:<64 lowercase hex>` form; a malformed value is ignored rather than
+ * echoed into an output. This function never throws for a malformed optional
+ * field — reports are untrusted input.
+ */
+export function resolvePackIdentity(
+  report: CanaryReport,
+  source: PackIdentitySource = {},
+): ResolvedPackIdentity {
+  const rawFixturePack = (report as { readonly fixturePack?: unknown }).fixturePack;
+  const fixturePack =
+    typeof rawFixturePack === "object" && rawFixturePack !== null && !Array.isArray(rawFixturePack)
+      ? (rawFixturePack as Record<string, unknown>)
+      : undefined;
+  const rawTopLevelDigest = (report as { readonly packDigest?: unknown }).packDigest;
+
+  const digest =
+    canonicalPackDigest(fixturePack?.digest) ??
+    canonicalPackDigest(fixturePack?.packDigest) ??
+    canonicalPackDigest(rawTopLevelDigest);
+  const version =
+    nonEmptyString(fixturePack?.version) ??
+    nonEmptyString(fixturePack?.tag) ??
+    nonEmptyString(source.fixturesPackVersion);
+  const protocol =
+    positiveInteger(fixturePack?.protocol) ??
+    positiveInteger(source.fixturesPackProtocol) ??
+    (digest !== undefined ? positiveInteger(report.targetProtocol) : undefined);
+
+  const identity: { digest?: string; protocol?: number; version?: string } = {};
+  if (digest !== undefined) identity.digest = digest;
+  if (protocol !== undefined) identity.protocol = protocol;
+  if (version !== undefined) identity.version = version;
+  return identity;
 }
 
 /**

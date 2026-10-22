@@ -11,6 +11,7 @@ import {
   CanaryExecutionFailedError,
   CanaryNotFoundError,
   InstallationFailedError,
+  InvalidInputError,
   TimeoutError,
 } from "./errors";
 import { resolveGithubToken } from "./inputs";
@@ -549,6 +550,179 @@ async function saveToCache(resolved: ResolvedVersion, binaryPath: string): Promi
     // Caching is a pure optimization; correctness never depends on it.
     core.warning(`Cache save failed, ignoring: ${String(error)}`);
   }
+}
+
+/** Canonical fixture-pack digest format (`sha256:` + 64 lowercase hex). */
+const PACK_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+/** Provenance marker written inside a cached pack directory. */
+const PACK_MARKER_FILE = ".stellar-canary-pack.json";
+
+export interface PackMarker {
+  readonly protocol: number;
+  readonly packDigest: string;
+}
+
+/**
+ * Deterministic Actions-cache key for a verified fixture pack (#345). The
+ * protocol number scopes the key and the canonical digest makes it
+ * content-addressed, so a republished or mutated pack can never alias a
+ * cached one.
+ *
+ * @throws {InvalidInputError} When `protocol` is not a non-negative integer
+ * or `packDigest` is not a `sha256:<64 lowercase hex>` digest.
+ */
+export function packCacheKey(protocol: number, packDigest: string): string {
+  if (!Number.isInteger(protocol) || protocol < 0) {
+    throw new InvalidInputError(
+      `Invalid fixture-pack protocol ${String(protocol)}: expected a non-negative integer.`,
+    );
+  }
+  if (!PACK_DIGEST_PATTERN.test(packDigest)) {
+    throw new InvalidInputError(
+      `Invalid fixture-pack digest ${JSON.stringify(packDigest)}: expected the canonical form ` +
+        '"sha256:<64 lowercase hex characters>".',
+    );
+  }
+  return `stellar-canary-pack-${String(protocol)}-${packDigest}`;
+}
+
+/** Reads the provenance marker from a restored pack directory, if any. */
+function readPackMarker(directory: string): PackMarker | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(directory, PACK_MARKER_FILE), "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) {
+      return undefined;
+    }
+    const marker = parsed as Partial<PackMarker>;
+    if (typeof marker.protocol !== "number" || typeof marker.packDigest !== "string") {
+      return undefined;
+    }
+    return { protocol: marker.protocol, packDigest: marker.packDigest };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Writes the provenance marker that makes a cached pack self-describing. */
+function writePackMarker(directory: string, protocol: number, packDigest: string): void {
+  // Deterministic serialization: a fixed key order and no insignificant
+  // whitespace, so a cached marker is byte-identical for the same pack.
+  fs.writeFileSync(
+    path.join(directory, PACK_MARKER_FILE),
+    `${JSON.stringify({ protocol, packDigest })}\n`,
+    "utf8",
+  );
+}
+
+/**
+ * Attempts to restore a previously verified fixture pack from the Actions
+ * cache. Returns `true` only when the restored directory carries a provenance
+ * marker matching the requested protocol and digest; a missing marker, a
+ * mismatched one, a cache miss, an unavailable cache service, or a restore
+ * error all return `false` (and remove a corrupt restored directory) so the
+ * caller downloads a fresh, verified pack.
+ *
+ * Caching is a pure optimization: no failure here is ever surfaced as an
+ * error.
+ */
+export async function restoreVerifiedPack(
+  protocol: number,
+  packDigest: string,
+  directory: string,
+): Promise<boolean> {
+  const key = packCacheKey(protocol, packDigest);
+  if (!cache.isFeatureAvailable()) {
+    return false;
+  }
+  let hit: string | undefined;
+  try {
+    hit = await cache.restoreCache([directory], key);
+  } catch (error) {
+    core.debug(`Fixture-pack cache restore failed, continuing without it: ${String(error)}`);
+    return false;
+  }
+  if (hit === undefined) {
+    return false;
+  }
+
+  const marker = readPackMarker(directory);
+  if (marker === undefined || marker.protocol !== protocol || marker.packDigest !== packDigest) {
+    core.debug(
+      `Cached fixture pack at ${directory} (key: ${key}) failed provenance validation; ` +
+        "discarding it and downloading a fresh copy.",
+    );
+    fs.rmSync(directory, { recursive: true, force: true });
+    return false;
+  }
+
+  core.info(`Restored verified fixture pack for protocol ${String(protocol)} from cache (key: ${key}).`);
+  return true;
+}
+
+/**
+ * Saves a verified fixture pack directory to the Actions cache, writing the
+ * provenance marker first. Failures are swallowed after a `core.debug` log:
+ * a cache outage must never fail a run that already has a verified pack.
+ */
+export async function saveVerifiedPack(
+  protocol: number,
+  packDigest: string,
+  directory: string,
+): Promise<void> {
+  const key = packCacheKey(protocol, packDigest);
+  try {
+    writePackMarker(directory, protocol, packDigest);
+  } catch (error) {
+    core.debug(`Could not write the fixture-pack provenance marker, skipping cache save: ${String(error)}`);
+    return;
+  }
+  if (!cache.isFeatureAvailable()) {
+    return;
+  }
+  try {
+    await cache.saveCache([directory], key);
+  } catch (error) {
+    // A cache save conflict or service outage is not a run failure.
+    core.debug(`Fixture-pack cache save failed, ignoring: ${String(error)}`);
+  }
+}
+
+export type PackCacheOutcome = "cache-hit" | "downloaded";
+
+export interface VerifiedPackRequest {
+  /** Protocol version the pack is pinned to. */
+  readonly protocol: number;
+  /** Canonical `sha256:<64 hex>` digest of the verified pack. */
+  readonly packDigest: string;
+  /** Directory the caller owns; it is restored into or downloaded into. */
+  readonly directory: string;
+  /** Downloads, verifies, and extracts the pack into `directory`. */
+  readonly download: (directory: string) => Promise<void>;
+}
+
+/**
+ * Makes a verified fixture pack available in `request.directory`, restoring
+ * it from the Actions cache when a valid entry exists and otherwise invoking
+ * `request.download` (the checksum/digest-verifying downloader) and saving
+ * the result for later runs.
+ *
+ * A cache hit skips both download and extraction entirely. A cache miss,
+ * restore failure, or cached entry whose provenance marker does not match the
+ * requested protocol/digest all fall through to a fresh download.
+ */
+export async function ensureVerifiedPack(request: VerifiedPackRequest): Promise<PackCacheOutcome> {
+  if (await restoreVerifiedPack(request.protocol, request.packDigest, request.directory)) {
+    return "cache-hit";
+  }
+
+  // Start from a clean directory: a restore that was rejected (or a partial
+  // one) must not leave stale fixtures mixed into the fresh download.
+  fs.rmSync(request.directory, { recursive: true, force: true });
+  fs.mkdirSync(request.directory, { recursive: true });
+  await request.download(request.directory);
+  await saveVerifiedPack(request.protocol, request.packDigest, request.directory);
+  return "downloaded";
 }
 
 /**

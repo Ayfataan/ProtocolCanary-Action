@@ -77,9 +77,15 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: osMocks.homedirMock };
 });
 
-import { cargoInstallTimeoutMs, ensureCanaryInstalled, prebuiltTargetTriple } from "../../src/canary";
+import {
+  cargoInstallTimeoutMs,
+  ensureCanaryInstalled,
+  ensureVerifiedPack,
+  packCacheKey,
+  prebuiltTargetTriple,
+} from "../../src/canary";
 import { CARGO_INSTALL_TIMEOUT_FLOOR_MS } from "../../src/runner";
-import { CanaryNotFoundError, InstallationFailedError } from "../../src/errors";
+import { CanaryNotFoundError, InstallationFailedError, InvalidInputError } from "../../src/errors";
 import { REDACTED } from "../../src/redact";
 import type { ResolvedVersion } from "../../src/version";
 import { CANARY_API_REPO_URL, CANARY_REPO_URL } from "../../src/version";
@@ -1534,5 +1540,150 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("Unsupported platform linux-arm"));
       expect(spawnMock).toHaveBeenCalled();
     });
+  });
+});
+
+describe("verified fixture-pack caching (#345)", () => {
+  const DIGEST = `sha256:${"a".repeat(64)}`;
+  const OTHER_DIGEST = `sha256:${"b".repeat(64)}`;
+  const MARKER = ".stellar-canary-pack.json";
+  let packDir: string;
+
+  beforeEach(() => {
+    packDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-pack-cache-"));
+    // The cache layer must not leave a directory behind at the exact path
+    // under test; each test creates what it needs inside it.
+    fs.rmSync(packDir, { recursive: true, force: true });
+
+    cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(true);
+    cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
+    cacheMocks.saveCacheMock.mockReset().mockResolvedValue(undefined);
+    coreMocks.infoMock.mockReset();
+    coreMocks.debugMock.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(packDir, { recursive: true, force: true });
+  });
+
+  it("builds a deterministic key from the protocol and canonical digest", () => {
+    expect(packCacheKey(28, DIGEST)).toBe(`stellar-canary-pack-28-${DIGEST}`);
+    expect(packCacheKey(28, DIGEST)).toBe(packCacheKey(28, DIGEST));
+    // A different protocol or digest must never share an entry.
+    expect(packCacheKey(29, DIGEST)).not.toBe(packCacheKey(28, DIGEST));
+    expect(packCacheKey(28, OTHER_DIGEST)).not.toBe(packCacheKey(28, DIGEST));
+  });
+
+  it("rejects a non-canonical digest or invalid protocol instead of building a loose key", () => {
+    for (const digest of ["abc", `sha256:${"A".repeat(64)}`, `sha256:${"a".repeat(63)}`, ""]) {
+      expect(() => packCacheKey(28, digest)).toThrow(InvalidInputError);
+    }
+    for (const protocol of [-1, 1.5, Number.NaN]) {
+      expect(() => packCacheKey(protocol, DIGEST)).toThrow(InvalidInputError);
+    }
+  });
+
+  it("skips download and extraction on a valid cache hit", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, MARKER), JSON.stringify({ protocol: 28, packDigest: DIGEST }));
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn();
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("cache-hit");
+    expect(download).not.toHaveBeenCalled();
+    expect(cacheMocks.restoreCacheMock).toHaveBeenCalledWith([packDir], `stellar-canary-pack-28-${DIGEST}`);
+    // A hit never re-saves the entry.
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+    expect(coreMocks.infoMock).toHaveBeenCalledWith(expect.stringContaining("protocol 28 from cache"));
+  });
+
+  it("downloads and saves on a cache miss, writing the provenance marker", async () => {
+    const download = vi.fn(async (directory: string) => {
+      fs.writeFileSync(path.join(directory, "fixture.json"), "{}");
+    });
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledWith(packDir);
+    expect(fs.readFileSync(path.join(packDir, MARKER), "utf8")).toBe(
+      `${JSON.stringify({ protocol: 28, packDigest: DIGEST })}\n`,
+    );
+    expect(fs.readFileSync(path.join(packDir, "fixture.json"), "utf8")).toBe("{}");
+    expect(cacheMocks.saveCacheMock).toHaveBeenCalledWith([packDir], `stellar-canary-pack-28-${DIGEST}`);
+  });
+
+  it("falls back to a fresh download when cache restore throws", async () => {
+    cacheMocks.restoreCacheMock.mockRejectedValue(new Error("cache service unavailable"));
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("cache restore failed"));
+  });
+
+  it("discards a cached directory whose marker does not match the requested digest", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, MARKER), JSON.stringify({ protocol: 28, packDigest: OTHER_DIGEST }));
+    fs.writeFileSync(path.join(packDir, "corrupt-fixture.json"), "{}");
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn(async (directory: string) => {
+      // The stale file must be gone before the fresh download runs.
+      expect(fs.existsSync(path.join(directory, "corrupt-fixture.json"))).toBe(false);
+    });
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("failed provenance validation"));
+  });
+
+  it("treats a restored directory without a provenance marker as corrupt", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fail the run when saving to the cache fails", async () => {
+    cacheMocks.saveCacheMock.mockRejectedValue(new Error("reserve cache failed"));
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("cache save failed"));
+  });
+
+  it("downloads without touching the cache service when caching is unavailable", async () => {
+    cacheMocks.isFeatureAvailableMock.mockReturnValue(false);
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates a failed download so a missing pack is never silently accepted", async () => {
+    const download = vi.fn(async () => {
+      throw new Error("checksum mismatch");
+    });
+
+    await expect(
+      ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download }),
+    ).rejects.toThrow("checksum mismatch");
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
   });
 });
