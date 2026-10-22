@@ -40,6 +40,7 @@ const INPUT_KEYS = [
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_PR-COMMENT",
 ];
 
 function clearInputs(): void {
@@ -74,6 +75,7 @@ describe("getInputs", () => {
       githubToken: undefined,
       generateReceipt: false,
       strictIntegrity: false,
+      prComment: false,
     });
   });
 
