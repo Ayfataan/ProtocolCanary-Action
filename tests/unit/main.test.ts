@@ -124,6 +124,7 @@ const INPUTS: ActionInputs = {
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
+  prComment: false,
 };
 
 const PASS_REPORT = report({
