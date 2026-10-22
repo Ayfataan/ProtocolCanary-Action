@@ -5,19 +5,20 @@ import * as path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// vi.mock is hoisted above the imports, so the spy must be too. Only `info` is
-// replaced: the whole suite reads inputs through the real `core.getInput`, and
-// CONTRIBUTING's partial-mock convention requires spreading the real module so
-// everything else keeps working. `vi.spyOn` cannot be used here because an ESM
-// namespace object is not configurable.
-const { infoMock, setSecretMock } = vi.hoisted(() => ({
+// vi.mock is hoisted above the imports, so the spies must be too. The suite
+// reads inputs through the real `core.getInput`, and CONTRIBUTING's
+// partial-mock convention requires spreading the real module so everything
+// else keeps working. `vi.spyOn` cannot be used here because an ESM namespace
+// object is not configurable.
+const { infoMock, warningMock, setSecretMock } = vi.hoisted(() => ({
   infoMock: vi.fn(),
+  warningMock: vi.fn(),
   setSecretMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof actionsCore>();
-  return { ...actual, info: infoMock, setSecret: setSecretMock };
+  return { ...actual, info: infoMock, warning: warningMock, setSecret: setSecretMock };
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
@@ -34,6 +35,8 @@ const INPUT_KEYS = [
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
+  "INPUT_FAIL-ON-WARNING",
+  "INPUT_OFFLINE",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_BASELINE-REPORT",
@@ -49,6 +52,7 @@ function clearInputs(): void {
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
+  warningMock.mockClear();
 }
 
 describe("getInputs", () => {
@@ -68,6 +72,8 @@ describe("getInputs", () => {
       annotations: true,
       timeoutMinutes: 15,
       allowEmpty: false,
+      failOnWarning: false,
+      offline: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       baselineReport: undefined,
@@ -395,6 +401,20 @@ describe("getInputs", () => {
   it("rejects an undocumented allow-empty form and names the input", () => {
     process.env["INPUT_ALLOW-EMPTY"] = "1";
     expect(() => getInputs()).toThrow(/"allow-empty"/);
+  });
+
+  it("warns when unsupported fail-on-warning or offline inputs are enabled", () => {
+    process.env["INPUT_FAIL-ON-WARNING"] = "true";
+    process.env.INPUT_OFFLINE = "true";
+
+    const inputs = getInputs();
+
+    expect(inputs.failOnWarning).toBe(true);
+    expect(inputs.offline).toBe(true);
+    expect(warningMock.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringContaining('"fail-on-warning"'),
+      expect.stringContaining('"offline"'),
+    ]);
   });
 
   // #361: `generate-receipt` opts a run into producing an Execution Receipt.

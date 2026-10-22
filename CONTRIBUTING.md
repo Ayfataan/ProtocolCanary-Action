@@ -60,6 +60,20 @@ actionlint           # static analysis of .github/workflows/
 zizmor .github/workflows # security audit of .github/workflows/
 ```
 
+### Updating job summary goldens
+
+The job summary's exact Markdown output is stored in `tests/golden/` and
+checked by `tests/unit/summary-golden.test.ts`. To intentionally update the
+snapshots, run:
+
+```bash
+UPDATE_GOLDEN=1 npx vitest run tests/unit/summary-golden.test.ts
+```
+
+Review every changed golden file by hand. A pull request that changes a
+golden must explain why the summary format changed; do not update snapshots
+just to make a failing test pass.
+
 ### Trying the Action locally without GitHub
 
 To see what a change does end to end without pushing a branch, run the
@@ -454,4 +468,3 @@ Release checklist:
    ```
    or trigger the **Release** workflow from the Actions tab in GitHub and enter
    the target tag in the `release_tag` input field.
-

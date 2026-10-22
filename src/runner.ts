@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 
+import { engineSupportsFailOnWarningAndOffline } from "./inputs";
 import type { ActionInputs } from "./inputs";
 import { CanaryExecutionFailedError, InvalidInputError, TimeoutError, describeError } from "./errors";
 import { parseReport } from "./output";
@@ -53,6 +54,14 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   args.push("--fixtures-dir", inputs.fixturesDir);
   if (inputs.allowEmpty && engineSupportsAllowEmpty(engineVersion)) {
     args.push("--allow-empty");
+  }
+  if (engineSupportsFailOnWarningAndOffline(engineVersion)) {
+    if (inputs.failOnWarning) {
+      args.push("--fail-on-warning");
+    }
+    if (inputs.offline) {
+      args.push("--offline");
+    }
   }
 
   return args;
