@@ -59,8 +59,8 @@ export async function postPullRequestComment(
     for (let page = 1; page <= 10 && !existing; page++) {
       const response = await request(`${base}/issues/${context.pullRequest}/comments?per_page=100&page=${page}`, { headers });
       if (!response.ok) throw new Error(`GitHub API HTTP ${response.status}`);
-      const comments = (await response.json()) as { id: number; body?: string; user?: { login?: string } }[];
-      existing = comments.find((comment) => comment.body?.startsWith(MARKER + "\n" + identity + "\n"));
+      const comments = (await response.json()) as { id: number; body?: string; user?: { login?: string; type?: string } }[];
+      existing = comments.find((comment) => comment.user?.type === "Bot" && comment.body?.startsWith(MARKER + "\n" + identity + "\n"));
       if (comments.length < 100) break;
     }
     const url = existing ? `${base}/issues/comments/${existing.id}` : `${base}/issues/${context.pullRequest}/comments`;
