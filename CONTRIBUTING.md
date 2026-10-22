@@ -180,6 +180,36 @@ This project bundles with **esbuild**, not `@vercel/ncc`: the pinned
 `runs.using: node24` action. See `scripts/build.mjs` for the exact
 settings.
 
+## Mutation testing (StrykerJS)
+
+Line coverage says little about whether the tests would notice a behavioural
+change, so this repository has an on-demand mutation testing workflow:
+
+- `.github/workflows/mutation.yml` — runs only on `workflow_dispatch`, so it
+  never gates a pull request. It uses `npx` with pinned (but not saved)
+  `@stryker-mutator/core` and `@stryker-mutator/vitest-runner` versions,
+  mutates `src/`, runs the unit suite against each mutant, and publishes the
+  per-file mutation score and the top surviving mutants to the job summary
+  and as a `mutation-report` artifact.
+- `stryker.config.json` — the StrykerJS configuration: mutates `src/**/*.ts`,
+  uses the Vitest runner against `tests/unit`, and emits JSON, Markdown, and
+  HTML reports.
+
+To run it locally:
+
+```bash
+# Install the Vitest runner once, without saving it to package.json or
+# package-lock.json.
+npm install --no-save @stryker-mutator/vitest-runner@7.7.4
+npx --yes @stryker-mutator/core@7.7.4 stryker run
+```
+
+Reports are written to `reports/mutation/` (gitignored). Mutation survivors
+point at assertions that are too weak to catch a real change: treat a
+surviving mutant as a signal to strengthen the test, not as a reason to
+lower the threshold. A deliberately weakened assertion in a scratch copy
+shows up as a surviving mutant.
+
 ## Coding standards
 
 - Strict TypeScript (`strict: true`); avoid `any`.
