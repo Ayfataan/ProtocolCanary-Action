@@ -63,6 +63,22 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   if (inputs.allowEmpty && engineSupportsAllowEmpty(engineVersion)) {
     args.push("--allow-empty");
   }
+  // #458 scope/cache options. Single `--flag=value` elements, in a stable
+  // order, so a value beginning with `-` (e.g. a fixture id `--weird`) can
+  // never be parsed as a separate option, and nothing can be split by a
+  // shell: the array goes straight to `spawn`. They are *not* version-gated
+  // here — main.ts refuses to start the run at all when the resolved engine
+  // cannot honour them (fixtureSurfaceCacheDirGateFailure), because silently
+  // dropping a filter would check a different scope than the caller asked.
+  if (inputs.fixture !== undefined) {
+    args.push(`--fixture=${inputs.fixture}`);
+  }
+  if (inputs.surface !== undefined) {
+    args.push(`--surface=${inputs.surface}`);
+  }
+  if (inputs.cacheDir !== undefined) {
+    args.push(`--cache-dir=${inputs.cacheDir}`);
+  }
 
   return args;
 }
@@ -100,6 +116,66 @@ export function engineSupportsAllowEmpty(version: string | undefined): boolean {
  * older and unknown engines must never receive flags they would reject. */
 export function engineSupportsNetworkPassphraseAndRpcRetrySettings(version: string | undefined): boolean {
   return engineAtLeastVersion(version, NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION);
+}
+
+/**
+ * The first published Protocol-Canary release whose `check` accepts all of
+ * `--fixture`, `--surface`, and `--cache-dir` together (#458). They exist on
+ * the engine's `main` (Protocol-Canary PRs #568 and #564) but not in any
+ * published release yet (absent from `v0.2.0`'s `CheckArgs`), so the constant
+ * is `undefined` — meaning "no released engine supports these inputs".
+ *
+ * Do not set this to a guessed version: it may only be set to a release tag
+ * whose `CheckArgs` has been read and confirmed to contain all three options,
+ * after a maintainer names that release on issue #458.
+ */
+export const FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION: readonly [number, number, number] | undefined = undefined;
+
+/** True when `version` (a bare `x.y.z`) may receive `--fixture`, `--surface`,
+ * and `--cache-dir`. Always false while
+ * {@link FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION} is `undefined`, and false for
+ * unknown or unparseable versions — the Action never passes a flag an engine
+ * would reject, and never silently drops one either (see
+ * {@link fixtureSurfaceCacheDirGateFailure}). */
+export function engineSupportsFixtureSurfaceCacheDir(version: string | undefined): boolean {
+  if (FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION === undefined) {
+    return false;
+  }
+  return engineAtLeastVersion(version, FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION);
+}
+
+/**
+ * Fail-clearly gate for `fixture`, `surface`, and `cache-dir` (#458):
+ * returns the failure message when any of those inputs is set but the
+ * resolved engine release cannot honour it, otherwise `undefined`.
+ *
+ * This deliberately differs from `allow-empty` and the 0.3.0 network inputs,
+ * which only relax behaviour and are therefore ignored with a note. A
+ * dropped `fixture` or `surface` filter would run the *whole* suite and
+ * report success for a different scope than the caller asked for, and a
+ * dropped `cache-dir` would store results somewhere else — so the run must
+ * not start at all. The message names each offending input, the resolved
+ * version, and either the minimum supporting release or the fact that no
+ * released engine supports these inputs yet.
+ */
+export function fixtureSurfaceCacheDirGateFailure(
+  version: string,
+  setInputs: readonly string[],
+): string | undefined {
+  if (setInputs.length === 0 || engineSupportsFixtureSurfaceCacheDir(version)) {
+    return undefined;
+  }
+  const plural = setInputs.length > 1;
+  const minimum =
+    FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION === undefined
+      ? `no released Protocol-Canary engine supports ${plural ? "them" : "it"} yet`
+      : `the minimum Protocol-Canary release supporting ${plural ? "them" : "it"} is ${FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION.join(".")}`;
+  return (
+    `The ${setInputs.map((name) => `"${name}"`).join(", ")} input${plural ? "s" : ""} ` +
+    `${plural ? "are" : "is"} set, but Canary ${version} cannot honour ${plural ? "them" : "it"}: ` +
+    `${minimum}. Omit ${plural ? "those inputs" : "that input"} or use a Protocol-Canary release ` +
+    "that supports it; running anyway would silently check a different scope than requested."
+  );
 }
 
 /**

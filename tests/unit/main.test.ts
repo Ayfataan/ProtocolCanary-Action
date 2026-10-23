@@ -116,6 +116,9 @@ const INPUTS: ActionInputs = {
   rpcMaxRetries: undefined,
   rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
+  fixture: undefined,
+  surface: undefined,
+  cacheDir: undefined,
   version: "0.1.0",
   uploadReport: false,
   annotations: true,
@@ -742,5 +745,32 @@ describe("run", () => {
       expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("validated for protocol 28"));
       expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("no regression verdict"));
     });
+  });
+
+  it("fails before any install or engine run when a scoped input the engine cannot honour is set (#458)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, fixture: "p28-xdr-cap83-empty-tx-set" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"fixture"');
+    expect(message).toContain("Canary 0.1.0");
+    expect(message).toMatch(/no released Protocol-Canary engine supports (it|them) yet/);
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("names every scoped input in the #458 gate failure and still never installs", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, surface: "rpc", cacheDir: "cache" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"surface"');
+    expect(message).toContain('"cache-dir"');
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
   });
 });

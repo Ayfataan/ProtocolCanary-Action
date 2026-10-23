@@ -6,6 +6,22 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- `fixture`, `surface`, and `cache-dir` inputs (#458), each forwarded as a
+  single `--flag=value` element in a stable order (a value beginning with `-`
+  can never be read as another option; arguments stay an array passed to
+  `spawn`). `surface` accepts only `xdr`/`rpc`/`soroban` (lower case);
+  `fixture`/`cache-dir` are trimmed, treat empty as unset, and reject control
+  characters (C0, DEL, C1) while otherwise leaving ids and paths untouched.
+  The three require an engine release whose `check` accepts them:
+  `FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION` is `undefined` because no published
+  Protocol-Canary release does yet (the flags exist only on the engine's
+  `main`, Protocol-Canary PRs #568/#564), so setting any of the three fails
+  the run **before** any install or engine process, naming the input, the
+  resolved version, and the missing support. This deliberately differs from
+  `allow-empty` and the 0.3.0 network inputs, which are ignored with a note:
+  a dropped filter would run a different scope than requested. With all three
+  unset, arguments and behaviour are unchanged for every engine version.
+
 - Enforce coverage thresholds in CI on Ubuntu runs and report the text coverage
   summary to the workflow job summary (`$GITHUB_STEP_SUMMARY`) inside a fenced
   code block (#410).

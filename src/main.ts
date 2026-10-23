@@ -24,6 +24,7 @@ import {
   engineSupportsAllowEmpty,
   engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
+  fixtureSurfaceCacheDirGateFailure,
   loadBaselineReport,
   runCheck,
 } from "./runner";
@@ -145,6 +146,23 @@ export async function run(): Promise<void> {
       resolved.commitSha !== undefined ? `@${resolved.commitSha.slice(0, 12)}` : ""
     })`,
   );
+
+  // #458: fail clearly — after the version is resolved, before any install or
+  // engine process — when a scope/cache input the resolved engine cannot
+  // honour is set. Unlike allow-empty (ignored with a note, because it only
+  // relaxes a check), dropping `fixture`/`surface` would run a different
+  // scope than the caller asked for, and dropping `cache-dir` would store
+  // results elsewhere, so this refuses to start rather than degrading.
+  const scopedInputs = [
+    inputs.fixture === undefined ? undefined : "fixture",
+    inputs.surface === undefined ? undefined : "surface",
+    inputs.cacheDir === undefined ? undefined : "cache-dir",
+  ].filter((name): name is string => name !== undefined);
+  const gateFailure = fixtureSurfaceCacheDirGateFailure(resolved.version, scopedInputs);
+  if (gateFailure !== undefined) {
+    core.setFailed(gateFailure);
+    return;
+  }
 
   let installed;
   try {

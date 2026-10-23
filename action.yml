@@ -83,6 +83,48 @@ inputs:
     required: false
     default: fixtures
 
+  fixture:
+    description: >-
+      Run only the fixture with this exact id, forwarded as the single
+      argument `--fixture=<id>` — the usual way to reproduce one failing
+      check in CI. Empty or whitespace-only means unset. Must not contain
+      control characters (C0, DEL, C1); no other characters are restricted,
+      because the engine decides what a fixture id is, and the
+      `--flag=value` form means an id beginning with `-` is still passed
+      safely. Requires a Protocol-Canary release whose `check` accepts
+      `--fixture`: with an older resolved `version` (or while no release
+      supports it) the Action fails before installing or running anything,
+      naming this input, the resolved version, and the minimum supporting
+      release — it never silently runs the whole suite instead.
+    required: false
+
+  surface:
+    description: >-
+      Run only fixtures of this surface, forwarded as the single argument
+      `--surface=<surface>`. Must be exactly one of `xdr`, `rpc`, or
+      `soroban` (lower case, as the engine accepts); anything else fails
+      the run with an input error naming the accepted values. Empty or
+      whitespace-only means unset. Same engine requirement as `fixture`:
+      with an unsupported resolved `version` the Action fails before
+      installing or running anything rather than checking every surface.
+    required: false
+
+  cache-dir:
+    description: >-
+      Directory for cached fixture results, forwarded as the single
+      argument `--cache-dir=<path>` and passed to the engine unchanged.
+      The engine — not the Action — resolves a relative path against
+      `--project-root` when one is given, so the path is deliberately not
+      resolved against `GITHUB_WORKSPACE` or the working directory. Missing
+      directories are created by the engine; a path that is an existing
+      file is rejected by the engine. May be combined with the engine's
+      cache-disabling flag (the engine accepts both). Empty or
+      whitespace-only means unset; control characters are rejected. Same
+      engine requirement as `fixture`: an unsupported resolved `version`
+      fails the run before installing or running anything rather than
+      caching results somewhere the caller did not ask for.
+    required: false
+
   version:
     description: >-
       Protocol Canary version to install and run, without a leading `v`
