@@ -21,7 +21,7 @@ vi.mock("@actions/core", async (importOriginal) => {
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
-import { getInputs } from "../../src/inputs";
+import { getInputs, parseScopedFilter } from "../../src/inputs";
 
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
@@ -33,6 +33,9 @@ const INPUT_KEYS = [
   "INPUT_RPC-MAX-RETRIES",
   "INPUT_RPC-RETRY-DELAY-MS",
   "INPUT_FIXTURES-DIR",
+  "INPUT_FIXTURE",
+  "INPUT_SURFACE",
+  "INPUT_CACHE-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
@@ -44,6 +47,7 @@ const INPUT_KEYS = [
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_JUNIT-REPORT",
 ];
 
 function clearInputs(): void {
@@ -82,6 +86,7 @@ describe("getInputs", () => {
       baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      junitReport: false,
       strictIntegrity: false,
     });
   });
@@ -694,6 +699,112 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       const inputs = getInputs();
       expect(inputs.githubToken).toBeUndefined();
       expect(setSecretMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("fixture, surface, and cache-dir inputs (#458)", () => {
+    it("are all unset when omitted", () => {
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("treats empty and whitespace-only values as unset rather than rejecting them", () => {
+      process.env.INPUT_FIXTURE = "   ";
+      process.env.INPUT_SURFACE = "";
+      process.env["INPUT_CACHE-DIR"] = "\t\n";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("parses valid values, trimming surrounding whitespace", () => {
+      process.env.INPUT_FIXTURE = "  p28-xdr-cap83-empty-tx-set  ";
+      process.env.INPUT_SURFACE = " rpc ";
+      process.env["INPUT_CACHE-DIR"] = " .canary-cache ";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("p28-xdr-cap83-empty-tx-set");
+      expect(inputs.surface).toBe("rpc");
+      expect(inputs.cacheDir).toBe(".canary-cache");
+    });
+
+    it("accepts each engine surface name and nothing else", () => {
+      for (const surface of ["xdr", "rpc", "soroban"]) {
+        process.env.INPUT_SURFACE = surface;
+        expect(getInputs().surface).toBe(surface);
+      }
+    });
+
+    it.each(["XDR", "Rpc", "xdr rpc", "all", "soroban-rpc"])(
+      "rejects surface %j with an error naming the accepted values",
+      (value) => {
+        process.env.INPUT_SURFACE = value;
+        expect(() => getInputs()).toThrow(InvalidInputError);
+        expect(() => getInputs()).toThrow(/"surface"/);
+        expect(() => getInputs()).toThrow(/xdr.*rpc.*soroban/);
+      },
+    );
+
+    it.each([
+      ["newline", "a\nb"],
+      ["tab", "a\tb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in fixture", (_label, value) => {
+      process.env.INPUT_FIXTURE = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"fixture"/);
+      expect(() => getInputs()).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it.each([
+      ["newline", "a\nb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in cache-dir", (_label, value) => {
+      process.env["INPUT_CACHE-DIR"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"cache-dir"/);
+    });
+
+    // NUL cannot be carried through process.env (the platform rejects the
+    // byte), so the NUL case of the shared validator is exercised directly.
+    it.each([["fixture"], ["cache-dir"]])("rejects a NUL control character in %s", (inputName) => {
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(InvalidInputError);
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(new RegExp(`"${inputName}"`));
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it("accepts ids and paths containing spaces, dots, slashes, and a leading dash", () => {
+      process.env.INPUT_FIXTURE = "-weird id.v1/x";
+      process.env["INPUT_CACHE-DIR"] = "-cache dir/./nested";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("-weird id.v1/x");
+      expect(inputs.cacheDir).toBe("-cache dir/./nested");
+    });
+  });
+
+  describe("junit-report input (#423)", () => {
+    it("defaults to false", () => {
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it.each([["true"], ["True"], ["TRUE"]])("parses %j as enabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(true);
+    });
+
+    it.each([["false"], ["False"], [""]])("parses %j as disabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it("rejects an undocumented boolean form by name", () => {
+      process.env["INPUT_JUNIT-REPORT"] = "yes";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"junit-report"/);
     });
   });
 });
