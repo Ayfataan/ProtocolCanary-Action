@@ -155,6 +155,8 @@ jobs:
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
+| `fail-on-warning` | Treat Protocol Canary warnings as failures (`--fail-on-warning`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
+| `offline` | Skip network-dependent fixtures (`--offline`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
 | `junit-report` | Render the JSON report to JUnit XML using the engine's own `stellar-canary report <file> --format junit` command and expose the file as the `junit-report-path` output. Written next to the JSON report and included in the artifact when `upload-report` is `true`. **Minimum engine version:** the release that adds `report --format junit` (Protocol-Canary #434; not in `0.2.0`) — with an older engine nothing is produced and a warning is logged. Any failure (unsupported engine, non-zero exit, empty output, missing report file) is a warning only: it never changes `status` and never fails the job. | `false` |
 | `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
 | `github-token` | Optional token for read-only requests to `api.github.com` for version resolution and checksum discovery. Set it to `${{ github.token }}` to authenticate (requires `contents: read`); otherwise requests are unauthenticated unless `GITHUB_TOKEN` is present in the environment. Pass an empty string (`""`) to disable authentication. | (none) |
@@ -391,6 +393,15 @@ in GitHub Actions collapsed log groups:
   stripped, byte/line tail bounds are enforced, and runner command processing is
   disabled via `::stop-commands::` using fresh random tokens to prevent command
   injection.
+
+- **Credential masking:** When an `rpc-url` input contains credentials in userinfo
+  (`user:password@host`), query parameter values, or a fragment, the Action registers
+  these sensitive values with the GitHub Actions runner via `core.setSecret()`. The
+  complete credential-bearing URL is also registered when sensitive components are
+  present. Plain RPC URLs without userinfo, query parameters, or a fragment are
+  unaffected. GitHub Actions runner masking is best effort — very short values may
+  not be masked due to runner limitations. Users should continue using GitHub Actions
+  secrets for RPC credentials and avoid intentionally printing sensitive values.
 
 ## Timeouts
 

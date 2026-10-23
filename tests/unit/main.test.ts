@@ -129,6 +129,8 @@ const INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 1,
   allowEmpty: false,
+  failOnWarning: false,
+  offline: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
   baselineReport: undefined,
