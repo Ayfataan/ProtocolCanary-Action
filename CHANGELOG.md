@@ -6,6 +6,46 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- Stamped releases for the reusable workflow (#457): for every release tag,
+  `release.yml` now creates a stamped commit whose `reusable-canary-check.yml`
+  refers to the Action at that release's own commit SHA (a literal 40-hex
+  value marked `# release-stamp: <tag>` — a `uses:` value cannot contain
+  expressions), then moves the release tag and the floating `v1` tag to that
+  stamped commit. A caller who pins the workflow to an exact release tag or
+  to the stamped commit therefore runs the exact Action code that release
+  shipped, instead of whichever commit `v1` happens to point at; pinning to
+  `@v1` or a branch still floats, as documented. Stamping is idempotent (an
+  already-stamped workflow is skipped), needs no change to the reusable
+  workflow's `permissions: contents: read` (only the release job holds
+  `contents: write`, for the tag push), and the guarantee itself is written
+  down in [docs/reusable-workflow.md](docs/reusable-workflow.md#what-your-pin-guarantees-457).
+- `junit-report` input (default `false`) and `junit-report-path` output (#423).
+  When enabled, the Action runs the engine's own renderer
+  (`stellar-canary report <report.json> --format junit`) on the JSON report it
+  just parsed and writes the XML next to it, keeping one definition of the
+  format instead of maintaining an XML writer here; the file is included in
+  the workflow artifact when `upload-report` is `true`. Auxiliary like the
+  artifact and the receipt: an engine release without the command (it is not
+  in `0.2.0`; it arrives with Protocol-Canary #434), a non-zero exit, empty
+  output, or a missing report file each produce a warning only — `status` and
+  the job outcome are untouched, and the output stays unset. With the input
+  at its default, no second engine process is started (behaviour unchanged).
+- `fixture`, `surface`, and `cache-dir` inputs (#458), each forwarded as a
+  single `--flag=value` element in a stable order (a value beginning with `-`
+  can never be read as another option; arguments stay an array passed to
+  `spawn`). `surface` accepts only `xdr`/`rpc`/`soroban` (lower case);
+  `fixture`/`cache-dir` are trimmed, treat empty as unset, and reject control
+  characters (C0, DEL, C1) while otherwise leaving ids and paths untouched.
+  The three require an engine release whose `check` accepts them:
+  `FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION` is `undefined` because no published
+  Protocol-Canary release does yet (the flags exist only on the engine's
+  `main`, Protocol-Canary PRs #568/#564), so setting any of the three fails
+  the run **before** any install or engine process, naming the input, the
+  resolved version, and the missing support. This deliberately differs from
+  `allow-empty` and the 0.3.0 network inputs, which are ignored with a note:
+  a dropped filter would run a different scope than requested. With all three
+  unset, arguments and behaviour are unchanged for every engine version.
+
 - Enforce coverage thresholds in CI on Ubuntu runs and report the text coverage
   summary to the workflow job summary (`$GITHUB_STEP_SUMMARY`) inside a fenced
   code block (#410).
@@ -39,6 +79,9 @@ All notable changes to this project are documented in this file.
 - Redact recognized secrets, strip control characters, and bound engine diagnostics
   in failure annotations and execution-failure summaries. Sanitize failure reasons
   as well, and redact before selecting or truncating diagnostic text (#499).
+- Bound HTTP response bodies to 4 MiB for GitHub API JSON, 1 MiB for checksum
+  manifests, and 64 MiB for prebuilt release assets. Reject oversized or incomplete
+  bodies and remove failed downloads before using the existing fallback paths (#500).
 
 - Execution-failure job summaries no longer break when the raw diagnostic
   (Canary's stderr, a timeout notice) itself contains a ``` sequence, e.g.

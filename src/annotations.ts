@@ -3,6 +3,7 @@ import * as core from "@actions/core";
 import { formatSafeDiagnosticTail } from "./log-block";
 import { describeExitCode } from "./output";
 import type { CanaryReport } from "./output";
+import { protocolMismatchMessage } from "./summary";
 
 const TITLE = "Stellar Protocol Canary";
 
@@ -29,6 +30,11 @@ export function emitAnnotations(report: CanaryReport): void {
     } else if (result.status === "warning") {
       core.warning(message, { title: TITLE });
     }
+  }
+
+  const mismatchMessage = protocolMismatchMessage(report);
+  if (mismatchMessage !== undefined) {
+    core.warning(mismatchMessage, { title: TITLE });
   }
 }
 

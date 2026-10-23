@@ -199,6 +199,30 @@ function provenanceLines(provenance: SummaryProvenance): string[] {
   ];
 }
 
+/**
+ * Explains an observed-protocol mismatch (#430): the engine checked the
+ * target protocol, but the network reported a different protocol version
+ * during live checks. Returns `undefined` when there is nothing to warn
+ * about — no network, no usable observed protocol, or agreement — so callers
+ * never emit a warning for a report that could not observe a protocol at
+ * all. The message is shared by the job summary and the annotation so both
+ * surfaces say exactly the same thing.
+ */
+export function protocolMismatchMessage(report: CanaryReport): string | undefined {
+  const observed = report.network?.observedProtocol;
+  const target = report.targetProtocol;
+  if (typeof observed !== "number" || !Number.isInteger(observed) || observed <= 0) {
+    return undefined;
+  }
+  if (!Number.isInteger(target) || target <= 0 || observed === target) {
+    return undefined;
+  }
+  return (
+    `Protocol mismatch: the network reported protocol ${String(observed)}, ` +
+    `but this run targets protocol ${String(target)}.`
+  );
+}
+
 /** Pure Markdown rendering, kept separate from `core.summary` so it can be
  * golden/snapshot-tested without a GitHub Actions runtime. `provenance`
  * renders the Provenance & Trust section (issue #373) and the reproduction
@@ -215,6 +239,13 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
         ? ` — observed protocol ${escapeInline(String(report.network.observedProtocol))}`
         : "";
     lines.push(`Network: ${escapeInline(report.network.name)}${observed}`);
+  }
+  // A live-check network that reports a different protocol than the target
+  // (#430) is worth surfacing prominently: the checks still describe the
+  // target protocol, not what the network is currently running.
+  const mismatch = protocolMismatchMessage(report);
+  if (mismatch !== undefined) {
+    lines.push(`> ⚠️ ${mismatch}`, "");
   }
   lines.push(`Canary version: ${escapeInline(report.toolVersion)}`, "");
 

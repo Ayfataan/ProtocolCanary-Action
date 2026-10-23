@@ -29,6 +29,7 @@ const {
   startGroupMock,
   endGroupMock,
   uploadReceiptMock,
+  renderJUnitReportMock,
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
   ensureCanaryInstalledMock: vi.fn(),
@@ -45,6 +46,7 @@ const {
   startGroupMock: vi.fn(),
   endGroupMock: vi.fn(),
   uploadReceiptMock: vi.fn(),
+  renderJUnitReportMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
@@ -81,8 +83,11 @@ vi.mock("../../src/canary", async (importOriginal) => {
 vi.mock("../../src/runner", async (importOriginal) => {
   const actual = await importOriginal<typeof runnerModule>();
   // buildCheckArgs stays real: it is pure, and asserting run() forwards its
-  // result to runCheck pins that wiring too.
-  return { ...actual, runCheck: runCheckMock };
+  // result to runCheck pins that wiring too. renderJUnitReport is replaced
+  // because it calls the module-local (unmocked) runCheck internally — the
+  // real one would spawn the fake BINARY_PATH; its own behaviour is covered
+  // by runner.test.ts against the mock engine.
+  return { ...actual, runCheck: runCheckMock, renderJUnitReport: renderJUnitReportMock };
 });
 
 vi.mock("../../src/summary", async (importOriginal) => {
@@ -111,8 +116,14 @@ const INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: "testnet",
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
+  fixture: undefined,
+  surface: undefined,
+  cacheDir: undefined,
   version: "0.1.0",
   uploadReport: false,
   annotations: true,
@@ -123,8 +134,10 @@ const INPUTS: ActionInputs = {
   baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  junitReport: false,
   strictIntegrity: false,
-};
+  workingDirectory: path.resolve("."),
+} as ActionInputs;
 
 const PASS_REPORT = report({
   status: "pass",
@@ -147,6 +160,7 @@ describe("run", () => {
     getInputsMock.mockReset().mockReturnValue(INPUTS);
     ensureCanaryInstalledMock.mockReset().mockResolvedValue({ binaryPath: BINARY_PATH, version: "0.1.0" });
     runCheckMock.mockReset();
+    renderJUnitReportMock.mockReset();
     writeSummaryMock.mockReset().mockResolvedValue(undefined);
     renderSummaryMarkdownMock.mockReset().mockReturnValue("## Stellar Protocol Canary (rendered summary)");
     renderExecutionFailureMarkdownMock.mockReset().mockReturnValue("## Stellar Protocol Canary (execution failure)");
@@ -222,6 +236,37 @@ describe("run", () => {
     await run();
     expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--allow-empty");
     expect(infoMock).toHaveBeenCalledWith(expect.stringContaining('"allow-empty" has no effect with Canary 0.1.1'));
+  });
+
+  it("warns about each new setting ignored by an older engine without exposing the passphrase", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      version: "0.2.0",
+      networkPassphrase: "Private Network ; secret value",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('"network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"'),
+    );
+    expect(warningMock.mock.calls.flat().join(" ")).not.toContain("secret value");
+    expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--network-passphrase");
+  });
+
+  it("does not warn about new settings when the resolved engine supports them", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({ ...INPUTS, version: "0.3.0", rpcMaxRetries: 0 });
+
+    await run();
+
+    expect(warningMock).not.toHaveBeenCalledWith(expect.stringContaining("rpc-max-retries"));
+    expect(runCheckMock.mock.calls[0]?.[1]).toEqual(
+      expect.arrayContaining(["--rpc-max-retries", "0"]),
+    );
   });
 
   // #65: run() derives the install bound from timeout-minutes and hands it to
@@ -757,5 +802,80 @@ describe("run", () => {
       expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("validated for protocol 28"));
       expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("no regression verdict"));
     });
+  });
+
+  it("fails before any install or engine run when a scoped input the engine cannot honour is set (#458)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, fixture: "p28-xdr-cap83-empty-tx-set" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"fixture"');
+    expect(message).toContain("Canary 0.1.0");
+    expect(message).toMatch(/no released Protocol-Canary engine supports (it|them) yet/);
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("names every scoped input in the #458 gate failure and still never installs", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, surface: "rpc", cacheDir: "cache" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"surface"');
+    expect(message).toContain('"cache-dir"');
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("never starts the JUnit render when junit-report is unset (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+    await run();
+
+    expect(runCheckMock).toHaveBeenCalledTimes(1);
+    expect(renderJUnitReportMock).not.toHaveBeenCalled();
+    expect(setOutputMock).not.toHaveBeenCalledWith("junit-report-path", expect.anything());
+  });
+
+  it("renders JUnit, sets junit-report-path, and keeps status when junit-report is true (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    const junitPath = path.join(runnerTemp, "stellar-canary-report.junit.xml");
+    fs.writeFileSync(junitPath, '<?xml version="1.0"?>\n<testsuites></testsuites>\n', "utf8");
+    renderJUnitReportMock.mockResolvedValueOnce({ path: junitPath });
+    getInputsMock.mockReturnValue({ ...INPUTS, junitReport: true });
+
+    await run();
+
+    // The check itself still runs exactly once; the renderer is a second,
+    // separate engine process only when the input is enabled.
+    expect(runCheckMock).toHaveBeenCalledTimes(1);
+    expect(renderJUnitReportMock).toHaveBeenCalledWith(
+      BINARY_PATH,
+      path.join(runnerTemp, "stellar-canary-report.json"),
+      60_000,
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("junit-report-path", junitPath);
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  it("warns without changing status when the JUnit render fails (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    renderJUnitReportMock.mockResolvedValueOnce({
+      reason: "the engine's report command exited with code 2: unknown subcommand \"report\"",
+    });
+    getInputsMock.mockReturnValue({ ...INPUTS, junitReport: true });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(expect.stringContaining("JUnit report not produced"));
+    expect(warningMock).toHaveBeenCalledWith(expect.stringContaining("status are unchanged"));
+    expect(setOutputMock).not.toHaveBeenCalledWith("junit-report-path", expect.anything());
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setFailedMock).not.toHaveBeenCalled();
   });
 });
