@@ -3,6 +3,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { ConfigNotFoundError, InvalidInputError } from "./errors";
+import type { Surface } from "./output";
+
+/** The `surface` input accepts exactly the engine's three surface names. */
+export type SurfaceFilter = Surface;
 
 export interface ActionInputs {
   readonly protocol: number | undefined;
@@ -19,6 +23,20 @@ export interface ActionInputs {
   readonly rpcMaxRetries: number | undefined;
   readonly rpcRetryDelayMs: number | undefined;
   readonly fixturesDir: string;
+  /** Run only the fixture with this exact id (`--fixture=<id>`, #458).
+   * `undefined` when unset. Requires an engine release whose `check` accepts
+   * `--fixture`; see `engineSupportsFixtureSurfaceCacheDir` in runner.ts. */
+  readonly fixture: string | undefined;
+  /** Run only fixtures of this surface (`--surface=<surface>`, #458):
+   * exactly one of the engine's three lower-case surface names. `undefined`
+   * when unset. Same engine gate as {@link fixture}. */
+  readonly surface: SurfaceFilter | undefined;
+  /** Directory for cached fixture results (`--cache-dir=<path>`, #458),
+   * forwarded unchanged — the engine resolves a relative path against
+   * `--project-root` when one is given, so the Action never resolves it
+   * against the workspace. `undefined` when unset. Same engine gate as
+   * {@link fixture}. */
+  readonly cacheDir: string | undefined;
   readonly version: string;
   readonly uploadReport: boolean;
   readonly annotations: boolean;
@@ -43,6 +61,13 @@ export interface ActionInputs {
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
   readonly generateReceipt: boolean;
+  /** Render the parsed JSON report to JUnit XML through the engine's own
+   * `report <file> --format junit` command (#423) and expose the file as the
+   * `junit-report-path` output (also included in the artifact upload).
+   * Auxiliary: any failure — an engine without the command, a non-zero exit,
+   * empty output, a missing report file — is a warning only and can never
+   * change the compatibility result. */
+  readonly junitReport: boolean;
   /** Fail closed whenever binary integrity cannot be proven (issue #372).
    * Default `false` preserves the historical degrade-to-pinning behaviour. */
   readonly strictIntegrity: boolean;
@@ -165,6 +190,9 @@ export function getInputs(): ActionInputs {
     RPC_RETRY_DELAY_MS_MAX,
   );
   const fixturesDir = core.getInput("fixtures-dir") || "fixtures";
+  const fixture = parseScopedFilter(core.getInput("fixture"), "fixture");
+  const surface = parseSurface(core.getInput("surface"));
+  const cacheDir = parseScopedFilter(core.getInput("cache-dir"), "cache-dir");
   const version = parseVersion(core.getInput("version") || "0.2.0");
   const uploadReport = parseBoolean("upload-report", core.getInput("upload-report") || "true");
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
@@ -194,6 +222,7 @@ export function getInputs(): ActionInputs {
     core.setSecret(networkPassphrase);
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+  const junitReport = parseBoolean("junit-report", core.getInput("junit-report") || "false");
 
   const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
 
@@ -220,6 +249,9 @@ export function getInputs(): ActionInputs {
     rpcMaxRetries,
     rpcRetryDelayMs,
     fixturesDir,
+    fixture,
+    surface,
+    cacheDir,
     version,
     uploadReport,
     annotations,
@@ -230,6 +262,7 @@ export function getInputs(): ActionInputs {
     baselineReport,
     githubToken,
     generateReceipt,
+    junitReport,
     strictIntegrity,
   };
 }
@@ -366,6 +399,59 @@ function parseBaselineReport(raw: string): string | undefined {
  * whitespace-only value, otherwise the trimmed value. Never throws. */
 function optional(value: string): string | undefined {
   return value.trim() === "" ? undefined : value.trim();
+}
+
+/**
+ * Validates a scope-affecting string input (#458 `fixture`, `cache-dir`):
+ * trimmed, with empty/whitespace-only meaning *unset* (the same normalization
+ * as every optional string input), and free of control characters once
+ * trimmed — C0 (`U+0000`-`U+001F`), `U+007F`, and C1 (`U+0080`-`U+009F`).
+ *
+ * Nothing beyond control characters is restricted: the engine decides what a
+ * fixture id is, and a cache path legitimately contains spaces, dots, slashes,
+ * and can begin with `-` (forwarded as `--flag=value`, so it can never be
+ * mistaken for another option). A silently ignored value here would run a
+ * different scope than the caller asked for (#458), so a bad value is an
+ * input error, never a downgraded warning.
+ *
+ * Exported for tests: a NUL byte cannot be carried through `process.env`
+ * (the platform rejects it), so the NUL case of this check is only
+ * reachable through the function directly.
+ */
+export function parseScopedFilter(raw: string, inputName: string): string | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (CONTROL_CHARACTERS.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "${inputName}" input: ${JSON.stringify(value)}. ` +
+        "Control characters (C0, DEL, and C1) are not allowed.",
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the `surface` input (#458) as exactly one of the engine's three
+ * lower-case surface names; empty/whitespace-only means unset. The engine
+ * rejects any other value (`invalid value ... [possible values: xdr, rpc,
+ * soroban]`), and a case or spelling mismatch must fail here with an
+ * input-naming message instead of surfacing as an engine failure — or, worse,
+ * as a differently scoped run.
+ */
+function parseSurface(raw: string): SurfaceFilter | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== "xdr" && value !== "rpc" && value !== "soroban") {
+    throw new InvalidInputError(
+      `Invalid "surface" input: ${JSON.stringify(value)}. Expected exactly ` +
+        'one of "xdr", "rpc" or "soroban" (lower case).',
+    );
+  }
+  return value;
 }
 
 /** Validates the "protocol" input as an unsigned decimal integer from 1 to
