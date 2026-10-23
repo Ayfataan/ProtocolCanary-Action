@@ -1,0 +1,92 @@
+name: Mutation testing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation:
+    name: StrykerJS mutation testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install the Stryker Vitest runner (pinned, not saved to package.json/package-lock.json)
+        # zizmor: ignore[adhoc-packages] Stryker packages are intentionally pinned here and excluded from package.json/package-lock.json per #443
+        run: npm install --no-save @stryker-mutator/vitest-runner@7.7.4
+
+      - name: Run StrykerJS mutation testing
+        # `@stryker-mutator/core` is fetched with `npx --yes` at an exact
+        # version and is not saved to package.json or the lockfile.
+        run: npx --yes @stryker-mutator/core@7.7.4 stryker run
+
+      - name: Write mutation score and surviving mutants to the job summary
+        id: summary
+        continue-on-error: true
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "reports/mutation/mutation-report.json";
+            const lines = ["# Mutation testing results", ""];
+            try {
+              const report = JSON.parse(fs.readFileSync(p, "utf8"));
+              const files = report.files || {};
+              const names = Object.keys(files);
+              let totalKilled = 0;
+              let totalMutants = 0;
+              const survivors = [];
+              for (const file of names) {
+                const info = files[file];
+                const mutants = Array.isArray(info.mutants) ? info.mutants : [];
+                const survived = mutants.filter((m) => String(m.status || "").toLowerCase() === "survived");
+                const killed = mutants.length - survived.length;
+                totalMutants += mutants.length;
+                totalKilled += killed;
+                const score = mutants.length ? ((killed / mutants.length) * 100).toFixed(1) : "n/a";
+                lines.push("## " + file);
+                lines.push("- mutants: " + mutants.length + " \u00b7 killed: " + killed + " \u00b7 survived: " + survived.length + " \u00b7 score: " + score + "%");
+                for (const m of survived) {
+                  const loc = m.location && m.location.start && m.location.start.line ? m.location.start.line : "?";
+                  survivors.push(file + ":" + loc + " \u00b7 " + (m.mutatorName || "?") + " \u00b7 " + (m.description || ""));
+                }
+              }
+              lines.push("");
+              lines.push("**Overall mutation score:** " + totalKilled + "/" + totalMutants + " mutants killed");
+              if (survivors.length) {
+                lines.push("");
+                lines.push("## Top surviving mutants");
+                for (const s of survivors.slice(0, 10)) {
+                  lines.push("- " + s);
+                }
+              } else {
+                lines.push("");
+                lines.push("No surviving mutants.");
+              }
+            } catch (err) {
+              lines.push("_Mutation report not available:_ " + String(err));
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          '
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutation/

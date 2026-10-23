@@ -89,12 +89,16 @@ export function isArtifactNameCollision(error: unknown): boolean {
 export async function uploadReport(
   reportPath: string,
   differentiator?: string,
+  /** Extra files (e.g. the JUnit rendering, #423) uploaded in the same
+   * artifact; they live beside the report so the artifact root is unchanged. */
+  additionalFiles: readonly string[] = [],
 ): Promise<ArtifactUploadOutcome> {
   let name = ARTIFACT_NAME;
+  const files = [reportPath, ...additionalFiles];
   try {
     const client = new DefaultArtifactClient();
     try {
-      await client.uploadArtifact(ARTIFACT_NAME, [reportPath], path.dirname(reportPath));
+      await client.uploadArtifact(ARTIFACT_NAME, files, path.dirname(reportPath));
     } catch (error) {
       if (!isArtifactNameCollision(error)) {
         throw error;
@@ -104,7 +108,7 @@ export async function uploadReport(
         `Artifact name "${ARTIFACT_NAME}" is already used in this workflow run; ` +
           `uploading this report as "${name}" instead.`,
       );
-      await client.uploadArtifact(name, [reportPath], path.dirname(reportPath));
+      await client.uploadArtifact(name, files, path.dirname(reportPath));
     }
     core.info(`Uploaded ${name} artifact.`);
     return { uploaded: true };

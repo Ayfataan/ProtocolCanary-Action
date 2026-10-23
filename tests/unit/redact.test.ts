@@ -69,9 +69,35 @@ describe("redactSecrets", () => {
     );
   });
 
+  it("leaves URL-like strings without a scheme (no ://) or with unsupported schemes intact", () => {
+    expect(redactSecrets("connect to localhost:8000/api?token=secret")).toBe(
+      "connect to localhost:8000/api?token=secret",
+    );
+    expect(redactSecrets("ftp://user:pass@example.com/files")).toBe(
+      "ftp://user:pass@example.com/files",
+    );
+    expect(redactSecrets("visit http:example.com/path")).toBe(
+      "visit http:example.com/path",
+    );
+  });
+
   it("redacts the value of a sensitive environment variable", () => {
     process.env[ENV_NAME] = ENV_VALUE;
     expect(redactSecrets(`debug: ${ENV_VALUE}`)).toBe(`debug: ${REDACTED}`);
+  });
+
+  it("skips sensitive environment variables with values shorter than the minimum length or equal to REDACTED", () => {
+    process.env[ENV_NAME] = "tiny";
+    expect(redactSecrets("log line with tiny secret")).toBe("log line with tiny secret");
+
+    process.env[ENV_NAME] = REDACTED;
+    expect(redactSecrets(`log line with ${REDACTED}`)).toBe(`log line with ${REDACTED}`);
+  });
+
+  it("masks both trimmed and untrimmed forms of a sensitive environment value with surrounding whitespace", () => {
+    process.env[ENV_NAME] = "  surrounded_secret_value  ";
+    expect(redactSecrets("log with surrounded_secret_value inside")).toBe(`log with ${REDACTED} inside`);
+    expect(redactSecrets("log with   surrounded_secret_value   inside")).toBe(`log with   ${REDACTED}   inside`);
   });
 
   it("does not redact values of environment variables whose names are not sensitive", () => {

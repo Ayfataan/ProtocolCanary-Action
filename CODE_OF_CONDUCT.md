@@ -1,6 +1,6 @@
 # Contributor Covenant Code of Conduct
 
-## Our Pledge
+# Our Pledge
 
 We pledge to make our community welcoming, safe, and equitable for all.
 
