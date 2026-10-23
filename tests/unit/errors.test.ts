@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ChecksumMismatchError,
   ConfigNotFoundError,
   TimeoutError,
   CanaryExecutionFailedError,
@@ -31,6 +32,21 @@ describe("CanaryActionError hierarchy", () => {
 
   it("sets the InvalidReportError code", () => {
     expect(new InvalidReportError("boom").code).toBe("InvalidReport");
+  });
+
+  it("sets the ChecksumMismatchError code", () => {
+    expect(new ChecksumMismatchError("boom").code).toBe("ChecksumMismatch");
+  });
+
+  it("names itself after its class so annotations and failures stay greppable", () => {
+    expect(new ChecksumMismatchError("boom").name).toBe("ChecksumMismatchError");
+  });
+
+  it("carries the expected and actual digests when the mismatch is compared", () => {
+    const error = new ChecksumMismatchError("the pack diverged", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    expect(error.message).toBe("the pack diverged");
+    expect(error.expected).toBe("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    expect(error.actual).toBe("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
   });
 
   it("isCanaryActionError distinguishes typed errors from arbitrary errors", () => {

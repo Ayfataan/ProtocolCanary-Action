@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import { protocolMismatchMessage, renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
 import type { CanarySkip } from "../../src/output";
 import { report, result } from "./helpers";
 
@@ -208,6 +208,45 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).not.toContain("Network:");
   });
 
+  describe("observed protocol mismatch (#430)", () => {
+    it("renders a warning when the network reported a different protocol than the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({
+          targetProtocol: 28,
+          network: { name: "testnet", observedProtocol: 27 },
+          results: [result({ testId: "a", surface: "rpc", fixtureId: "a" })],
+        }),
+      );
+
+      expect(markdown).toContain("> ⚠️ Protocol mismatch:");
+      // Both numbers and the direction of the mismatch are stated, so a
+      // reader never has to guess which protocol the results describe.
+      expect(markdown).toContain("reported protocol 27");
+      expect(markdown).toContain("targets protocol 28");
+    });
+
+    it("does not warn when the observed protocol matches the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      );
+
+      expect(markdown).toContain("Network: testnet — observed protocol 28");
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no observed protocol to compare", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet" } }),
+      );
+
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no network at all", () => {
+      expect(renderSummaryMarkdown(report({ targetProtocol: 28 }))).not.toContain("Protocol mismatch");
+    });
+  });
+
   it("never fabricates a result: an empty results array renders as a trivial pass with no surface rows", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }));
     expect(markdown).not.toContain("| XDR |");
@@ -384,7 +423,7 @@ describe("renderExecutionFailureMarkdown", () => {
     }
 
     // The verbatim diagnostic content survives inside the single block.
-    expect(markdown).toContain("```rust");
+    expect(markdown).toContain("\\`\\`\\`rust");
     expect(markdown).toContain("// quoted code from the panic message");
     expect(markdown).toContain("stack backtrace:");
   });
@@ -410,6 +449,37 @@ describe("renderExecutionFailureMarkdown", () => {
       if (run.length >= fence.length) {
         expect([fence, `${fence}text`]).toContain(line);
       }
+    }
+  });
+});
+
+describe("protocolMismatchMessage (#430)", () => {
+  it("returns a message naming both protocols when they differ", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 27 } }),
+      ),
+    ).toBe("Protocol mismatch: the network reported protocol 27, but this run targets protocol 28.");
+  });
+
+  it("returns undefined when the protocols agree", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined with no observed protocol, rather than treating it as a mismatch", () => {
+    expect(protocolMismatchMessage(report({ network: { name: "testnet" } }))).toBeUndefined();
+    expect(protocolMismatchMessage(report({}))).toBeUndefined();
+  });
+
+  it("ignores observed values that are not positive integers", () => {
+    for (const observedProtocol of [0, -1, 27.5, Number.NaN]) {
+      expect(
+        protocolMismatchMessage(report({ targetProtocol: 28, network: { name: "testnet", observedProtocol } })),
+      ).toBeUndefined();
     }
   });
 });

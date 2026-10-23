@@ -22,14 +22,21 @@ vi.mock("@actions/core", async (importOriginal) => {
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
-import { getInputs } from "../../src/inputs";
+import { getInputs, parseScopedFilter } from "../../src/inputs";
 
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
+  "INPUT_WORKING-DIRECTORY",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
+  "INPUT_RPC-MAX-RETRIES",
+  "INPUT_RPC-RETRY-DELAY-MS",
   "INPUT_FIXTURES-DIR",
+  "INPUT_FIXTURE",
+  "INPUT_SURFACE",
+  "INPUT_CACHE-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
@@ -43,12 +50,14 @@ const INPUT_KEYS = [
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_JUNIT-REPORT",
 ];
 
 function clearInputs(): void {
   for (const key of INPUT_KEYS) {
     delete process.env[key];
   }
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
@@ -64,10 +73,14 @@ describe("getInputs", () => {
     expect(inputs).toEqual({
       protocol: undefined,
       config: undefined,
+      workingDirectory: process.cwd(),
       network: undefined,
+      networkPassphrase: undefined,
       rpcUrl: undefined,
+      rpcMaxRetries: undefined,
+      rpcRetryDelayMs: undefined,
       fixturesDir: "fixtures",
-      version: "0.1.1",
+      version: "0.2.0",
       uploadReport: true,
       annotations: true,
       timeoutMinutes: 15,
@@ -79,6 +92,7 @@ describe("getInputs", () => {
       baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      junitReport: false,
       strictIntegrity: false,
     });
   });
@@ -203,6 +217,61 @@ describe("getInputs", () => {
     expect(getInputs().network).toBe("testnet");
   });
 
+  it("preserves the exact network passphrase for endpoint identity checks", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "  Local Network ; 2026  ";
+    expect(getInputs().networkPassphrase).toBe("  Local Network ; 2026  ");
+    expect(setSecretMock).toHaveBeenCalledWith("  Local Network ; 2026  ");
+  });
+
+  it("rejects an explicitly empty network passphrase", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"network-passphrase"/);
+  });
+
+  it.each(["line\nbreak", "tab\tvalue", "delete\u007fvalue"])(
+    "rejects control characters in network-passphrase %j",
+    (value) => {
+      process.env["INPUT_NETWORK-PASSPHRASE"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"network-passphrase"/);
+    },
+  );
+
+  it("leaves an omitted network-passphrase unset", () => {
+    expect(getInputs().networkPassphrase).toBeUndefined();
+  });
+
+  it.each([
+    ["0", 0],
+    ["3", 3],
+    ["4294967295", 4294967295],
+  ])("accepts rpc-max-retries %s", (value, expected) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(getInputs().rpcMaxRetries).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "4294967296"])("rejects rpc-max-retries %s", (value) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-max-retries"/);
+  });
+
+  it.each([
+    ["0", 0],
+    ["500", 500],
+    [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+  ])("accepts rpc-retry-delay-ms %s", (value, expected) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(getInputs().rpcRetryDelayMs).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "9007199254740992"])("rejects rpc-retry-delay-ms %s", (value) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-retry-delay-ms"/);
+  });
+
   it("trims surrounding whitespace from rpc-url", () => {
     process.env["INPUT_RPC-URL"] = "  https://soroban-testnet.stellar.org  ";
     expect(getInputs().rpcUrl).toBe("https://soroban-testnet.stellar.org");
@@ -255,6 +324,11 @@ describe("getInputs", () => {
   it("normalizes a version with a leading v", () => {
     process.env.INPUT_VERSION = "v0.1.0";
     expect(getInputs().version).toBe("0.1.0");
+  });
+
+  it("preserves an explicit legacy engine pin for migration compatibility", () => {
+    process.env.INPUT_VERSION = "0.1.1";
+    expect(getInputs().version).toBe("0.1.1");
   });
 
   it("rejects a non-semver version", () => {
@@ -645,6 +719,112 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       const inputs = getInputs();
       expect(inputs.githubToken).toBeUndefined();
       expect(setSecretMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("fixture, surface, and cache-dir inputs (#458)", () => {
+    it("are all unset when omitted", () => {
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("treats empty and whitespace-only values as unset rather than rejecting them", () => {
+      process.env.INPUT_FIXTURE = "   ";
+      process.env.INPUT_SURFACE = "";
+      process.env["INPUT_CACHE-DIR"] = "\t\n";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("parses valid values, trimming surrounding whitespace", () => {
+      process.env.INPUT_FIXTURE = "  p28-xdr-cap83-empty-tx-set  ";
+      process.env.INPUT_SURFACE = " rpc ";
+      process.env["INPUT_CACHE-DIR"] = " .canary-cache ";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("p28-xdr-cap83-empty-tx-set");
+      expect(inputs.surface).toBe("rpc");
+      expect(inputs.cacheDir).toBe(".canary-cache");
+    });
+
+    it("accepts each engine surface name and nothing else", () => {
+      for (const surface of ["xdr", "rpc", "soroban"]) {
+        process.env.INPUT_SURFACE = surface;
+        expect(getInputs().surface).toBe(surface);
+      }
+    });
+
+    it.each(["XDR", "Rpc", "xdr rpc", "all", "soroban-rpc"])(
+      "rejects surface %j with an error naming the accepted values",
+      (value) => {
+        process.env.INPUT_SURFACE = value;
+        expect(() => getInputs()).toThrow(InvalidInputError);
+        expect(() => getInputs()).toThrow(/"surface"/);
+        expect(() => getInputs()).toThrow(/xdr.*rpc.*soroban/);
+      },
+    );
+
+    it.each([
+      ["newline", "a\nb"],
+      ["tab", "a\tb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in fixture", (_label, value) => {
+      process.env.INPUT_FIXTURE = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"fixture"/);
+      expect(() => getInputs()).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it.each([
+      ["newline", "a\nb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in cache-dir", (_label, value) => {
+      process.env["INPUT_CACHE-DIR"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"cache-dir"/);
+    });
+
+    // NUL cannot be carried through process.env (the platform rejects the
+    // byte), so the NUL case of the shared validator is exercised directly.
+    it.each([["fixture"], ["cache-dir"]])("rejects a NUL control character in %s", (inputName) => {
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(InvalidInputError);
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(new RegExp(`"${inputName}"`));
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it("accepts ids and paths containing spaces, dots, slashes, and a leading dash", () => {
+      process.env.INPUT_FIXTURE = "-weird id.v1/x";
+      process.env["INPUT_CACHE-DIR"] = "-cache dir/./nested";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("-weird id.v1/x");
+      expect(inputs.cacheDir).toBe("-cache dir/./nested");
+    });
+  });
+
+  describe("junit-report input (#423)", () => {
+    it("defaults to false", () => {
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it.each([["true"], ["True"], ["TRUE"]])("parses %j as enabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(true);
+    });
+
+    it.each([["false"], ["False"], [""]])("parses %j as disabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it("rejects an undocumented boolean form by name", () => {
+      process.env["INPUT_JUNIT-REPORT"] = "yes";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"junit-report"/);
     });
   });
 });

@@ -39,10 +39,6 @@
  */
 "use strict";
 
-/* eslint-disable @typescript-eslint/no-require-imports -- this hook must stay CommonJS: Node loads it
- * through `--require` (which has no ESM equivalent) before the child can
- * pick a module system, and its whole purpose is a synchronous preload. */
-
 const path = require("node:path");
 
 const engineArgs = process.argv.slice(1);
