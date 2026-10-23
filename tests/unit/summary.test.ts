@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import { protocolMismatchMessage, renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
 import type { CanarySkip } from "../../src/output";
 import { report, result } from "./helpers";
 
@@ -208,6 +208,45 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).not.toContain("Network:");
   });
 
+  describe("observed protocol mismatch (#430)", () => {
+    it("renders a warning when the network reported a different protocol than the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({
+          targetProtocol: 28,
+          network: { name: "testnet", observedProtocol: 27 },
+          results: [result({ testId: "a", surface: "rpc", fixtureId: "a" })],
+        }),
+      );
+
+      expect(markdown).toContain("> ⚠️ Protocol mismatch:");
+      // Both numbers and the direction of the mismatch are stated, so a
+      // reader never has to guess which protocol the results describe.
+      expect(markdown).toContain("reported protocol 27");
+      expect(markdown).toContain("targets protocol 28");
+    });
+
+    it("does not warn when the observed protocol matches the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      );
+
+      expect(markdown).toContain("Network: testnet — observed protocol 28");
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no observed protocol to compare", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet" } }),
+      );
+
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no network at all", () => {
+      expect(renderSummaryMarkdown(report({ targetProtocol: 28 }))).not.toContain("Protocol mismatch");
+    });
+  });
+
   it("never fabricates a result: an empty results array renders as a trivial pass with no surface rows", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }));
     expect(markdown).not.toContain("| XDR |");
@@ -384,7 +423,7 @@ describe("renderExecutionFailureMarkdown", () => {
     }
 
     // The verbatim diagnostic content survives inside the single block.
-    expect(markdown).toContain("```rust");
+    expect(markdown).toContain("\\`\\`\\`rust");
     expect(markdown).toContain("// quoted code from the panic message");
     expect(markdown).toContain("stack backtrace:");
   });
@@ -414,9 +453,50 @@ describe("renderExecutionFailureMarkdown", () => {
   });
 });
 
+describe("protocolMismatchMessage (#430)", () => {
+  it("returns a message naming both protocols when they differ", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 27 } }),
+      ),
+    ).toBe("Protocol mismatch: the network reported protocol 27, but this run targets protocol 28.");
+  });
+
+  it("returns undefined when the protocols agree", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined with no observed protocol, rather than treating it as a mismatch", () => {
+    expect(protocolMismatchMessage(report({ network: { name: "testnet" } }))).toBeUndefined();
+    expect(protocolMismatchMessage(report({}))).toBeUndefined();
+  });
+
+  it("ignores observed values that are not positive integers", () => {
+    for (const observedProtocol of [0, -1, 27.5, Number.NaN]) {
+      expect(
+        protocolMismatchMessage(report({ targetProtocol: 28, network: { name: "testnet", observedProtocol } })),
+      ).toBeUndefined();
+    }
+  });
+});
+
 describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
   const BINARY_SHA = "a".repeat(64);
   const PACK_DIGEST = "b".repeat(64);
+
+  it("renders a report persistence warning callout note when reportWriteError is present (#508)", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      reportWriteError: "EACCES",
+    });
+
+    expect(markdown).toContain("Report persistence warning");
+    expect(markdown).toContain("EACCES");
+    expect(markdown).toContain("report artifact was not uploaded");
+  });
 
   it("renders a provenance table with the binary SHA-256, pack digest, and engine version", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
