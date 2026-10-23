@@ -50,6 +50,7 @@ const INPUT_KEYS = [
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_PR-COMMENT",
   "INPUT_JUNIT-REPORT",
 ];
 
@@ -94,6 +95,7 @@ describe("getInputs", () => {
       generateReceipt: false,
       junitReport: false,
       strictIntegrity: false,
+      prComment: false,
     });
   });
 

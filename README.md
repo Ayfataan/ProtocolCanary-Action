@@ -166,6 +166,7 @@ jobs:
 | `baseline-report` | Path to a previous Protocol Canary JSON report. The file must exist and be a schemaVersion 1 report for the same target protocol as this run. **Validated only**: the engine's `diff` command is not released yet (#335), so no regression verdict is produced. A missing, malformed, or protocol-incompatible baseline fails the run with an actionable annotation. | (none) |
 | `generate-receipt` | Generate a machine-readable Execution Receipt (provenance: engine version, engine build commit, fixture-pack digest, target protocol, observed protocol, timestamp) and upload it as the `stellar-canary-receipt-<run-id>` artifact; `receipt-path` carries the file location. | `false` |
 | `strict-integrity` | Fail-closed integrity policy. When `true`, the run aborts whenever binary integrity cannot be proven (no published checksum manifest, no entry for this platform, or a checksum lookup that could not be completed); when `false` it degrades to commit/tag pinning with a debug note. A checksum mismatch aborts the run in either mode. A checksum verifies data integrity, not the release author's identity. See [`docs/security-model.md`](docs/security-model.md). | `false` |
+| `pr-comment` | Opt in to a bounded pull request summary comment. Requires `pull-requests: write` on same-repository `pull_request` workflows; fork PRs and other events are skipped, and permission failures are warnings, not failed checks. | `false` |
 
 There is deliberately no `format` input: the Action always requests
 `--format json` from the CLI (the only way it can build the summary and
@@ -602,3 +603,8 @@ The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail
 ## License
 
 [Apache-2.0](LICENSE)
+
+
+### Optional pull request comment (experimental)
+
+Set `pr-comment: "true"` to request a bounded copy of the existing escaped job summary as a pull request comment. The default is `false`. Same-repository `pull_request` jobs require `pull-requests: write`; fork PRs and non-PR events do not post comments. Missing permissions cause a warning without failing the check. The comment is capped at 60,000 characters and updates an existing bot-authored comment for the workflow/job where found. This feature is pending maintainer security approval and is not ready for production use.

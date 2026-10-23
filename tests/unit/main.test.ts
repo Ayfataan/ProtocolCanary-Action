@@ -138,6 +138,7 @@ const INPUTS: ActionInputs = {
   generateReceipt: false,
   junitReport: false,
   strictIntegrity: false,
+  prComment: false,
   workingDirectory: path.resolve("."),
 } as ActionInputs;
 
