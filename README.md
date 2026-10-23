@@ -195,7 +195,7 @@ literals below.
 | `pack-protocol` | Protocol version of the resolved fixture pack, from `fixturePack.protocol` in the report or the `fixtures-pack-protocol` input. Empty when no pack identity is recorded. | `"28"` |
 | `pack-version` | Release tag/version of the resolved fixture pack, from `fixturePack.version`/`tag` or the `fixtures-pack-version` input. Empty when no pack identity is recorded. | `"v1.2.0"` |
 | `pack-digest` | Canonical content digest of the resolved fixture pack, formatted as `sha256:<64 lowercase hex>`, when the report records one. Empty when no digest is recorded or the recorded value is malformed; the Action never fabricates a digest. | `"sha256:…"` |
-| `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse and the report file was written successfully; empty/unset on report write failure or execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `report` | Absolute path to the JSON report file this invocation wrote. The file is uniquely named per invocation (see below), so it is never shared with another Action step. Only set when Canary produced output to parse and the report file was written successfully; empty/unset on report write failure or execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report-canary-check-4b9c1d2e3f4a5b6c.json` |
 | `receipt-path` | Absolute path to the generated Execution Receipt JSON. Set only when `generate-receipt` is `true` and Canary produced a parseable report; unset otherwise, including on an execution failure. | `/home/runner/work/_temp/stellar-canary-receipt.json` |
 | `junit-report-path` | Absolute path to the generated JUnit XML file. Only set when `junit-report` is `true` **and** the engine's render succeeded; unset otherwise (input disabled, engine without the command, failed/empty render) and on an execution failure. A failed render is always a warning, never a status change. | `/home/runner/work/_temp/stellar-canary-report.junit.xml` |
 
@@ -209,6 +209,26 @@ A concrete consumer, using the outputs to gate a follow-up step:
 - name: React to the result
   if: steps.canary.outputs.status == 'fail'
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
+```
+
+Every Action invocation writes its report to its own uniquely named JSON
+file, directly inside the runner's temporary directory (`RUNNER_TEMP`,
+falling back to the system temp directory). The filename is
+`stellar-canary-report-<step>-<random>.json`, where `<step>` is the
+current step's `GITHUB_ACTION` identifier sanitized to ASCII letters,
+digits, `-`, and `_`, and `<random>` is a short cryptographically random
+suffix. Multiple Action steps in the same job therefore never overwrite
+each other's reports, and the `report` output always contains the
+absolute path of the file *that* invocation wrote — so a later step can
+safely read or upload an earlier step's report:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  id: canary
+  with:
+    protocol: "28"
+- name: Read the report from a later step
+  run: jq .status "${{ steps.canary.outputs.report }}"
 ```
 
 > **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol`, `pack-protocol`, `pack-version`, and `pack-digest` are set to empty strings `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.

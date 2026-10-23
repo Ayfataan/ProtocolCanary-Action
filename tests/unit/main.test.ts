@@ -29,6 +29,7 @@ const {
   startGroupMock,
   endGroupMock,
   uploadReceiptMock,
+  uploadReportMock,
   renderJUnitReportMock,
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
@@ -46,6 +47,7 @@ const {
   startGroupMock: vi.fn(),
   endGroupMock: vi.fn(),
   uploadReceiptMock: vi.fn(),
+  uploadReportMock: vi.fn(),
   renderJUnitReportMock: vi.fn(),
 }));
 
@@ -102,10 +104,13 @@ vi.mock("../../src/summary", async (importOriginal) => {
 
 // #362: only `uploadReceipt` is replaced — receipt tests assert the gate
 // (upload when generate-receipt is true, skip when false) without ever
-// touching the artifact service.
+// touching the artifact service. `uploadReport` is mocked for the same
+// reason (#399): the report-path tests assert which file the upload
+// receives without contacting the artifact service; artifact *naming*
+// itself is covered by tests/unit/artifact.test.ts.
 vi.mock("../../src/artifact", async (importOriginal) => {
   const actual = await importOriginal<typeof artifactModule>();
-  return { ...actual, uploadReceipt: uploadReceiptMock };
+  return { ...actual, uploadReceipt: uploadReceiptMock, uploadReport: uploadReportMock };
 });
 
 import { run } from "../../src/main";
@@ -157,6 +162,15 @@ const PASS_REPORT = report({
   ],
 });
 
+/** The path the last run() advertised through its "report" output
+ * (#399: unique per invocation, so tests read it from the output instead
+ * of reconstructing a fixed filename). */
+function reportOutputPath(): string {
+  const call = setOutputMock.mock.calls.find((c) => c[0] === "report");
+  expect(call, "expected the run to set a \"report\" output").toBeDefined();
+  return String(call?.[1]);
+}
+
 describe("run", () => {
   let runnerTemp: string;
 
@@ -177,6 +191,8 @@ describe("run", () => {
     startGroupMock.mockReset();
     endGroupMock.mockReset();
     uploadReceiptMock.mockReset();
+    uploadReportMock.mockReset();
+    delete process.env.GITHUB_ACTION;
 
     // The success path writes the report under RUNNER_TEMP; give each test a
     // private directory (as the integration suite does) so it neither leaks
@@ -405,9 +421,9 @@ describe("run", () => {
 
     // The report was still written next to the (failed) summary, and its
     // path is what the "report" output advertises.
-    const reportPath = path.join(runnerTemp, "stellar-canary-report.json");
+    const reportPath = reportOutputPath();
+    expect(path.isAbsolute(reportPath)).toBe(true);
     expect(fs.existsSync(reportPath)).toBe(true);
-    expect(setOutputMock).toHaveBeenCalledWith("report", reportPath);
 
     // The success-path summary rendering was attempted exactly once, and a
     // passing report emits no annotations. The second argument is the
@@ -697,6 +713,143 @@ describe("run", () => {
     });
   });
 
+  // #399: every invocation writes its report to a uniquely named file
+  // directly inside RUNNER_TEMP, so two Action steps in one job can never
+  // overwrite each other's report. The filename is always a single safe
+  // path component: `stellar-canary-report-<sanitized GITHUB_ACTION>-<hex>.json`.
+  describe("issue #399: unique report path per invocation", () => {
+    const SAFE_NAME = /^stellar-canary-report-[A-Za-z0-9_-]+-[0-9a-f]{16}\.json$/;
+
+    beforeEach(() => {
+      process.env.GITHUB_ACTION = "canary-check";
+      runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    });
+
+    it("generates a different path for every invocation with an identical environment", async () => {
+      await run();
+      const first = reportOutputPath();
+      setOutputMock.mockClear();
+      await run();
+      const second = reportOutputPath();
+
+      expect(first).not.toBe(second);
+      expect(fs.existsSync(first)).toBe(true);
+      expect(fs.existsSync(second)).toBe(true);
+      // The first report is untouched by the second invocation.
+      expect(JSON.parse(fs.readFileSync(first, "utf8"))).toEqual(PASS_REPORT);
+    });
+
+    it("generates only absolute paths", async () => {
+      await run();
+      expect(path.isAbsolute(reportOutputPath())).toBe(true);
+    });
+
+    it("places the report directly inside the configured RUNNER_TEMP", async () => {
+      await run();
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(runnerTemp);
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+    });
+
+    it("falls back to os.tmpdir() when RUNNER_TEMP is unset", async () => {
+      delete process.env.RUNNER_TEMP;
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(os.tmpdir());
+      expect(path.isAbsolute(reportPath)).toBe(true);
+      expect(fs.existsSync(reportPath)).toBe(true);
+      fs.rmSync(reportPath, { force: true });
+    });
+
+    it("embeds a normal GITHUB_ACTION identifier safely in the filename", async () => {
+      process.env.GITHUB_ACTION = "StellarCanary-ProtocolCanary-Action__check";
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(runnerTemp);
+      expect(path.basename(reportPath)).toContain("StellarCanary-ProtocolCanary-Action__check");
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+    });
+
+    it("produces different filenames for two invocations with the same GITHUB_ACTION", async () => {
+      await run();
+      const first = reportOutputPath();
+      setOutputMock.mockClear();
+      await run();
+      const second = reportOutputPath();
+
+      expect(path.basename(first)).toContain("canary-check");
+      expect(path.basename(second)).toContain("canary-check");
+      expect(path.basename(first)).not.toBe(path.basename(second));
+    });
+
+    it("cannot escape RUNNER_TEMP via traversal or separator GITHUB_ACTION values", async () => {
+      const malicious = ["../", "../../other", "foo/bar", "foo\\bar", "..\\..\\windows", "a/../../b"];
+
+      for (const value of malicious) {
+        process.env.GITHUB_ACTION = value;
+        setOutputMock.mockReset();
+
+        await run();
+
+        const reportPath = reportOutputPath();
+        expect(path.isAbsolute(reportPath)).toBe(true);
+        // No traversal component survives: the file lands directly in RUNNER_TEMP.
+        expect(path.dirname(reportPath)).toBe(runnerTemp);
+        // The filename is a single path component of safe characters only.
+        expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+        expect(path.basename(reportPath)).not.toContain("/");
+        expect(path.basename(reportPath)).not.toContain("\\");
+      }
+    });
+
+    it("removes spaces and Unicode from the identifier", async () => {
+      process.env.GITHUB_ACTION = "my step \u{1F680} name";
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+      expect(path.basename(reportPath)).toContain("my-step-name");
+    });
+
+    it("produces a valid filename when GITHUB_ACTION is unset, empty, or separator-only", async () => {
+      delete process.env.GITHUB_ACTION;
+      await run();
+      const unset = reportOutputPath();
+      expect(path.basename(unset)).toMatch(SAFE_NAME);
+      expect(path.dirname(unset)).toBe(runnerTemp);
+
+      for (const unusable of ["", "/", "../.."]) {
+        process.env.GITHUB_ACTION = unusable;
+        setOutputMock.mockClear();
+        await run();
+        const reportPath = reportOutputPath();
+        expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+        expect(path.dirname(reportPath)).toBe(runnerTemp);
+      }
+    });
+
+    it("uses the one generated path for the file, the report output, and the artifact upload", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+      uploadReportMock.mockResolvedValue({ uploaded: true });
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.isAbsolute(reportPath)).toBe(true);
+      // The file at the advertised path holds exactly this invocation's report.
+      expect(JSON.parse(fs.readFileSync(reportPath, "utf8"))).toEqual(PASS_REPORT);
+      // The artifact upload received the same single path — the generator
+      // was not called again for the upload.
+      expect(uploadReportMock).toHaveBeenCalledTimes(1);
+      expect(uploadReportMock).toHaveBeenCalledWith(reportPath, expect.any(String), []);
+    });
+  });
+
   describe("issue #508: report write failure handling", () => {
     it("handles EACCES/ENOENT/ENOSPC report file write failure without failing execution", async () => {
       // Set RUNNER_TEMP to a non-existent or read-only directory
@@ -728,9 +881,13 @@ describe("run", () => {
     });
 
     it("safe cleanup failures do not abort execution", async () => {
-      // Create a directory at the report path so writeFileSync throws EISDIR
-      const unwriteableReportPath = path.join(runnerTemp, "stellar-canary-report.json");
-      fs.mkdirSync(unwriteableReportPath, { recursive: true });
+      // The report path is unique per invocation (#399), so a directory cannot
+      // be planted at it in advance. Point RUNNER_TEMP at a regular file
+      // instead: the write fails with ENOTDIR, a different errno from the
+      // missing-directory case above (Windows reports it as ENOENT).
+      const notADirectory = path.join(runnerTemp, "not-a-directory");
+      fs.writeFileSync(notADirectory, "", "utf8");
+      process.env.RUNNER_TEMP = notADirectory;
 
       runCheckMock.mockResolvedValueOnce({
         exitCode: 0,
@@ -743,7 +900,7 @@ describe("run", () => {
 
       expect(setFailedMock).not.toHaveBeenCalled();
       expect(warningMock).toHaveBeenCalledWith(
-        expect.stringContaining("EISDIR"),
+        expect.stringMatching(/ENOTDIR|ENOENT/),
       );
       expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
     });
@@ -911,7 +1068,7 @@ describe("run", () => {
     expect(runCheckMock).toHaveBeenCalledTimes(1);
     expect(renderJUnitReportMock).toHaveBeenCalledWith(
       BINARY_PATH,
-      path.join(runnerTemp, "stellar-canary-report.json"),
+      reportOutputPath(),
       60_000,
     );
     expect(setOutputMock).toHaveBeenCalledWith("junit-report-path", junitPath);
