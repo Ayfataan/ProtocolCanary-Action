@@ -794,9 +794,6 @@ async function saveToCache(resolved: ResolvedVersion, binaryPath: string): Promi
   }
 }
 
-/** Canonical fixture-pack digest format (`sha256:` + 64 lowercase hex). */
-const PACK_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
-
 /** Provenance marker written inside a cached pack directory. */
 const PACK_MARKER_FILE = ".stellar-canary-pack.json";
 
