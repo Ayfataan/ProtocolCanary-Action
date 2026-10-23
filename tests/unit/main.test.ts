@@ -884,7 +884,7 @@ describe("run", () => {
       // The report path is unique per invocation (#399), so a directory cannot
       // be planted at it in advance. Point RUNNER_TEMP at a regular file
       // instead: the write fails with ENOTDIR, a different errno from the
-      // missing-directory case above.
+      // missing-directory case above (Windows reports it as ENOENT).
       const notADirectory = path.join(runnerTemp, "not-a-directory");
       fs.writeFileSync(notADirectory, "", "utf8");
       process.env.RUNNER_TEMP = notADirectory;
@@ -900,7 +900,7 @@ describe("run", () => {
 
       expect(setFailedMock).not.toHaveBeenCalled();
       expect(warningMock).toHaveBeenCalledWith(
-        expect.stringContaining("ENOTDIR"),
+        expect.stringMatching(/ENOTDIR|ENOENT/),
       );
       expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
     });
