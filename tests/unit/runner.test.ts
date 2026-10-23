@@ -1,20 +1,31 @@
 import type * as childProcess from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CanaryExecutionFailedError, TimeoutError } from "../../src/errors";
+import { CanaryExecutionFailedError, InvalidInputError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
 import {
   MAX_STDERR_CAPTURE_BYTES,
   STDERR_DROPPED_NOTICE,
+  FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION,
+  assertBaselineProtocol,
   buildCheckArgs,
   engineSupportsAllowEmpty,
+  engineSupportsFixtureSurfaceCacheDir,
+  engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
+  fixtureSurfaceCacheDirGateFailure,
+  junitFilePath,
+  loadBaselineReport,
+  renderJUnitReport,
   runCheck,
 } from "../../src/runner";
+import { report } from "./helpers";
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -56,18 +67,31 @@ const BASE_INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: undefined,
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
+  fixture: undefined,
+  surface: undefined,
+  cacheDir: undefined,
   version: "0.1.0",
   uploadReport: true,
   annotations: true,
+  diagnostics: false,
   timeoutMinutes: 15,
   allowEmpty: false,
+  failOnWarning: false,
+  offline: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  junitReport: false,
   strictIntegrity: false,
+  prComment: false,
+  workingDirectory: path.resolve("."),
 };
 
 describe("buildCheckArgs", () => {
@@ -127,12 +151,198 @@ describe("buildCheckArgs", () => {
     );
   });
 
+  it("forwards passphrase and retry flags to engines that support them", () => {
+    const args = buildCheckArgs(
+      {
+        ...BASE_INPUTS,
+        network: "testnet",
+        networkPassphrase: "Private Network ; October 2026",
+        rpcMaxRetries: 0,
+        rpcRetryDelayMs: 250,
+      },
+      "0.3.0",
+    );
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "--network",
+        "testnet",
+        "--network-passphrase",
+        "Private Network ; October 2026",
+        "--rpc-max-retries",
+        "0",
+        "--rpc-retry-delay-ms",
+        "250",
+      ]),
+    );
+  });
+
+  it("does not pass new flags to older or unknown engines", () => {
+    const inputs = {
+      ...BASE_INPUTS,
+      networkPassphrase: "Private Network ; October 2026",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    };
+    for (const version of ["0.2.0", "", undefined]) {
+      const args = buildCheckArgs(inputs, version);
+      expect(args).not.toContain("--network-passphrase");
+      expect(args).not.toContain("--rpc-max-retries");
+      expect(args).not.toContain("--rpc-retry-delay-ms");
+    }
+  });
+
   it("never concatenates arguments into a single string (command-injection defense)", () => {
     const args = buildCheckArgs({ ...BASE_INPUTS, network: "testnet; rm -rf /" });
     // The dangerous value must appear as exactly one array element, never
     // merged with adjacent flags or split by the shell.
     expect(args).toContain("testnet; rm -rf /");
     expect(args.some((a) => a.includes("--network testnet"))).toBe(false);
+  });
+
+  it("forwards fail-on-warning and offline only when enabled and supported", () => {
+    const supportedVersion = "999999999.0.0";
+    const baseArgs = buildCheckArgs(BASE_INPUTS);
+
+    expect(
+      buildCheckArgs({ ...BASE_INPUTS, failOnWarning: true }, supportedVersion),
+    ).toEqual([...baseArgs, "--fail-on-warning"]);
+    expect(buildCheckArgs({ ...BASE_INPUTS, offline: true }, supportedVersion)).toEqual([
+      ...baseArgs,
+      "--offline",
+    ]);
+    expect(
+      buildCheckArgs(
+        { ...BASE_INPUTS, failOnWarning: true, offline: true },
+        supportedVersion,
+      ),
+    ).toEqual([...baseArgs, "--fail-on-warning", "--offline"]);
+    for (const unsupportedVersion of [undefined, "0.2.0", "not-a-version"]) {
+      expect(
+        buildCheckArgs(
+          { ...BASE_INPUTS, failOnWarning: true, offline: true },
+          unsupportedVersion,
+        ),
+      ).toEqual(baseArgs);
+    }
+  });
+
+  describe("fixture, surface, and cache-dir forwarding (#458)", () => {
+    const prefix = ["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"];
+
+    it("leaves the argument array identical to before when none of the three is set", () => {
+      expect(buildCheckArgs(BASE_INPUTS, "0.1.0")).toEqual(prefix);
+      expect(buildCheckArgs(BASE_INPUTS, "0.2.0")).toEqual(prefix);
+      expect(buildCheckArgs(BASE_INPUTS)).toEqual(prefix);
+    });
+
+    it("forwards each input set alone as one --flag=value element", () => {
+      expect(buildCheckArgs({ ...BASE_INPUTS, fixture: "p28-xdr-cap83-empty-tx-set" }, "9.9.9")).toEqual([
+        ...prefix,
+        "--fixture=p28-xdr-cap83-empty-tx-set",
+      ]);
+      expect(buildCheckArgs({ ...BASE_INPUTS, surface: "xdr" }, "9.9.9")).toEqual([...prefix, "--surface=xdr"]);
+      expect(buildCheckArgs({ ...BASE_INPUTS, cacheDir: ".stellar-canary-cache" }, "9.9.9")).toEqual([
+        ...prefix,
+        "--cache-dir=.stellar-canary-cache",
+      ]);
+    });
+
+    it("keeps a stable order for every combination", () => {
+      const fixtureSurface = { ...BASE_INPUTS, fixture: "f", surface: "rpc" as const };
+      expect(buildCheckArgs(fixtureSurface, "0.1.0")).toEqual([...prefix, "--fixture=f", "--surface=rpc"]);
+
+      const fixtureCache = { ...BASE_INPUTS, fixture: "f", cacheDir: "c" };
+      expect(buildCheckArgs(fixtureCache, "0.1.0")).toEqual([...prefix, "--fixture=f", "--cache-dir=c"]);
+
+      const surfaceCache = { ...BASE_INPUTS, surface: "soroban" as const, cacheDir: "c" };
+      expect(buildCheckArgs(surfaceCache, "0.1.0")).toEqual([...prefix, "--surface=soroban", "--cache-dir=c"]);
+
+      const all = { ...BASE_INPUTS, fixture: "f", surface: "soroban" as const, cacheDir: "c" };
+      expect(buildCheckArgs(all, "0.1.0")).toEqual([
+        ...prefix,
+        "--fixture=f",
+        "--surface=soroban",
+        "--cache-dir=c",
+      ]);
+    });
+
+    it("passes a value beginning with - as one element, never as a separate option", () => {
+      const args = buildCheckArgs({ ...BASE_INPUTS, fixture: "--weird-id" }, "0.1.0");
+      expect(args).toContain("--fixture=--weird-id");
+      expect(args).not.toContain("--weird-id");
+      expect(args).not.toContain("");
+    });
+
+    it("appends --fixture= after every pre-existing argument", () => {
+      const args = buildCheckArgs({ ...BASE_INPUTS, network: "testnet", fixture: "f" }, "0.1.0");
+      expect(args.indexOf("--fixture=f")).toBe(args.length - 1);
+      expect(args.indexOf("--network")).toBeLessThan(args.indexOf("--fixture=f"));
+    });
+  });
+});
+
+describe("baseline report validation (#344)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-baseline-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(name: string, contents: string): string {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, contents, "utf8");
+    return file;
+  }
+
+  it("loads a complete report and preserves its target protocol", () => {
+    const file = write("baseline.json", JSON.stringify(report({ targetProtocol: 28 })));
+    const baseline = loadBaselineReport(file);
+    expect(baseline.targetProtocol).toBe(28);
+    expect(baseline.schemaVersion).toBe(1);
+  });
+
+  it("rejects an empty file before parsing", () => {
+    const file = write("empty.json", "   \n");
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/baseline report is empty/);
+  });
+
+  it("rejects invalid JSON with a clear baseline parse error", () => {
+    const file = write("broken.json", '{"schemaVersion": 1,');
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/not a valid Protocol Canary report/);
+    expect(() => loadBaselineReport(file)).toThrow(/could not be parsed as JSON/);
+  });
+
+  it("rejects an unsupported schemaVersion", () => {
+    const file = write("future.json", JSON.stringify(report({ schemaVersion: 99 })));
+    expect(() => loadBaselineReport(file)).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(file)).toThrow(/schemaVersion 99/);
+  });
+
+  it("rejects a missing or unreadable file", () => {
+    expect(() => loadBaselineReport(path.join(dir, "absent.json"))).toThrow(InvalidInputError);
+    expect(() => loadBaselineReport(path.join(dir, "absent.json"))).toThrow(/could not be read/);
+  });
+
+  it("accepts a baseline recorded for the same target protocol", () => {
+    const baseline = report({ targetProtocol: 28 });
+    const current = report({ targetProtocol: 28 });
+    expect(() => assertBaselineProtocol(baseline, current, "baseline.json")).not.toThrow();
+  });
+
+  it("rejects a baseline recorded for a different target protocol with both values named", () => {
+    const baseline = report({ targetProtocol: 27 });
+    const current = report({ targetProtocol: 28 });
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(InvalidInputError);
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(
+      /targets protocol 27, but this run targets protocol 28/,
+    );
+    expect(() => assertBaselineProtocol(baseline, current, "/tmp/baseline.json")).toThrow(/Incompatible baseline report/);
   });
 });
 
@@ -178,6 +388,138 @@ describe("allow-empty forwarding", () => {
     [undefined, false],
   ])("engineSupportsAllowEmpty(%j) is %s", (version, expected) => {
     expect(engineSupportsAllowEmpty(version)).toBe(expected);
+  });
+});
+
+describe("network passphrase and RPC retry version gate", () => {
+  it.each([
+    ["0.2.0", false],
+    ["0.2.99", false],
+    ["0.3.0", true],
+    ["0.3.1", true],
+    ["1.0.0", true],
+    ["", false],
+    ["v0.3.0", false],
+    ["0.3.0-rc1", false],
+    [undefined, false],
+  ])("engineSupportsNetworkPassphraseAndRpcRetrySettings(%j) is %s", (version, expected) => {
+    expect(engineSupportsNetworkPassphraseAndRpcRetrySettings(version)).toBe(expected);
+  });
+});
+
+describe("fixture/surface/cache-dir fail-clearly gate (#458)", () => {
+  it("has no minimum release hard-coded while no release supports the flags", () => {
+    // Only change this assertion together with FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION,
+    // after reading CheckArgs at the release a maintainer names on #458.
+    expect(FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION).toBeUndefined();
+  });
+
+  it("reports no support for any engine version while the gate constant is undefined", () => {
+    for (const version of ["0.1.0", "0.2.0", "0.3.0", "9.9.9", "", undefined]) {
+      expect(engineSupportsFixtureSurfaceCacheDir(version)).toBe(false);
+    }
+  });
+
+  it("produces no failure when no scoped input is set, whatever the engine version", () => {
+    expect(fixtureSurfaceCacheDirGateFailure("0.1.0", [])).toBeUndefined();
+    expect(fixtureSurfaceCacheDirGateFailure("9.9.9", [])).toBeUndefined();
+  });
+
+  it.each([["fixture"], ["surface"], ["cache-dir"], ["fixture", "surface"], ["fixture", "surface", "cache-dir"]])(
+    "names the input(s), the resolved version, and the missing support for %j",
+    (...setInputs) => {
+      const message = fixtureSurfaceCacheDirGateFailure("0.2.0", setInputs);
+      expect(message).toBeDefined();
+      const text = message ?? "";
+      for (const name of setInputs) {
+        expect(text).toContain(`"${name}"`);
+      }
+      expect(text).toContain("Canary 0.2.0");
+      expect(text).toMatch(/no released Protocol-Canary engine supports (it|them) yet/);
+      expect(text).toMatch(/different scope than requested/);
+    },
+  );
+});
+
+describe("junit-report rendering through the engine (#423)", () => {
+  let dir: string;
+  let reportPath: string;
+  let previousScenario: string | undefined;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-junit-"));
+    reportPath = path.join(dir, "stellar-canary-report.json");
+    fs.writeFileSync(reportPath, JSON.stringify(report({})), "utf8");
+    previousScenario = process.env.MOCK_CANARY_SCENARIO;
+    delete process.env.MOCK_CANARY_SCENARIO;
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (previousScenario === undefined) {
+      delete process.env.MOCK_CANARY_SCENARIO;
+    } else {
+      process.env.MOCK_CANARY_SCENARIO = previousScenario;
+    }
+  });
+
+  function render(): ReturnType<typeof renderJUnitReport> {
+    return renderJUnitReport(MOCK_CANARY_COMMAND, reportPath, 10_000, MOCK_CANARY_PREFIX);
+  }
+
+  it("derives the JUnit path from the report path", () => {
+    expect(junitFilePath("/tmp/stellar-canary-report.json")).toBe("/tmp/stellar-canary-report.junit.xml");
+    expect(junitFilePath("/tmp/report")).toBe("/tmp/report.junit.xml");
+  });
+
+  it("writes a well-formed XML file and returns its path on success", async () => {
+    const outcome = await render();
+    expect(outcome.reason).toBeUndefined();
+    expect(outcome.path).toBe(path.join(dir, "stellar-canary-report.junit.xml"));
+    const xml = fs.readFileSync(String(outcome.path), "utf8");
+    expect(xml).toMatch(/^<\?xml version="1\.0"/);
+    expect(xml).toContain("<testsuites");
+    expect(xml).toContain("</testsuites>");
+  });
+
+  it("reports an engine without the report command as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-unknown";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 2");
+    expect(outcome.reason).toContain('unknown subcommand "report"');
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports a non-zero render exit as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-fail";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 5");
+    expect(outcome.reason).toContain("internal error while rendering JUnit XML");
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports empty engine output as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-empty";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("produced no output");
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports a missing report file as a failure without throwing", async () => {
+    reportPath = path.join(dir, "absent.json");
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 2");
+    expect(outcome.reason).toContain("report file not found");
+  });
+
+  it("captures a spawn failure as a reason instead of throwing", async () => {
+    const outcome = await renderJUnitReport(path.join(dir, "no-such-binary"), reportPath, 5_000);
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toBeTruthy();
   });
 });
 
@@ -447,7 +789,7 @@ describe("extractDiagnostic", () => {
     const long = `error: ${"x".repeat(5_000)}`;
     const diagnostic = extractDiagnostic(long);
     expect(diagnostic.length).toBe(500);
-    expect(diagnostic.startsWith("error: ")).toBe(true);
+    expect(diagnostic.startsWith("[... earlier output truncated ...]\n")).toBe(true);
   });
 });
 
@@ -561,5 +903,66 @@ describe("UTF-8 stream decoding and bounded capture (issue #427)", () => {
     expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
     expect(result.stderr).toContain("FINAL ROOT DIAGNOSTIC ERROR");
     expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_STDERR_CAPTURE_BYTES);
+  });
+});
+
+describe("runCheck timeoutMs guard (#456)", () => {
+  beforeEach(() => {
+    spawnMock.mockClear();
+  });
+
+  it("rejects a timeoutMs above the Node timer limit instead of starting a timer", async () => {
+    await expect(
+      runCheck("fake-canary", ["check"], 2_147_483_648),
+    ).rejects.toThrow(/timeoutMs/);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, NaN, Infinity])(
+    "rejects a non-positive or non-finite timeoutMs %j",
+    async (timeoutMs) => {
+      await expect(runCheck("fake-canary", ["check"], timeoutMs)).rejects.toThrow(
+        /timeoutMs/,
+      );
+      expect(spawnMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("passes a sub-limit delay to setTimeout for 35791 minutes and does not fire immediately", async () => {
+    // Regression: timeout-minutes: 40000 used to be multiplied by 60,000 and
+    // handed to setTimeout, which clamped delays above 2,147,483,647 ms to
+    // fire after 1 ms and terminate the engine almost immediately. The largest
+    // accepted value (35791 minutes) must keep a real, sub-limit delay.
+    vi.useFakeTimers();
+    try {
+      const child = new FakeChild(false); // ignores SIGTERM: only the timer can settle it
+      spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+      const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+      let settled = false;
+      const pending = runCheck("fake-canary", ["check"], 35791 * 60_000);
+      pending.then(() => {
+        settled = true;
+      }, () => {
+        settled = true;
+      });
+
+      expect(setTimeoutSpy).toHaveBeenCalledTimes(1);
+      const [, delay] = setTimeoutSpy.mock.lastCall as [unknown, number];
+      expect(delay).toBe(35791 * 60_000);
+      expect(delay).toBeLessThan(2_147_483_647);
+
+      // Advancing 1 ms must not settle the promise: the timer is honoured,
+      // not clamped to fire immediately.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(false);
+
+      // Letting the timer fire proves the delay is real: SIGTERM is sent, the
+      // child ignores it, and SIGKILL after the grace period settles it.
+      await vi.advanceTimersByTimeAsync(35791 * 60_000 + 6_000);
+      await expect(pending).rejects.toThrow(TimeoutError);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

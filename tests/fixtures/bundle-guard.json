@@ -1,0 +1,60 @@
+{
+  "measuredAt": "2026-10-22",
+  "committedBundleBytes": 1849171,
+  "sizeBudgetBytes": 2200030,
+  "sizeBudgetNote": "About 20% above the committed dist/index.js size (1,833,358 bytes) measured on 2026-10-22: 1,833,358 * 1.2 = 2,200,029.6 (rounded). Raise deliberately, with a reason, when the bundle legitimately grows.",
+  "allowedUrlHosts": [
+    {
+      "host": "127.0.0.1",
+      "from": "This action's rpc-url local-loopback check (src/inputs.ts) and the Azure Storage emulator connection string"
+    },
+    {
+      "host": "api.github.com",
+      "from": "@actions/core (tag lookup), @actions/artifact, @actions/cache, @actions/exec (GitHub REST API)"
+    },
+    {
+      "host": "disk.azure.com",
+      "from": "@azure/storage-blob / @azure/storage-common (transitive via @actions/artifact and @actions/cache)"
+    },
+    {
+      "host": "disk.compute.azure.com",
+      "from": "@azure/storage-blob / @azure/storage-common (transitive via @actions/artifact and @actions/cache)"
+    },
+    {
+      "host": "docs.github.com",
+      "from": "Documentation links in bundled dependencies and source"
+    },
+    {
+      "host": "emscripten.org",
+      "from": "@azure/storage-common (emscripten-compiled wasm crc64, transitive via @actions/artifact and @actions/cache)"
+    },
+    {
+      "host": "github.com",
+      "from": "@actions/* toolkit and octokit source links in bundled dependencies"
+    },
+    {
+      "host": "githubstatus.com",
+      "from": "@actions/artifact (status page link in the download error message)"
+    },
+    {
+      "host": "learn.microsoft.com",
+      "from": "@azure/storage-blob (documentation link in the Azure SDK)"
+    },
+    {
+      "host": "localhost",
+      "from": "This action's rpc-url local-loopback check (src/inputs.ts)"
+    },
+    {
+      "host": "storage.azure.com",
+      "from": "@azure/storage-blob (transitive via @actions/artifact and @actions/cache)"
+    },
+    {
+      "host": "uploads.github.com",
+      "from": "@actions/artifact (artifact upload endpoint)"
+    },
+    {
+      "host": "www.githubstatus.com",
+      "from": "@actions/artifact (status page link in the download error message)"
+    }
+  ]
+}

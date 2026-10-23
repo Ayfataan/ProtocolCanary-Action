@@ -11,13 +11,15 @@ lockfile (`package-lock.json`) is committed and authoritative.
 
 ```bash
 npm ci
+npm run audit
+npm run check:licenses
 npm run typecheck
 npm run lint
 npm test
 npm run build
 ```
 
-All four must pass before a change is considered done — this is exactly
+All must pass before a change is considered done — this is exactly
 what `.github/workflows/ci.yml` runs, plus a check that the committed
 `dist/` matches a fresh build (see [Build](#build) below).
 
@@ -55,10 +57,26 @@ npm run typecheck    # tsc --noEmit, strict mode
 npm run lint         # eslint
 npm test             # vitest run (unit + integration, includes workflow-policy.test.ts)
 npm run test:coverage  # vitest run with v8 coverage over src/ (text, HTML, and lcov reports in coverage/)
+npm run audit        # npm audit --omit=dev --audit-level=high
+npm run check:licenses # license allow-list verification for production dependencies
 npm run build         # esbuild bundle to dist/index.js
 actionlint           # static analysis of .github/workflows/
 zizmor .github/workflows # security audit of .github/workflows/
 ```
+
+### Updating job summary goldens
+
+The job summary's exact Markdown output is stored in `tests/golden/` and
+checked by `tests/unit/summary-golden.test.ts`. To intentionally update the
+snapshots, run:
+
+```bash
+UPDATE_GOLDEN=1 npx vitest run tests/unit/summary-golden.test.ts
+```
+
+Review every changed golden file by hand. A pull request that changes a
+golden must explain why the summary format changed; do not update snapshots
+just to make a failing test pass.
 
 ### Trying the Action locally without GitHub
 
@@ -107,14 +125,22 @@ the codebase, these thresholds are ratcheted upward. Run `npm run test:coverage`
 locally to verify your changes satisfy the coverage gate.
 
 Unit and integration tests must never require network access or a real
-`stellar-canary` binary: they run against
+`stellar-canary` binary by default: they run against
 [`tests/fixtures/mock-canary.cjs`](tests/fixtures/mock-canary.cjs), a fake
 CLI that simulates every documented result state (`pass`, `warning`,
 `fail`, `config-error`, `rpc-error`, `fixture-error`, `internal-error`,
 `malformed-json`, `timeout`) via the `MOCK_CANARY_SCENARIO` environment
-variable. `.github/workflows/integration.yml` is the only place this
-repository talks to a real Canary build and a real Testnet endpoint, and it
-never gates a pull request.
+variable. Real-engine checks run separately: `.github/workflows/weekly-live.yml`
+runs on a weekly schedule or manual dispatch against a real Canary build and
+live Testnet/Futurenet endpoints (network required);
+`.github/workflows/engine-compat.yml` runs only on manual dispatch, builds
+real engines from source, and exercises offline scenarios without network
+access; `tests/integration/real-engine.test.ts` is skipped unless
+`STELLAR_CANARY_BIN` points to a real engine. The `smoke-test` job in
+`.github/workflows/release.yml` runs the published Action with a real engine
+after a version-tag release or on manual dispatch. None of these real-engine
+workflows gates a pull request; `.github/workflows/ci.yml` provides the
+required pull-request checks.
 
 For tests that need to observe what the Action reports through
 `@actions/core`, use the partial-mock convention described in [Mocking
@@ -175,6 +201,36 @@ This project bundles with **esbuild**, not `@vercel/ncc`: the pinned
 `ncc`'s webpack-based bundler cannot resolve into a CommonJS
 `runs.using: node24` action. See `scripts/build.mjs` for the exact
 settings.
+
+## Mutation testing (StrykerJS)
+
+Line coverage says little about whether the tests would notice a behavioural
+change, so this repository has an on-demand mutation testing workflow:
+
+- `.github/workflows/mutation.yml` — runs only on `workflow_dispatch`, so it
+  never gates a pull request. It uses `npx` with pinned (but not saved)
+  `@stryker-mutator/core` and `@stryker-mutator/vitest-runner` versions,
+  mutates `src/`, runs the unit suite against each mutant, and publishes the
+  per-file mutation score and the top surviving mutants to the job summary
+  and as a `mutation-report` artifact.
+- `stryker.config.json` — the StrykerJS configuration: mutates `src/**/*.ts`,
+  uses the Vitest runner against `tests/unit`, and emits JSON, Markdown, and
+  HTML reports.
+
+To run it locally:
+
+```bash
+# Install the Vitest runner once, without saving it to package.json or
+# package-lock.json.
+npm install --no-save @stryker-mutator/vitest-runner@7.7.4
+npx --yes @stryker-mutator/core@7.7.4 stryker run
+```
+
+Reports are written to `reports/mutation/` (gitignored). Mutation survivors
+point at assertions that are too weak to catch a real change: treat a
+surviving mutant as a signal to strengthen the test, not as a reason to
+lower the threshold. A deliberately weakened assertion in a scratch copy
+shows up as a surviving mutant.
 
 ## Coding standards
 
@@ -239,16 +295,53 @@ docs: document the fixtures-dir input
 
 Update explicitly (`chore(deps): update @actions/core`), never silently as
 a side effect of another change. Re-run the full test/lint/build sequence
-after any dependency bump, and run `npm audit` — fix or explicitly justify
-any new advisory before merging.
+after any dependency bump, run `npm run audit`, and run `npm run check:licenses` —
+fix or explicitly justify any new advisory before merging.
 
 Dependabot also opens automated update PRs for the npm and
 `github-actions` ecosystems on a weekly schedule (see
 `.github/dependabot.yml`), so some dependency updates arrive without
 anyone hand-writing a `chore(deps):` commit. Those PRs are held to the
 same review expectations as any other change: re-run the full
-test/lint/build sequence and `npm audit` before merging one, and either
-fix or explicitly justify any new advisory in the PR.
+test/lint/build sequence, `npm run audit`, and `npm run check:licenses`
+before merging one, and either fix or explicitly justify any new advisory in the PR.
+
+### Dependency audit and vulnerability handling
+
+CI runs `npm run audit` (`npm audit --omit=dev --audit-level=high`) on every
+pull request and on a weekly schedule to detect high or critical advisories in
+the production dependency tree that bundles into `dist/index.js`.
+
+- **Report only in CI**: Do **not** use `npm audit fix` in CI. Vulnerabilities must
+  be explicitly reviewed and resolved or triaged by maintainers.
+- **When an audit reports a finding with a fix available**: Update the affected
+  direct or transitive dependency (e.g. via `npm update <package>` or explicit
+  package bump), re-run `npm run build`, and commit both `package-lock.json` and
+  updated `dist/`.
+- **When an audit reports a finding with NO fix available yet**:
+  1. **Assess reachability and impact**: Determine whether the vulnerable code path
+     in the transitive dependency is reachable in the context of this Action's bundle
+     and execution model.
+  2. **Check for upstream workarounds**: Check if an override in `package.json`
+     (`overrides` field) can safely pin a patched transitive version without breaking
+     runtime behavior.
+  3. **Document and track**: If no upstream fix or safe override is available and the
+     vulnerability is deemed unexploitable or low risk in the Action's context, open
+     an issue or record the justification in the pull request review referencing the
+     upstream advisory tracking issue. Temporary audit exceptions must be reviewed
+     and approved by repository maintainers.
+
+### License compliance checks
+
+Production dependencies are verified against an allow-list located in
+[`.licenses-allowlist.json`](.licenses-allowlist.json).
+
+- Run `npm run check:licenses` locally to verify production dependencies.
+- Allowed licenses include standard permissive licenses (`MIT`, `Apache-2.0`,
+  `ISC`, `BSD-2-Clause`, `BSD-3-Clause`, `0BSD`, `BlueOak-1.0.0`, etc.).
+- If a legitimate new production dependency or package with dual/custom licensing
+  is added, propose updating `.licenses-allowlist.json` in the same pull request
+  with maintainer review.
 
 ## Updating Canary compatibility
 
@@ -424,4 +517,3 @@ Release checklist:
    ```
    or trigger the **Release** workflow from the Actions tab in GitHub and enter
    the target tag in the `release_tag` input field.
-
