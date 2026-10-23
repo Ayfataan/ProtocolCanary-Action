@@ -12,9 +12,19 @@ vi.mock("@actions/core", () => ({
 
 import * as core from "@actions/core";
 import * as https from "node:https";
-import { resolveVersion } from "../../src/version";
+import { InvalidInputError } from "../../src/errors";
+import { MAX_API_RESPONSE_BYTES } from "../../src/http-response";
+import {
+  assessEngineVersion,
+  DEPRECATED_BELOW_ENGINE_VERSION,
+  LATEST_VALIDATED_ENGINE_VERSION,
+  MIN_SUPPORTED_ENGINE_VERSION,
+  resolveVersion,
+} from "../../src/version";
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string | string[] | undefined>;
   constructor(statusCode: number, headers: Record<string, string | string[] | undefined> = {}) {
@@ -387,5 +397,115 @@ describe("resolveVersion", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.headers.Authorization).toBe("Bearer secret-token");
     expect(calls[1]?.headers.Authorization).toBeUndefined();
+  });
+});
+
+/**
+ * #374: supported engine range and deprecation warnings. The default engine
+ * version 0.1.1 is fully supported and must never warn, so a normal run stays
+ * noise-free; only releases strictly older than 0.1.0 (or unvalidated future
+ * majors) produce an annotation.
+ */
+describe("assessEngineVersion", () => {
+  it("accepts the default 0.1.1 version without a warning", () => {
+    expect(assessEngineVersion("0.1.1")).toEqual({
+      version: "0.1.1",
+      supported: true,
+      warning: undefined,
+    });
+  });
+
+  it("accepts a newer release on the supported 0.x line without a warning", () => {
+    expect(assessEngineVersion("0.2.0")).toEqual({
+      version: "0.2.0",
+      supported: true,
+      warning: undefined,
+    });
+  });
+
+  it("reports 0.1.0 as outside the supported range but not deprecated", () => {
+    // 0.1.0 predates the supported >= 0.1.1 range, yet no deprecation
+    // decision covers it, so it must not produce warning noise.
+    const result = assessEngineVersion("0.1.0");
+    expect(result.supported).toBe(false);
+    expect(result.warning).toBeUndefined();
+  });
+
+  it("warns for an engine strictly older than 0.1.0", () => {
+    const result = assessEngineVersion("0.0.9");
+    expect(result.supported).toBe(false);
+    expect(result.warning).toContain("older than 0.1.0");
+    expect(result.warning).toContain("no longer supported");
+    expect(result.warning).toContain(LATEST_VALIDATED_ENGINE_VERSION);
+  });
+
+  it("warns for an unvalidated future major release", () => {
+    const result = assessEngineVersion("1.0.0");
+    expect(result.warning).toContain("not verified");
+    expect(result.warning).toContain(LATEST_VALIDATED_ENGINE_VERSION);
+  });
+
+  it("compares numeric components rather than strings", () => {
+    // A lexicographic comparison would call 0.10.0 "older" than 0.9.0.
+    expect(assessEngineVersion("0.10.0").warning).toBeUndefined();
+    expect(assessEngineVersion("0.10.0").supported).toBe(true);
+    expect(assessEngineVersion("0.0.10").warning).toContain("older than 0.1.0");
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(assessEngineVersion("  0.1.1  ")).toEqual({
+      version: "0.1.1",
+      supported: true,
+      warning: undefined,
+    });
+  });
+
+  it.each(["latest", "main", "1.2", "1.2.3.4", "v0.1.1", "", "0.1.x", "1.2.3-rc.1"])(
+    "rejects the invalid engine version %s with InvalidInputError",
+    (value) => {
+      expect(() => assessEngineVersion(value)).toThrow(InvalidInputError);
+      expect(() => assessEngineVersion(value)).toThrow(/semantic version/);
+    },
+  );
+
+  it("exposes the documented policy constants", () => {
+    expect(MIN_SUPPORTED_ENGINE_VERSION).toBe("0.1.1");
+    expect(DEPRECATED_BELOW_ENGINE_VERSION).toBe("0.1.0");
+    expect(LATEST_VALIDATED_ENGINE_VERSION).toBe("0.1.1");
+  });
+});
+
+
+describe("bounded tag pages (#500)", () => {
+  it.each(["exact", "oversized", "header", "lying", "aborted", "short", "split"])("handles a %s response without using partial JSON", async (kind) => {
+    const body = Buffer.from(tagsBody([{ name: "v0.2.0", sha: "a".repeat(40) }]) + " ".repeat(MAX_API_RESPONSE_BYTES));
+    const response = new FakeResponse(200, kind === "header" ? { "content-length": String(MAX_API_RESPONSE_BYTES + 1) } : kind === "lying" ? { "content-length": "1" } : kind === "short" ? { "content-length": String(MAX_API_RESPONSE_BYTES) } : {});
+    const destroyed = vi.spyOn(response, "destroy");
+    const request = new FakeRequest();
+    const requestDestroyed = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    vi.mocked(https.get).mockImplementation((_url, _options, callback) => {
+      queueMicrotask(() => {
+        callback!(response as unknown as Parameters<NonNullable<typeof callback>>[0]);
+        const bytes = kind === "split" ? Buffer.from('[{"name":"v0.2.0","commit":{"sha":"é"}}]') : body.subarray(0, kind === "short" ? 100 : MAX_API_RESPONSE_BYTES);
+        const split = kind === "split" ? bytes.indexOf(0xc3) + 1 : bytes.length;
+        const chunks = [bytes.subarray(0, split), bytes.subarray(split)];
+        if (kind === "oversized" || kind === "lying") chunks.push(Buffer.from(" "));
+        for (const chunk of chunks) {
+          if (destroyed.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        response.emit(kind === "aborted" ? "aborted" : "end");
+      });
+      return request as unknown as ReturnType<typeof https.get>;
+    });
+    const result = await resolveVersion("0.2.0");
+    expect(result.commitSha).toBe(kind === "exact" ? "a".repeat(40) : kind === "split" ? "é" : undefined);
+    if (kind === "header") expect(delivered).toBe(0);
+    if (kind !== "exact" && kind !== "split") {
+      expect(destroyed).toHaveBeenCalled();
+      expect(requestDestroyed).toHaveBeenCalled();
+    }
   });
 });

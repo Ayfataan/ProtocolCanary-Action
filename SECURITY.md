@@ -66,7 +66,10 @@ which:
   fetches and runs;
 - verifies the installed or cached binary against the checksum manifest
   published with the release, when one exists, and refuses to use a binary
-  that does not match (see [Checksum verification](#checksum-verification)).
+  that does not match (see [Checksum verification](#checksum-verification));
+- extracts prebuilt archives into a fresh temporary directory, validating that
+  exactly one regular `stellar-canary` binary exists and rejecting symlinks,
+  path escapes, or duplicate binaries before atomic placement into the tool cache.
 
 ### Checksum verification
 
@@ -149,11 +152,9 @@ manifest lookup) to raise API rate limits. It is:
 - operable with minimal read-only permissions (`contents: read`), making it safe
   for pull requests from forks without granting write access.
 
-The Action does not require any secret for its core function. If a
-workflow's `rpc-url` happens to embed a credential in its query string
-(not a pattern this project recommends), that is echoed only insofar as
-Canary itself might log it — the same as any other CLI argument a workflow
-author chooses to pass.
+The Action registers non-empty userinfo credentials, query parameter values, and fragments using `core.setSecret()`. The complete URL is also registered when sensitive components exist. GitHub Actions runner masking is best effort: very short values may not be masked because of runner masking limitations. Values may still be exposed through transformations or outputs outside the runner's masking coverage. Engine output is not guaranteed to be fully sanitized by this mechanism. Users should continue using GitHub Actions secrets for RPC credentials. Users should avoid intentionally printing sensitive values.
+
+Credential-bearing RPC URLs are now protected: the Action registers non-empty userinfo credentials (`user:password@host`), query parameter values, and URL fragments using `core.setSecret()`. The complete credential-bearing URL is also registered when any sensitive component is present. GitHub Actions runner masking is best effort — very short values may not be masked due to runner limitations. Values may still be exposed through transformations or outputs outside the runner's masking coverage. Engine output is not guaranteed to be fully sanitized by this mechanism. Users should continue using GitHub Actions secrets for RPC credentials. Users should avoid intentionally printing sensitive values.
 
 ## Supported versions
 
@@ -194,3 +195,8 @@ release depend on the severity and complexity of the issue. If you have
 not received an acknowledgement within 5 business days, please follow up
 on your existing private report thread rather than opening a public issue,
 so the report is not lost or unintentionally disclosed.
+
+
+### Experimental pull request comment security
+
+The opt-in `pr-comment` feature requests `pull-requests: write` only when consumers explicitly configure it. Do not use `pull_request_target` or run untrusted fork code with a write token. Fork PRs are skipped. The comment is based on the existing escaped job-summary renderer, bounded to 60,000 characters, and attempts to update only bot-authored comments with the matching workflow/job marker. API permission errors are warnings. This implementation is provisional until a maintainer-approved permission model is recorded in the engine contract decisions.

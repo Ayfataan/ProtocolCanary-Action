@@ -1,3 +1,4 @@
+import { MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES, MAX_RELEASE_ASSET_BYTES } from "../../src/http-response";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as crypto from "node:crypto";
@@ -7,6 +8,11 @@ import type * as osModule from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+});
 
 const cacheMocks = vi.hoisted(() => ({
   isFeatureAvailableMock: vi.fn(),
@@ -78,6 +84,9 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import {
+  httpsGetText,
+  httpsGetFile,
+  installPrebuiltRelease,
   cargoInstallTimeoutMs,
   ensureCanaryInstalled,
   ensureVerifiedPack,
@@ -202,6 +211,8 @@ async function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T> 
 }
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string> = {};
   constructor(statusCode: number) {
@@ -354,6 +365,25 @@ describe("ensureCanaryInstalled", () => {
     expect(installed).toEqual({ binaryPath: binaryPath(), version: "0.1.0" });
     expect(spawnMock).not.toHaveBeenCalled();
     expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
+  });
+
+  it("emits a deprecation warning for an engine strictly older than 0.1.0 (#374)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    versionProbeResults = ["0.0.9"];
+
+    await ensureCanaryInstalled({ version: "0.0.9", tag: "v0.0.9", commitSha: "abc123" });
+
+    expect(coreMocks.warningMock).toHaveBeenCalledTimes(1);
+    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("older than 0.1.0"));
+  });
+
+  it("does not warn about the default engine version 0.1.1 (#374)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    versionProbeResults = ["0.1.1"];
+
+    await ensureCanaryInstalled({ version: "0.1.1", tag: "v0.1.1", commitSha: "abc123" });
+
+    expect(coreMocks.warningMock).not.toHaveBeenCalled();
   });
 
   it("does not reuse an already-installed binary with a different version", async () => {
@@ -584,6 +614,14 @@ describe("ensureCanaryInstalled", () => {
 
     expect(installed.binaryPath).toBe(binaryPath());
     expect(httpsGetMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores an oversized checksum manifest rather than verifying its partial prefix (#500)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n${" ".repeat(MAX_CHECKSUM_MANIFEST_BYTES)}`);
+    const installed = await ensureCanaryInstalled(RESOLVED);
+    expect(installed.binaryPath).toBe(binaryPath());
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("1048576-byte limit"));
   });
 
   it("throws InstallationFailedError when the installed binary does not match the published checksum", async () => {
@@ -1500,6 +1538,126 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("Unsupported platform linux-arm"));
       expect(spawnMock).toHaveBeenCalled();
     });
+
+    describe("issue #509 — secure prebuilt extraction & binary discovery", () => {
+      it("rejects archives with symlinks in the extracted contents", async () => {
+        const archiveBytes = Buffer.from("symlink-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(dest, { recursive: true });
+          fs.writeFileSync(path.join(dest, "real-binary"), "executable");
+          try {
+            fs.symlinkSync("real-binary", path.join(dest, "stellar-canary"));
+          } catch {
+            // fall back if symlinks not supported on test host
+          }
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains invalid or unsafe entries"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("rejects archives where stellar-canary is a directory instead of a regular file", async () => {
+        const archiveBytes = Buffer.from("dir-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(path.join(dest, "stellar-canary"), { recursive: true });
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains invalid or unsafe entries"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("rejects archives with multiple stellar-canary binaries", async () => {
+        const archiveBytes = Buffer.from("duplicate-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(path.join(dest, "dir1"), { recursive: true });
+          fs.mkdirSync(path.join(dest, "dir2"), { recursive: true });
+          fs.writeFileSync(path.join(dest, "dir1", "stellar-canary"), "bin1");
+          fs.writeFileSync(path.join(dest, "dir2", "stellar-canary"), "bin2");
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains multiple stellar-canary executables"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("falls back to source install and preserves previous installation when extraction fails", async () => {
+        const archiveBytes = Buffer.from("extract-fail-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, _dest) => {
+          // Simulate tar failure by throwing
+          throw new Error("tar exit code 1");
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("Could not extract the prebuilt Protocol-Canary asset"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+    });
   });
 });
 
@@ -1645,5 +1803,125 @@ describe("verified fixture-pack caching (#345)", () => {
       ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download }),
     ).rejects.toThrow("checksum mismatch");
     expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("bounded HTTP downloads (#500)", () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-http-limit-")); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); httpsGetMock.mockReset(); });
+
+  function stream(chunks: Buffer[], headers: Record<string, string> = {}, ending = "end") {
+    const response = new FakeResponse(200);
+    response.headers = headers;
+    const request = new FakeRequest();
+    const destroyResponse = vi.spyOn(response, "destroy");
+    const destroyRequest = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      callback(response);
+      queueMicrotask(() => {
+        for (const chunk of chunks) {
+          if (destroyResponse.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        if (destroyResponse.mock.calls.length === 0) response.emit(ending);
+      });
+      return request;
+    });
+    return { response, destroyResponse, destroyRequest, delivered: () => delivered };
+  }
+
+  it.each([MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES])("accepts exactly %i bytes and preserves split UTF-8", async (limit) => {
+    const bytes = Buffer.from("é" + "x".repeat(limit - 2));
+    stream([bytes.subarray(0, 1), bytes.subarray(1)], { "content-length": String(limit) });
+    const text = await httpsGetText("https://example.test/body", undefined, limit);
+    expect(Buffer.byteLength(text)).toBe(limit);
+    expect(text.startsWith("é")).toBe(true);
+  });
+
+  it.each(["header", "stream", "lying header"])("rejects oversized text via %s and destroys both streams", async (kind) => {
+    const limit = MAX_CHECKSUM_MANIFEST_BYTES;
+    const state = stream([Buffer.alloc(limit), Buffer.from("x"), Buffer.from("unused")],
+      kind === "header" ? { "content-length": String(limit + 1) } : kind === "lying header" ? { "content-length": "1" } : {});
+    await expect(httpsGetText("https://example.test/body", undefined, limit)).rejects.toThrow(`example.test exceeds the ${limit}-byte limit`);
+    expect(state.delivered()).toBe(kind === "header" ? 0 : 2);
+    expect(state.destroyResponse).toHaveBeenCalled();
+    expect(state.destroyRequest).toHaveBeenCalled();
+  });
+
+  it.each(["aborted", "close", "end"])("rejects incomplete text on %s", async (ending) => {
+    stream([Buffer.from("partial")], { "content-length": "100" }, ending);
+    await expect(httpsGetText("https://example.test/body", undefined)).rejects.toThrow();
+  });
+
+  it("writes exactly the asset byte limit", async () => {
+    stream([Buffer.alloc(MAX_RELEASE_ASSET_BYTES)], { "content-length": String(MAX_RELEASE_ASSET_BYTES) });
+    const dest = path.join(dir, "asset");
+    await httpsGetFile("https://example.test/asset", dest, 5);
+    expect(fs.statSync(dest).size).toBe(MAX_RELEASE_ASSET_BYTES);
+  });
+
+  it.each(["header", "stream", "lying header", "aborted", "close", "short"])("removes the partial file on %s rejection", async (kind) => {
+    const over = kind === "stream" || kind === "lying header";
+    const state = stream(over ? [Buffer.alloc(MAX_RELEASE_ASSET_BYTES), Buffer.from("x"), Buffer.from("unused")] : [Buffer.from("partial")],
+      kind === "header" ? { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) } : kind === "short" || kind === "lying header" ? { "content-length": "100" } : {},
+      kind === "aborted" || kind === "close" ? kind : "end");
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow();
+    expect(fs.existsSync(dest)).toBe(false);
+    expect(state.destroyRequest).toHaveBeenCalled();
+    if (kind === "header") expect(state.delivered()).toBe(0);
+    if (over) expect(state.delivered()).toBe(2);
+  });
+
+  it("removes the destination after a write error", async () => {
+    stream([Buffer.from("partial")]);
+    const dest = path.join(dir, "asset");
+    const actual = (await vi.importActual<typeof fs>("node:fs")).createWriteStream;
+    const spy = vi.mocked(fs.createWriteStream).mockImplementationOnce((...args) => {
+      const file = actual(...args);
+      file.once("open", () => file.destroy(new Error("disk full")));
+      return file;
+    });
+    try {
+      await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("disk full");
+      expect(fs.existsSync(dest)).toBe(false);
+    } finally { spy.mockImplementation(actual); }
+  });
+
+  it.each(["release", "manifest", "asset"])("keeps the existing prebuilt fallback for an oversized %s", async (stage) => {
+    const assetName = `stellar-canary-${RESOLVED.version}-${prebuiltTargetTriple(process.platform, process.arch)}.tar.gz`;
+    if (stage === "release") {
+      stream([], { "content-length": String(MAX_API_RESPONSE_BYTES + 1) });
+    } else {
+      stream([Buffer.from(JSON.stringify({ assets: [
+        { name: assetName, browser_download_url: "https://example.test/asset" },
+        { name: "SHA256SUMS", browser_download_url: "https://example.test/manifest" },
+      ] }))]);
+      if (stage === "manifest") {
+        stream([], { "content-length": String(MAX_CHECKSUM_MANIFEST_BYTES + 1) });
+      } else {
+        stream([Buffer.from(`${"0".repeat(64)}  ${assetName}`)]);
+        stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+      }
+    }
+    execMock.mockClear();
+    await expect(installPrebuiltRelease(RESOLVED)).resolves.toBeUndefined();
+    expect(execMock).not.toHaveBeenCalled();
+  });
+
+  it("applies the asset limit after a redirect", async () => {
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      const response = new FakeResponse(302);
+      response.headers.location = "https://cdn.test/asset";
+      queueMicrotask(() => callback(response));
+      return new FakeRequest();
+    });
+    stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("cdn.test");
+    expect(fs.existsSync(dest)).toBe(false);
   });
 });
