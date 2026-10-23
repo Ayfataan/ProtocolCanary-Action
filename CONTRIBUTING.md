@@ -469,6 +469,33 @@ input and always use the recorded SHA. A `fixtures_ref` that does not
 exist fails the job at checkout with the checkout step's own error; that
 is expected and leaves the pin untouched.
 
+## Tracking weekly live failures
+
+A repeated scheduled failure should not open a new issue every Monday. The
+`track-failure` job in `.github/workflows/weekly-live.yml` keeps exactly one
+tracking issue per failure episode, labelled **`weekly-live`**:
+
+- on the **first failing run** it opens a new issue titled
+  "Weekly live canary is failing (Protocol 29)";
+- while the canary stays red it **comments** on that same issue (it never
+  opens a second one, even if several runs fail in a row);
+- once a run goes **fully green** it comments on the open issue and closes
+  it with `--reason completed`; a later failure reopens the cycle by
+  creating a fresh issue.
+
+The label `weekly-live` must exist in the repository. The job checks for it
+with `gh label list` and fails loudly (`::error::`) if it is missing, rather
+than silently skipping the notification. Create the label once when setting
+up the repository:
+
+```bash
+gh label create weekly-live --description "Single open tracking issue for scheduled weekly live failures"
+```
+
+The `track-failure` job is the only job in the workflow granted
+`issues: write`, and it is scoped to that job; every other job stays at the
+workflow default of `contents: read`.
+
 ## Release process
 
 Before creating a release, ensure all metadata values agree. `.github/workflows/release.yml`

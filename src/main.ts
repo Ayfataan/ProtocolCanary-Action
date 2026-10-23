@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,7 +15,7 @@ import {
 import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./canary";
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
-import { getInputs } from "./inputs";
+import { getInputs, validateFixturesDir } from "./inputs";
 import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import { countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
 import type { CanaryReport } from "./output";
@@ -33,9 +34,54 @@ import {
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
 
-function reportFilePath(): string {
+/** Maximum length of the sanitized `GITHUB_ACTION` identifier embedded in
+ * the report filename (#399), keeping the name short on every filesystem. */
+const REPORT_IDENTIFIER_MAX_LENGTH = 64;
+
+/** Step identifier used when `GITHUB_ACTION` is unset or sanitizes to
+ * nothing usable (#399). */
+const FALLBACK_ACTION_IDENTIFIER = "action";
+
+/**
+ * Reduces the untrusted `GITHUB_ACTION` environment variable to a single
+ * safe path component (#399): every run of characters outside ASCII
+ * letters, digits, `-` and `_` collapses to one hyphen, leading/trailing
+ * hyphens are trimmed, and the result is length-capped. Path separators,
+ * traversal sequences, spaces, and Unicode therefore can never survive
+ * into the generated filename.
+ */
+export function sanitizeActionIdentifier(value: string): string {
+  return value
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, REPORT_IDENTIFIER_MAX_LENGTH)
+    .replace(/-+$/, "");
+}
+
+/**
+ * The report path for *this* Action invocation (#399): a uniquely named
+ * JSON file directly inside the runner's temporary directory
+ * (`RUNNER_TEMP`, falling back to `os.tmpdir()`), so two invocations in
+ * one job — a second Action step, or a matrix leg sharing the runner —
+ * never overwrite each other's report.
+ *
+ * The filename is `stellar-canary-report-<step>-<random>.json`, where
+ * `<step>` is the sanitized `GITHUB_ACTION` identifier (a safe fallback
+ * when it is missing or empty) and `<random>` is a short cryptographically
+ * random hex suffix, so uniqueness never depends on the identifier alone.
+ * The filename is a single path component built only from `[A-Za-z0-9_-]`,
+ * so resolving it cannot escape the temp directory.
+ *
+ * `run()` calls this exactly once per invocation and reuses the result for
+ * writing the report, the `report` output, and the artifact upload — the
+ * path is never regenerated after the file has been written.
+ */
+export function reportFilePath(): string {
   const dir = process.env.RUNNER_TEMP ?? os.tmpdir();
-  return path.join(dir, "stellar-canary-report.json");
+  const sanitized = sanitizeActionIdentifier(process.env.GITHUB_ACTION ?? "");
+  const step = sanitized !== "" ? sanitized : FALLBACK_ACTION_IDENTIFIER;
+  const unique = crypto.randomBytes(8).toString("hex");
+  return path.resolve(dir, `stellar-canary-report-${step}-${unique}.json`);
 }
 
 /** Location of the Execution Receipt written when `generate-receipt` is
@@ -100,7 +146,8 @@ async function handleExecutionFailure(
 }
 
 /**
- * Orchestrates one Action run, in order: read and validate inputs, resolve
+ * Orchestrates one Action run, in order: read and validate inputs (including
+ * the `fixtures-dir` directory on disk, #400), resolve
  * the requested version to a pinned commit, ensure a matching binary is
  * installed, execute the compatibility check, parse stdout into a report,
  * emit annotations, write the job summary, set the Action outputs, and
@@ -122,6 +169,19 @@ export async function run(): Promise<void> {
     inputs = getInputs();
   } catch (error) {
     core.setFailed(describeError(error));
+    return;
+  }
+
+  // #400: fail fast when `fixtures-dir` does not name an existing directory
+  // — after input parsing, before any version resolution or installation
+  // work — so a mistyped path costs milliseconds, not a full `cargo
+  // install`. Routed through the execution-failure handler so the error
+  // reaches the annotation, the job summary, and the failure outputs exactly
+  // like every other reason Canary could not be executed.
+  try {
+    validateFixturesDir(inputs.fixturesDir, inputs.allowEmpty);
+  } catch (error) {
+    await handleExecutionFailure(describeError(error), "", inputs.annotations, "");
     return;
   }
 
@@ -221,9 +281,30 @@ export async function run(): Promise<void> {
     printLogBlock("Canary diagnostics", execution.stderr);
   }
 
+  // #399: generated exactly once per invocation; the same path is reused
+  // below for the write, the "report" output, and the artifact upload.
   const reportPath = reportFilePath();
+  let reportWritten = false;
+  let reportWriteError: string | undefined;
+
   if (execution.stdout.trim() !== "") {
-    fs.writeFileSync(reportPath, execution.stdout, "utf8");
+    try {
+      fs.writeFileSync(reportPath, execution.stdout, "utf8");
+      reportWritten = true;
+    } catch (error) {
+      const err = error as { code?: string };
+      reportWriteError = typeof err?.code === "string" ? err.code : describeError(error);
+      core.warning(
+        `Failed to write JSON report to ${reportPath} (${reportWriteError}): report artifact will not be uploaded.`,
+      );
+      try {
+        if (fs.existsSync(reportPath)) {
+          fs.rmSync(reportPath, { force: true });
+        }
+      } catch {
+        // Cleanup failure must never abort execution
+      }
+    }
   }
 
   if (execution.exitCode === null) {
@@ -308,6 +389,7 @@ export async function run(): Promise<void> {
         // Reproduction command (issue #416): the exact argument array the
         // engine was invoked with, so a reader can rerun the same check.
         engineArgs,
+        reportWriteError,
       });
     await writeSummary(summaryMarkdown);
     if (inputs.prComment) {
@@ -352,7 +434,9 @@ export async function run(): Promise<void> {
   core.setOutput("pack-protocol", packIdentity.protocol === undefined ? "" : String(packIdentity.protocol));
   core.setOutput("pack-version", packIdentity.version ?? "");
   core.setOutput("pack-digest", packIdentity.digest ?? "");
-  core.setOutput("report", reportPath);
+  if (reportWritten) {
+    core.setOutput("report", reportPath);
+  }
 
   // #423: optional JUnit rendering through the engine's own `report` command,
   // before the artifact upload so the XML ships with the JSON report. Like
@@ -361,7 +445,7 @@ export async function run(): Promise<void> {
   // report file) is a warning only and can never change `status` or fail the
   // job.
   let junitPath: string | undefined;
-  if (inputs.junitReport) {
+  if (inputs.junitReport && reportWritten) {
     const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
     if (junit.path !== undefined) {
       junitPath = junit.path;
@@ -376,7 +460,7 @@ export async function run(): Promise<void> {
     }
   }
 
-  if (inputs.uploadReport) {
+  if (inputs.uploadReport && reportWritten) {
     await uploadReport(reportPath, artifactDifferentiator(inputs), junitPath === undefined ? [] : [junitPath]);
   }
 
