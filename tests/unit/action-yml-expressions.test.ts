@@ -19,7 +19,8 @@ describe("action.yml expressions", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("keeps the github-token default as the workflow token", () => {
-    expect(ACTION_YML).toMatch(/^\s*default:\s*\$\{\{ github\.token \}\}\s*$/m);
+  it("does not use github context in an action input default", () => {
+    expect(ACTION_YML).not.toMatch(/^\s*default:.*\$\{\{\s*github\./m);
+    expect(ACTION_YML).toMatch(/github-token:[\s\S]*?required:\s*false/m);
   });
 });
