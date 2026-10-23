@@ -47,6 +47,7 @@ jobs:
         run: npm run build
 
       - name: Verify committed dist/ matches a fresh build
+        shell: bash
         run: |
           if ! git diff --quiet -- dist; then
             echo "::error::dist/ is out of date. Run 'npm run build' and commit the result."
