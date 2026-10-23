@@ -67,6 +67,7 @@ jobs:
   live-check:
     name: Live canary (Protocol 29 ${{ matrix.network }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       # Both legs must run even when one network is down, so a Testnet outage
       # still tells us whether Futurenet is healthy (and vice versa).
