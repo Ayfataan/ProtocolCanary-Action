@@ -1,3 +1,4 @@
+import { MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES, MAX_RELEASE_ASSET_BYTES } from "../../src/http-response";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as crypto from "node:crypto";
@@ -7,6 +8,11 @@ import type * as osModule from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+});
 
 const cacheMocks = vi.hoisted(() => ({
   isFeatureAvailableMock: vi.fn(),
@@ -77,9 +83,18 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: osMocks.homedirMock };
 });
 
-import { cargoInstallTimeoutMs, ensureCanaryInstalled, prebuiltTargetTriple } from "../../src/canary";
+import {
+  httpsGetText,
+  httpsGetFile,
+  installPrebuiltRelease,
+  cargoInstallTimeoutMs,
+  ensureCanaryInstalled,
+  ensureVerifiedPack,
+  packCacheKey,
+  prebuiltTargetTriple,
+} from "../../src/canary";
 import { CARGO_INSTALL_TIMEOUT_FLOOR_MS } from "../../src/runner";
-import { CanaryNotFoundError, InstallationFailedError } from "../../src/errors";
+import { CanaryNotFoundError, InstallationFailedError, InvalidInputError } from "../../src/errors";
 import { REDACTED } from "../../src/redact";
 import type { ResolvedVersion } from "../../src/version";
 import { CANARY_API_REPO_URL, CANARY_REPO_URL } from "../../src/version";
@@ -196,6 +211,8 @@ async function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T> 
 }
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string> = {};
   constructor(statusCode: number) {
@@ -597,6 +614,14 @@ describe("ensureCanaryInstalled", () => {
 
     expect(installed.binaryPath).toBe(binaryPath());
     expect(httpsGetMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores an oversized checksum manifest rather than verifying its partial prefix (#500)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n${" ".repeat(MAX_CHECKSUM_MANIFEST_BYTES)}`);
+    const installed = await ensureCanaryInstalled(RESOLVED);
+    expect(installed.binaryPath).toBe(binaryPath());
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("1048576-byte limit"));
   });
 
   it("throws InstallationFailedError when the installed binary does not match the published checksum", async () => {
@@ -1513,5 +1538,270 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("Unsupported platform linux-arm"));
       expect(spawnMock).toHaveBeenCalled();
     });
+  });
+});
+
+describe("verified fixture-pack caching (#345)", () => {
+  const DIGEST = `sha256:${"a".repeat(64)}`;
+  const OTHER_DIGEST = `sha256:${"b".repeat(64)}`;
+  const MARKER = ".stellar-canary-pack.json";
+  let packDir: string;
+
+  beforeEach(() => {
+    packDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-pack-cache-"));
+    // The cache layer must not leave a directory behind at the exact path
+    // under test; each test creates what it needs inside it.
+    fs.rmSync(packDir, { recursive: true, force: true });
+
+    cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(true);
+    cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
+    cacheMocks.saveCacheMock.mockReset().mockResolvedValue(undefined);
+    coreMocks.infoMock.mockReset();
+    coreMocks.debugMock.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(packDir, { recursive: true, force: true });
+  });
+
+  it("builds a deterministic key from the protocol and canonical digest", () => {
+    expect(packCacheKey(28, DIGEST)).toBe(`stellar-canary-pack-28-${DIGEST}`);
+    expect(packCacheKey(28, DIGEST)).toBe(packCacheKey(28, DIGEST));
+    // A different protocol or digest must never share an entry.
+    expect(packCacheKey(29, DIGEST)).not.toBe(packCacheKey(28, DIGEST));
+    expect(packCacheKey(28, OTHER_DIGEST)).not.toBe(packCacheKey(28, DIGEST));
+  });
+
+  it("rejects a non-canonical digest or invalid protocol instead of building a loose key", () => {
+    for (const digest of ["abc", `sha256:${"A".repeat(64)}`, `sha256:${"a".repeat(63)}`, ""]) {
+      expect(() => packCacheKey(28, digest)).toThrow(InvalidInputError);
+    }
+    for (const protocol of [-1, 1.5, Number.NaN]) {
+      expect(() => packCacheKey(protocol, DIGEST)).toThrow(InvalidInputError);
+    }
+  });
+
+  it("skips download and extraction on a valid cache hit", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, MARKER), JSON.stringify({ protocol: 28, packDigest: DIGEST }));
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn();
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("cache-hit");
+    expect(download).not.toHaveBeenCalled();
+    expect(cacheMocks.restoreCacheMock).toHaveBeenCalledWith([packDir], `stellar-canary-pack-28-${DIGEST}`);
+    // A hit never re-saves the entry.
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+    expect(coreMocks.infoMock).toHaveBeenCalledWith(expect.stringContaining("protocol 28 from cache"));
+  });
+
+  it("downloads and saves on a cache miss, writing the provenance marker", async () => {
+    const download = vi.fn(async (directory: string) => {
+      fs.writeFileSync(path.join(directory, "fixture.json"), "{}");
+    });
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledWith(packDir);
+    expect(fs.readFileSync(path.join(packDir, MARKER), "utf8")).toBe(
+      `${JSON.stringify({ protocol: 28, packDigest: DIGEST })}\n`,
+    );
+    expect(fs.readFileSync(path.join(packDir, "fixture.json"), "utf8")).toBe("{}");
+    expect(cacheMocks.saveCacheMock).toHaveBeenCalledWith([packDir], `stellar-canary-pack-28-${DIGEST}`);
+  });
+
+  it("falls back to a fresh download when cache restore throws", async () => {
+    cacheMocks.restoreCacheMock.mockRejectedValue(new Error("cache service unavailable"));
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("cache restore failed"));
+  });
+
+  it("discards a cached directory whose marker does not match the requested digest", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, MARKER), JSON.stringify({ protocol: 28, packDigest: OTHER_DIGEST }));
+    fs.writeFileSync(path.join(packDir, "corrupt-fixture.json"), "{}");
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn(async (directory: string) => {
+      // The stale file must be gone before the fresh download runs.
+      expect(fs.existsSync(path.join(directory, "corrupt-fixture.json"))).toBe(false);
+    });
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("failed provenance validation"));
+  });
+
+  it("treats a restored directory without a provenance marker as corrupt", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fail the run when saving to the cache fails", async () => {
+    cacheMocks.saveCacheMock.mockRejectedValue(new Error("reserve cache failed"));
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("cache save failed"));
+  });
+
+  it("downloads without touching the cache service when caching is unavailable", async () => {
+    cacheMocks.isFeatureAvailableMock.mockReturnValue(false);
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates a failed download so a missing pack is never silently accepted", async () => {
+    const download = vi.fn(async () => {
+      throw new Error("checksum mismatch");
+    });
+
+    await expect(
+      ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download }),
+    ).rejects.toThrow("checksum mismatch");
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("bounded HTTP downloads (#500)", () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-http-limit-")); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); httpsGetMock.mockReset(); });
+
+  function stream(chunks: Buffer[], headers: Record<string, string> = {}, ending = "end") {
+    const response = new FakeResponse(200);
+    response.headers = headers;
+    const request = new FakeRequest();
+    const destroyResponse = vi.spyOn(response, "destroy");
+    const destroyRequest = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      callback(response);
+      queueMicrotask(() => {
+        for (const chunk of chunks) {
+          if (destroyResponse.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        if (destroyResponse.mock.calls.length === 0) response.emit(ending);
+      });
+      return request;
+    });
+    return { response, destroyResponse, destroyRequest, delivered: () => delivered };
+  }
+
+  it.each([MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES])("accepts exactly %i bytes and preserves split UTF-8", async (limit) => {
+    const bytes = Buffer.from("é" + "x".repeat(limit - 2));
+    stream([bytes.subarray(0, 1), bytes.subarray(1)], { "content-length": String(limit) });
+    const text = await httpsGetText("https://example.test/body", undefined, limit);
+    expect(Buffer.byteLength(text)).toBe(limit);
+    expect(text.startsWith("é")).toBe(true);
+  });
+
+  it.each(["header", "stream", "lying header"])("rejects oversized text via %s and destroys both streams", async (kind) => {
+    const limit = MAX_CHECKSUM_MANIFEST_BYTES;
+    const state = stream([Buffer.alloc(limit), Buffer.from("x"), Buffer.from("unused")],
+      kind === "header" ? { "content-length": String(limit + 1) } : kind === "lying header" ? { "content-length": "1" } : {});
+    await expect(httpsGetText("https://example.test/body", undefined, limit)).rejects.toThrow(`example.test exceeds the ${limit}-byte limit`);
+    expect(state.delivered()).toBe(kind === "header" ? 0 : 2);
+    expect(state.destroyResponse).toHaveBeenCalled();
+    expect(state.destroyRequest).toHaveBeenCalled();
+  });
+
+  it.each(["aborted", "close", "end"])("rejects incomplete text on %s", async (ending) => {
+    stream([Buffer.from("partial")], { "content-length": "100" }, ending);
+    await expect(httpsGetText("https://example.test/body", undefined)).rejects.toThrow();
+  });
+
+  it("writes exactly the asset byte limit", async () => {
+    stream([Buffer.alloc(MAX_RELEASE_ASSET_BYTES)], { "content-length": String(MAX_RELEASE_ASSET_BYTES) });
+    const dest = path.join(dir, "asset");
+    await httpsGetFile("https://example.test/asset", dest, 5);
+    expect(fs.statSync(dest).size).toBe(MAX_RELEASE_ASSET_BYTES);
+  });
+
+  it.each(["header", "stream", "lying header", "aborted", "close", "short"])("removes the partial file on %s rejection", async (kind) => {
+    const over = kind === "stream" || kind === "lying header";
+    const state = stream(over ? [Buffer.alloc(MAX_RELEASE_ASSET_BYTES), Buffer.from("x"), Buffer.from("unused")] : [Buffer.from("partial")],
+      kind === "header" ? { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) } : kind === "short" || kind === "lying header" ? { "content-length": "100" } : {},
+      kind === "aborted" || kind === "close" ? kind : "end");
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow();
+    expect(fs.existsSync(dest)).toBe(false);
+    expect(state.destroyRequest).toHaveBeenCalled();
+    if (kind === "header") expect(state.delivered()).toBe(0);
+    if (over) expect(state.delivered()).toBe(2);
+  });
+
+  it("removes the destination after a write error", async () => {
+    stream([Buffer.from("partial")]);
+    const dest = path.join(dir, "asset");
+    const actual = (await vi.importActual<typeof fs>("node:fs")).createWriteStream;
+    const spy = vi.mocked(fs.createWriteStream).mockImplementationOnce((...args) => {
+      const file = actual(...args);
+      file.once("open", () => file.destroy(new Error("disk full")));
+      return file;
+    });
+    try {
+      await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("disk full");
+      expect(fs.existsSync(dest)).toBe(false);
+    } finally { spy.mockImplementation(actual); }
+  });
+
+  it.each(["release", "manifest", "asset"])("keeps the existing prebuilt fallback for an oversized %s", async (stage) => {
+    const assetName = `stellar-canary-${RESOLVED.version}-${prebuiltTargetTriple(process.platform, process.arch)}.tar.gz`;
+    if (stage === "release") {
+      stream([], { "content-length": String(MAX_API_RESPONSE_BYTES + 1) });
+    } else {
+      stream([Buffer.from(JSON.stringify({ assets: [
+        { name: assetName, browser_download_url: "https://example.test/asset" },
+        { name: "SHA256SUMS", browser_download_url: "https://example.test/manifest" },
+      ] }))]);
+      if (stage === "manifest") {
+        stream([], { "content-length": String(MAX_CHECKSUM_MANIFEST_BYTES + 1) });
+      } else {
+        stream([Buffer.from(`${"0".repeat(64)}  ${assetName}`)]);
+        stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+      }
+    }
+    execMock.mockClear();
+    await expect(installPrebuiltRelease(RESOLVED)).resolves.toBeUndefined();
+    expect(execMock).not.toHaveBeenCalled();
+  });
+
+  it("applies the asset limit after a redirect", async () => {
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      const response = new FakeResponse(302);
+      response.headers.location = "https://cdn.test/asset";
+      queueMicrotask(() => callback(response));
+      return new FakeRequest();
+    });
+    stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("cdn.test");
+    expect(fs.existsSync(dest)).toBe(false);
   });
 });

@@ -29,6 +29,7 @@ const {
   startGroupMock,
   endGroupMock,
   uploadReceiptMock,
+  renderJUnitReportMock,
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
   ensureCanaryInstalledMock: vi.fn(),
@@ -45,6 +46,7 @@ const {
   startGroupMock: vi.fn(),
   endGroupMock: vi.fn(),
   uploadReceiptMock: vi.fn(),
+  renderJUnitReportMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
@@ -81,8 +83,11 @@ vi.mock("../../src/canary", async (importOriginal) => {
 vi.mock("../../src/runner", async (importOriginal) => {
   const actual = await importOriginal<typeof runnerModule>();
   // buildCheckArgs stays real: it is pure, and asserting run() forwards its
-  // result to runCheck pins that wiring too.
-  return { ...actual, runCheck: runCheckMock };
+  // result to runCheck pins that wiring too. renderJUnitReport is replaced
+  // because it calls the module-local (unmocked) runCheck internally — the
+  // real one would spawn the fake BINARY_PATH; its own behaviour is covered
+  // by runner.test.ts against the mock engine.
+  return { ...actual, runCheck: runCheckMock, renderJUnitReport: renderJUnitReportMock };
 });
 
 vi.mock("../../src/summary", async (importOriginal) => {
@@ -111,8 +116,14 @@ const INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: "testnet",
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
+  fixture: undefined,
+  surface: undefined,
+  cacheDir: undefined,
   version: "0.1.0",
   uploadReport: false,
   annotations: true,
@@ -120,10 +131,13 @@ const INPUTS: ActionInputs = {
   allowEmpty: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  junitReport: false,
   strictIntegrity: false,
-};
+  workingDirectory: path.resolve("."),
+} as ActionInputs;
 
 const PASS_REPORT = report({
   status: "pass",
@@ -146,6 +160,7 @@ describe("run", () => {
     getInputsMock.mockReset().mockReturnValue(INPUTS);
     ensureCanaryInstalledMock.mockReset().mockResolvedValue({ binaryPath: BINARY_PATH, version: "0.1.0" });
     runCheckMock.mockReset();
+    renderJUnitReportMock.mockReset();
     writeSummaryMock.mockReset().mockResolvedValue(undefined);
     renderSummaryMarkdownMock.mockReset().mockReturnValue("## Stellar Protocol Canary (rendered summary)");
     renderExecutionFailureMarkdownMock.mockReset().mockReturnValue("## Stellar Protocol Canary (execution failure)");
@@ -171,6 +186,34 @@ describe("run", () => {
     delete process.env.RUNNER_TEMP;
   });
 
+  it.each(["timeout", "signal", "parse"])("sanitizes %s failure annotations, reasons and the published summary", async (kind) => {
+    const actual = await vi.importActual<typeof summaryModule>("../../src/summary");
+    renderExecutionFailureMarkdownMock.mockImplementation(actual.renderExecutionFailureMarkdown);
+    const token = "ghp_" + "a".repeat(36);
+    const dirty = `fatal \x1b[31m${token}\x1b[0m\0\x85 https://host/?api_key=private-query\n::error::injected`;
+    if (kind === "timeout") {
+      runCheckMock.mockRejectedValueOnce(new TimeoutError("timed out", "", dirty));
+    } else {
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: kind === "signal" ? null : 1,
+        signal: kind === "signal" ? "SIGTERM" : null,
+        stdout: dirty,
+        stderr: dirty,
+      });
+    }
+    await run();
+    const outputs = [...errorMock.mock.calls, ...setFailedMock.mock.calls, ...writeSummaryMock.mock.calls];
+    expect(errorMock).toHaveBeenCalled();
+    expect(writeSummaryMock).toHaveBeenCalled();
+    for (const [value] of outputs) {
+      const text = String(value);
+      expect(text.includes(token)).toBe(false);
+      expect(text).not.toContain("private-query");
+      expect(text).not.toContain("::");
+      expect(text).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+    }
+  });
+
   it("forwards the installed binary, the built args, and the millisecond timeout to runCheck", async () => {
     runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
 
@@ -193,6 +236,37 @@ describe("run", () => {
     await run();
     expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--allow-empty");
     expect(infoMock).toHaveBeenCalledWith(expect.stringContaining('"allow-empty" has no effect with Canary 0.1.1'));
+  });
+
+  it("warns about each new setting ignored by an older engine without exposing the passphrase", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      version: "0.2.0",
+      networkPassphrase: "Private Network ; secret value",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('"network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"'),
+    );
+    expect(warningMock.mock.calls.flat().join(" ")).not.toContain("secret value");
+    expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--network-passphrase");
+  });
+
+  it("does not warn about new settings when the resolved engine supports them", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({ ...INPUTS, version: "0.3.0", rpcMaxRetries: 0 });
+
+    await run();
+
+    expect(warningMock).not.toHaveBeenCalledWith(expect.stringContaining("rpc-max-retries"));
+    expect(runCheckMock.mock.calls[0]?.[1]).toEqual(
+      expect.arrayContaining(["--rpc-max-retries", "0"]),
+    );
   });
 
   // #65: run() derives the install bound from timeout-minutes and hands it to
@@ -284,6 +358,27 @@ describe("run", () => {
     expect(messages.some((message) => message.includes("assertion failed at byte 12"))).toBe(true);
   });
 
+  it.each(["stderr", "report"])("sanitizes the exit-failure diagnostic from %s", async (source) => {
+    const token = "ghp_" + "f".repeat(36);
+    const dirty = `fatal \x1b[31m${token}\x1b[0m\0\x85 https://host/?api_key=private-query\n::error::injected`;
+    const failing = report({
+      status: "fail",
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 0 },
+      results: [result({ status: "fail", summary: source === "report" ? dirty : "failed" })],
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 1, signal: null, stdout: JSON.stringify(failing),
+      stderr: source === "stderr" ? dirty : "",
+    });
+    await run();
+    const message = String(errorMock.mock.calls.find(([value]) => String(value).includes("exit code 1"))?.[0]);
+    expect(message).toContain("Engine diagnostic:");
+    expect(message.includes(token)).toBe(false);
+    expect(message).not.toContain("private-query");
+    expect(message).not.toContain("::");
+    expect(message).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+  });
+
   // #271, branch 2: writeSummary rejecting on the otherwise-successful path
   // must fail the run with the underlying reason, without swallowing or
   // overwriting the compatibility result the outputs already carry.
@@ -312,9 +407,13 @@ describe("run", () => {
 
     // The success-path summary rendering was attempted exactly once, and a
     // passing report emits no annotations. The second argument is the
-    // provenance metadata plumbed into the summary (#373): the mocked
-    // binary path does not exist, so only the engine version is reported.
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, { engineVersion: "0.1.0" });
+    // provenance metadata plumbed into the summary: the mocked binary path
+    // does not exist, so only the engine version and the reproduction
+    // command's argument array are reported (#373, #416).
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, {
+      engineVersion: "0.1.0",
+      engineArgs: ["check", "--format", "json", "--protocol", "28", "--network", "testnet", "--fixtures-dir", "fixtures"],
+    });
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
     expect(warningMock).not.toHaveBeenCalled();
@@ -454,5 +553,329 @@ describe("run", () => {
     expect(setOutputMock).not.toHaveBeenCalledWith("receipt-path", expect.anything());
     expect(uploadReceiptMock).not.toHaveBeenCalled();
   });
-});
 
+  describe("issue #414: engine-version, total, skipped and observed-protocol outputs", () => {
+    it("sets engine-version, total, skipped and observed-protocol on success", async () => {
+      ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
+      const testReport = report({
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+        network: { name: "testnet", observedProtocol: 28 },
+        results: ["a", "b", "c", "d"].map((testId) => result({ testId, fixtureId: testId })),
+        skipped: [{ fixtureId: "e", surface: "soroban", reason: "disabled" }],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "4");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "1");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
+    });
+
+    it("sets engine-version, total, skipped and observed-protocol on compatibility failure", async () => {
+      ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
+      const testReport = report({
+        status: "fail",
+        counts: { total: 3, passed: 1, failed: 2, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet", observedProtocol: 28 },
+        results: [
+          result({ testId: "a", status: "pass", fixtureId: "a" }),
+          result({ testId: "b", status: "fail", fixtureId: "b" }),
+          result({ testId: "c", status: "fail", fixtureId: "c" }),
+        ],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 1, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "3");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
+    });
+
+    it("sets observed-protocol to empty string for an offline run (no network object)", async () => {
+      const testReport = report({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+    });
+
+    it("sets observed-protocol to empty string when network is present but observedProtocol is missing or NaN", async () => {
+      const missingObserved = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet" },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(missingObserved), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+
+      setOutputMock.mockClear();
+      const nanObserved = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet", observedProtocol: Number.NaN },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(nanObserved), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+    });
+
+    it("sets total and skipped when counts.skipped is absent in older engine report", async () => {
+      const rawJson = {
+        schemaVersion: 1,
+        toolVersion: "0.1.0",
+        targetProtocol: 28,
+        project: { name: "mock-project", type: "soroban" },
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0 },
+        results: [
+          {
+            testId: "p28-xdr-1",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "ok",
+            durationMs: 1,
+            fixtureId: "p28-xdr-1",
+          },
+        ],
+        git: { commit: "deadbeef", branch: "main", isDirty: false },
+      };
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(rawJson), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("total", "4");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+    });
+
+    it("sets failure outputs with resolved engine-version when execution fails after install succeeded", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, version: "0.1.1" });
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.1");
+    });
+
+    it("sets failure outputs with empty engine-version when installation fails", async () => {
+      ensureCanaryInstalledMock.mockRejectedValueOnce(
+        new InstallationFailedError("cargo install failed", "error[E0432]: unresolved import\n"),
+      );
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+    });
+  });
+
+  describe("issue #340: fixture-pack identity outputs", () => {
+    it("sets pack-protocol, pack-version and pack-digest from the report and inputs", async () => {
+      const digest = `sha256:${"b".repeat(64)}`;
+      const testReport = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+        fixturePack: { digest, protocol: 28 },
+      });
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesPackVersion: "v1.2.0", fixturesPackProtocol: 28 });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "28");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "v1.2.0");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", digest);
+    });
+
+    it("sets empty pack outputs when no external pack is in use", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+
+    it("clears pack outputs on an execution failure instead of leaking a stale identity", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+  });
+
+  describe("issue #344: baseline report failure modes", () => {
+    function baselineFile(contents: string): string {
+      const file = path.join(runnerTemp, "baseline.json");
+      fs.writeFileSync(file, contents, "utf8");
+      return file;
+    }
+
+    it("fails before installation on an invalid JSON baseline with a parse annotation", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baselineFile('{"schemaVersion": 1,') });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("baseline-report");
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("could not be parsed as JSON");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("baseline validation failed"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+    });
+
+    it("fails before installation when the baseline schemaVersion is unsupported", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ schemaVersion: 99 }))),
+      });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("schemaVersion 99");
+    });
+
+    it("halts with an incompatibility diagnostic when the baseline targets another protocol", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ targetProtocol: 27 }))),
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failure = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failure).toContain("Incompatible baseline report");
+      expect(failure).toContain("targets protocol 27, but this run targets protocol 28");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("targets protocol 27"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+      // No regression claim is made and no compatibility outputs are published.
+      expect(setOutputMock).not.toHaveBeenCalledWith("status", expect.anything());
+    });
+
+    it("validates a matching baseline without claiming a regression verdict", async () => {
+      const baseline = baselineFile(JSON.stringify(report({ targetProtocol: 28 })));
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baseline });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("validated for protocol 28"));
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("no regression verdict"));
+    });
+  });
+
+  it("fails before any install or engine run when a scoped input the engine cannot honour is set (#458)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, fixture: "p28-xdr-cap83-empty-tx-set" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"fixture"');
+    expect(message).toContain("Canary 0.1.0");
+    expect(message).toMatch(/no released Protocol-Canary engine supports (it|them) yet/);
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("names every scoped input in the #458 gate failure and still never installs", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, surface: "rpc", cacheDir: "cache" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"surface"');
+    expect(message).toContain('"cache-dir"');
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("never starts the JUnit render when junit-report is unset (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+    await run();
+
+    expect(runCheckMock).toHaveBeenCalledTimes(1);
+    expect(renderJUnitReportMock).not.toHaveBeenCalled();
+    expect(setOutputMock).not.toHaveBeenCalledWith("junit-report-path", expect.anything());
+  });
+
+  it("renders JUnit, sets junit-report-path, and keeps status when junit-report is true (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    const junitPath = path.join(runnerTemp, "stellar-canary-report.junit.xml");
+    fs.writeFileSync(junitPath, '<?xml version="1.0"?>\n<testsuites></testsuites>\n', "utf8");
+    renderJUnitReportMock.mockResolvedValueOnce({ path: junitPath });
+    getInputsMock.mockReturnValue({ ...INPUTS, junitReport: true });
+
+    await run();
+
+    // The check itself still runs exactly once; the renderer is a second,
+    // separate engine process only when the input is enabled.
+    expect(runCheckMock).toHaveBeenCalledTimes(1);
+    expect(renderJUnitReportMock).toHaveBeenCalledWith(
+      BINARY_PATH,
+      path.join(runnerTemp, "stellar-canary-report.json"),
+      60_000,
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("junit-report-path", junitPath);
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  it("warns without changing status when the JUnit render fails (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    renderJUnitReportMock.mockResolvedValueOnce({
+      reason: "the engine's report command exited with code 2: unknown subcommand \"report\"",
+    });
+    getInputsMock.mockReturnValue({ ...INPUTS, junitReport: true });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(expect.stringContaining("JUnit report not produced"));
+    expect(warningMock).toHaveBeenCalledWith(expect.stringContaining("status are unchanged"));
+    expect(setOutputMock).not.toHaveBeenCalledWith("junit-report-path", expect.anything());
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setFailedMock).not.toHaveBeenCalled();
+  });
+});

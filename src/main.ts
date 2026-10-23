@@ -4,15 +4,31 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { uploadReceipt, uploadReport } from "./artifact";
-import { emitAnnotations, emitExecutionFailureAnnotation, emitExitFailureAnnotation } from "./annotations";
+import {
+  emitAnnotations,
+  emitBaselineFailureAnnotation,
+  emitExecutionFailureAnnotation,
+  emitExitFailureAnnotation,
+} from "./annotations";
 import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./canary";
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
-import { printLogBlock } from "./log-block";
-import { countReplayed, describeExitCode, parseReport } from "./output";
+import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
+import { countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
+import type { CanaryReport } from "./output";
 import { buildReceipt, serializeReceipt } from "./receipt";
-import { buildCheckArgs, engineSupportsAllowEmpty, extractDiagnostic, runCheck } from "./runner";
+import {
+  assertBaselineProtocol,
+  buildCheckArgs,
+  engineSupportsAllowEmpty,
+  engineSupportsNetworkPassphraseAndRpcRetrySettings,
+  extractDiagnostic,
+  fixtureSurfaceCacheDirGateFailure,
+  loadBaselineReport,
+  renderJUnitReport,
+  runCheck,
+} from "./runner";
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
 import { resolveVersion } from "./version";
 
@@ -52,8 +68,13 @@ function artifactDifferentiator(inputs: ActionInputs): string | undefined {
 /** Handles every case where Canary did not produce a usable report at all
  * (install failure, process error, timeout, or malformed JSON) —
  * distinct from a real compatibility failure per section 29. */
-async function handleExecutionFailure(reason: string, diagnostic: string, annotate: boolean): Promise<void> {
-  core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${reason}`);
+async function handleExecutionFailure(
+  reason: string,
+  diagnostic: string,
+  annotate: boolean,
+  engineVersion: string = "",
+): Promise<void> {
+  core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${formatSafeDiagnosticTail(reason)}`);
   if (annotate) {
     emitExecutionFailureAnnotation(reason, diagnostic);
   }
@@ -67,7 +88,14 @@ async function handleExecutionFailure(reason: string, diagnostic: string, annota
   core.setOutput("warnings", "0");
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
+  core.setOutput("total", "0");
+  core.setOutput("skipped", "0");
   core.setOutput("replayed-count", "0");
+  core.setOutput("engine-version", engineVersion);
+  core.setOutput("observed-protocol", "");
+  core.setOutput("pack-protocol", "");
+  core.setOutput("pack-version", "");
+  core.setOutput("pack-digest", "");
 }
 
 /**
@@ -96,12 +124,46 @@ export async function run(): Promise<void> {
     return;
   }
 
+  // #344: validate a supplied baseline before installing or running anything.
+  // The engine's diff command is not released, so this only proves the file is
+  // a usable report; it never produces a regression verdict.
+  let baselineReport: CanaryReport | undefined;
+  if (inputs.baselineReport !== undefined) {
+    try {
+      baselineReport = loadBaselineReport(inputs.baselineReport);
+    } catch (error) {
+      const reason = describeError(error);
+      core.setFailed(reason);
+      if (inputs.annotations) {
+        emitBaselineFailureAnnotation(reason);
+      }
+      return;
+    }
+  }
+
   const resolved = await resolveVersion(inputs.version, { token: inputs.githubToken });
   core.info(
     `Stellar Protocol Canary Action\nCanary version: ${resolved.version} (${resolved.tag}${
       resolved.commitSha !== undefined ? `@${resolved.commitSha.slice(0, 12)}` : ""
     })`,
   );
+
+  // #458: fail clearly — after the version is resolved, before any install or
+  // engine process — when a scope/cache input the resolved engine cannot
+  // honour is set. Unlike allow-empty (ignored with a note, because it only
+  // relaxes a check), dropping `fixture`/`surface` would run a different
+  // scope than the caller asked for, and dropping `cache-dir` would store
+  // results elsewhere, so this refuses to start rather than degrading.
+  const scopedInputs = [
+    inputs.fixture === undefined ? undefined : "fixture",
+    inputs.surface === undefined ? undefined : "surface",
+    inputs.cacheDir === undefined ? undefined : "cache-dir",
+  ].filter((name): name is string => name !== undefined);
+  const gateFailure = fixtureSurfaceCacheDirGateFailure(resolved.version, scopedInputs);
+  if (gateFailure !== undefined) {
+    core.setFailed(gateFailure);
+    return;
+  }
 
   let installed;
   try {
@@ -113,7 +175,7 @@ export async function run(): Promise<void> {
     );
   } catch (error) {
     const diagnostic = error instanceof InstallationFailedError && error.diagnostic ? error.diagnostic : "";
-    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations);
+    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations, "");
     return;
   }
 
@@ -122,19 +184,35 @@ export async function run(): Promise<void> {
       `"allow-empty" has no effect with Canary ${resolved.version}: that version already passes a run that executes nothing.`,
     );
   }
+  if (!engineSupportsNetworkPassphraseAndRpcRetrySettings(resolved.version)) {
+    const ignoredInputs = [
+      inputs.networkPassphrase === undefined ? undefined : "network-passphrase",
+      inputs.rpcMaxRetries === undefined ? undefined : "rpc-max-retries",
+      inputs.rpcRetryDelayMs === undefined ? undefined : "rpc-retry-delay-ms",
+    ].filter((input): input is string => input !== undefined);
+    if (ignoredInputs.length > 0) {
+      core.warning(
+        `The ${ignoredInputs.map((input) => `"${input}"`).join(", ")} input(s) are not supported by Canary ` +
+          `${resolved.version} and were ignored. Use Canary 0.3.0 or newer.`,
+      );
+    }
+  }
 
   core.info(`Protocol: ${inputs.protocol !== undefined ? String(inputs.protocol) : "(from configuration)"}`);
   core.info("Running compatibility checks...");
 
+  // Build the engine arguments for the reproduction command display
+  const engineArgs = buildCheckArgs(inputs, resolved.version);
+
   let execution;
   try {
-    execution = await runCheck(installed.binaryPath, buildCheckArgs(inputs, resolved.version), inputs.timeoutMinutes * 60_000);
+    execution = await runCheck(installed.binaryPath, engineArgs, inputs.timeoutMinutes * 60_000);
   } catch (error) {
     const diagnostic = error instanceof TimeoutError && error.stderr ? error.stderr : "";
     if (error instanceof TimeoutError && error.stderr.trim() !== "") {
       printLogBlock("Canary diagnostics", error.stderr);
     }
-    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations);
+    await handleExecutionFailure(describeError(error), diagnostic, inputs.annotations, resolved.version);
     return;
   }
 
@@ -152,6 +230,7 @@ export async function run(): Promise<void> {
       `Canary was terminated by signal ${execution.signal ?? "unknown"}.`,
       execution.stderr,
       inputs.annotations,
+      resolved.version,
     );
     return;
   }
@@ -166,12 +245,31 @@ export async function run(): Promise<void> {
       `${exitInfo.description} (exit code ${String(execution.exitCode)}). ${describeError(error)}`,
       execution.stderr,
       inputs.annotations,
+      resolved.version,
     );
     return;
   }
 
   core.info(`${String(report.counts.passed)}/${String(report.counts.total)} applicable checks passed.`);
   core.info(`Status: ${report.status.toUpperCase()}`);
+
+  if (baselineReport !== undefined && inputs.baselineReport !== undefined) {
+    try {
+      assertBaselineProtocol(baselineReport, report, inputs.baselineReport);
+    } catch (error) {
+      const reason = describeError(error);
+      core.setFailed(reason);
+      if (inputs.annotations) {
+        emitBaselineFailureAnnotation(reason);
+      }
+      return;
+    }
+    core.info(
+      `Baseline report ${JSON.stringify(inputs.baselineReport)} validated for protocol ` +
+        `${String(report.targetProtocol)}; the engine's diff command is not released, so this run ` +
+        "produced no regression verdict.",
+    );
+  }
 
   if (inputs.annotations) {
     emitAnnotations(report);
@@ -207,6 +305,9 @@ export async function run(): Promise<void> {
       renderSummaryMarkdown(report, {
         ...(binarySha256 !== undefined ? { binarySha256 } : {}),
         engineVersion: installed.version,
+        // Reproduction command (issue #416): the exact argument array the
+        // engine was invoked with, so a reader can rerun the same check.
+        engineArgs,
       }),
     );
   } catch (error) {
@@ -218,11 +319,47 @@ export async function run(): Promise<void> {
   core.setOutput("warnings", String(report.counts.warnings));
   core.setOutput("failures", String(report.counts.failed));
   core.setOutput("errors", String(report.counts.errors));
+  core.setOutput("total", String(report.counts.total));
+  core.setOutput("skipped", String(report.counts.skipped ?? 0));
   core.setOutput("replayed-count", String(countReplayed(report)));
+  core.setOutput("engine-version", installed.version);
+  const observedProtocol =
+    report.network?.observedProtocol !== undefined &&
+    report.network.observedProtocol !== null &&
+    !Number.isNaN(report.network.observedProtocol)
+      ? String(report.network.observedProtocol)
+      : "";
+  core.setOutput("observed-protocol", observedProtocol);
+  const packIdentity = resolvePackIdentity(report, inputs);
+  core.setOutput("pack-protocol", packIdentity.protocol === undefined ? "" : String(packIdentity.protocol));
+  core.setOutput("pack-version", packIdentity.version ?? "");
+  core.setOutput("pack-digest", packIdentity.digest ?? "");
   core.setOutput("report", reportPath);
 
+  // #423: optional JUnit rendering through the engine's own `report` command,
+  // before the artifact upload so the XML ships with the JSON report. Like
+  // the artifact and the receipt, it is auxiliary: any failure (an engine
+  // release without the command, a non-zero exit, empty output, a missing
+  // report file) is a warning only and can never change `status` or fail the
+  // job.
+  let junitPath: string | undefined;
+  if (inputs.junitReport) {
+    const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
+    if (junit.path !== undefined) {
+      junitPath = junit.path;
+      core.setOutput("junit-report-path", junit.path);
+      core.info(`Wrote JUnit report to ${junit.path}.`);
+    } else {
+      core.warning(
+        `JUnit report not produced: ${junit.reason ?? "unknown reason"}. The compatibility ` +
+          "result and status are unchanged. Rendering requires a Protocol-Canary release whose " +
+          "`report` command supports `--format junit` (Protocol-Canary #434).",
+      );
+    }
+  }
+
   if (inputs.uploadReport) {
-    await uploadReport(reportPath, artifactDifferentiator(inputs));
+    await uploadReport(reportPath, artifactDifferentiator(inputs), junitPath === undefined ? [] : [junitPath]);
   }
 
   // #362: strictly opt-in, and auxiliary like the report artifact. A receipt

@@ -13,6 +13,7 @@ vi.mock("@actions/core", () => ({
 import * as core from "@actions/core";
 import * as https from "node:https";
 import { InvalidInputError } from "../../src/errors";
+import { MAX_API_RESPONSE_BYTES } from "../../src/http-response";
 import {
   assessEngineVersion,
   DEPRECATED_BELOW_ENGINE_VERSION,
@@ -22,6 +23,8 @@ import {
 } from "../../src/version";
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string | string[] | undefined>;
   constructor(statusCode: number, headers: Record<string, string | string[] | undefined> = {}) {
@@ -47,7 +50,7 @@ interface FakePage {
   statusCode?: number;
   body: string;
   /** Raw `Link` header value, when the page has a next page. */
-  link?: string;
+  link?: string | string[];
 }
 
 interface RecordedCall {
@@ -288,6 +291,54 @@ describe("resolveVersion", () => {
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
   });
 
+  it("terminates pagination when a Link header contains relations other than rel=next", async () => {
+    const otherLink =
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=1>; rel="first", ' +
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=3>; rel="last"';
+    const calls = mockHttpsPages([{ body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]), link: otherLink }]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved.commitSha).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("Could not find upstream tag v0.1.0"),
+    );
+  });
+
+  it("supports array-valued Link headers (string[]) from the HTTP response", async () => {
+    const linkArray = [
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=2>; rel="next"',
+      '<https://api.github.com/repos/StellarCanary/Protocol-Canary/tags?per_page=100&page=5>; rel="last"',
+    ];
+    const calls = mockHttpsPages([
+      { body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]), link: linkArray },
+      { body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) },
+    ]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved.commitSha).toBe("abc123");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.url).toContain("page=2");
+  });
+
+  it("degrades to commitSha undefined when a Link header carries an invalid URL", async () => {
+    mockHttpsPages([
+      {
+        body: tagsBody([{ name: "v9.9.9", sha: "zzz" }]),
+        link: '<not a valid url>; rel="next"',
+      },
+    ]);
+
+    const resolved = await resolveVersion("0.1.0");
+
+    expect(resolved.commitSha).toBeUndefined();
+    expect(vi.mocked(core.debug)).toHaveBeenCalledWith(
+      expect.stringContaining("Could not resolve v0.1.0 to a commit sha"),
+    );
+  });
+
   it("caps pagination at MAX_TAG_PAGES when the Link header never terminates", async () => {
     // A malformed or hostile Link header must spin the page walk forever;
     // every request re-serves this page, so the loop has to stop itself.
@@ -421,5 +472,40 @@ describe("assessEngineVersion", () => {
     expect(MIN_SUPPORTED_ENGINE_VERSION).toBe("0.1.1");
     expect(DEPRECATED_BELOW_ENGINE_VERSION).toBe("0.1.0");
     expect(LATEST_VALIDATED_ENGINE_VERSION).toBe("0.1.1");
+  });
+});
+
+
+describe("bounded tag pages (#500)", () => {
+  it.each(["exact", "oversized", "header", "lying", "aborted", "short", "split"])("handles a %s response without using partial JSON", async (kind) => {
+    const body = Buffer.from(tagsBody([{ name: "v0.2.0", sha: "a".repeat(40) }]) + " ".repeat(MAX_API_RESPONSE_BYTES));
+    const response = new FakeResponse(200, kind === "header" ? { "content-length": String(MAX_API_RESPONSE_BYTES + 1) } : kind === "lying" ? { "content-length": "1" } : kind === "short" ? { "content-length": String(MAX_API_RESPONSE_BYTES) } : {});
+    const destroyed = vi.spyOn(response, "destroy");
+    const request = new FakeRequest();
+    const requestDestroyed = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    vi.mocked(https.get).mockImplementation((_url, _options, callback) => {
+      queueMicrotask(() => {
+        callback!(response as unknown as Parameters<NonNullable<typeof callback>>[0]);
+        const bytes = kind === "split" ? Buffer.from('[{"name":"v0.2.0","commit":{"sha":"é"}}]') : body.subarray(0, kind === "short" ? 100 : MAX_API_RESPONSE_BYTES);
+        const split = kind === "split" ? bytes.indexOf(0xc3) + 1 : bytes.length;
+        const chunks = [bytes.subarray(0, split), bytes.subarray(split)];
+        if (kind === "oversized" || kind === "lying") chunks.push(Buffer.from(" "));
+        for (const chunk of chunks) {
+          if (destroyed.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        response.emit(kind === "aborted" ? "aborted" : "end");
+      });
+      return request as unknown as ReturnType<typeof https.get>;
+    });
+    const result = await resolveVersion("0.2.0");
+    expect(result.commitSha).toBe(kind === "exact" ? "a".repeat(40) : kind === "split" ? "é" : undefined);
+    if (kind === "header") expect(delivered).toBe(0);
+    if (kind !== "exact" && kind !== "split") {
+      expect(destroyed).toHaveBeenCalled();
+      expect(requestDestroyed).toHaveBeenCalled();
+    }
   });
 });

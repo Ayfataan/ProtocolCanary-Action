@@ -2,6 +2,7 @@ import * as core from "@actions/core";
 import * as https from "node:https";
 
 import { InvalidInputError } from "./errors";
+import { MAX_API_RESPONSE_BYTES, readResponseText } from "./http-response";
 import { resolveGithubToken } from "./inputs";
 
 /**
@@ -241,22 +242,15 @@ function fetchTagsPage(url: string, token: string | undefined): Promise<TagsPage
         reject(new Error(`GitHub API returned status ${String(response.statusCode)} for ${url}`));
         return;
       }
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk: string) => {
-        body += chunk;
-      });
-      response.on("end", () => {
-        try {
-          const parsed = JSON.parse(body) as unknown;
-          if (!Array.isArray(parsed)) {
-            reject(new Error("unexpected response shape from GitHub API"));
-            return;
-          }
-          resolve({ tags: parsed as GitHubTag[], next: parseNextLink(response.headers.link) });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
+      readResponseText(response, url, MAX_API_RESPONSE_BYTES).then((body) => {
+        const parsed = JSON.parse(body) as unknown;
+        if (!Array.isArray(parsed)) {
+          throw new Error("unexpected response shape from GitHub API");
         }
+        resolve({ tags: parsed as GitHubTag[], next: parseNextLink(response.headers.link) });
+      }).catch((error: unknown) => {
+        request.destroy();
+        reject(error);
       });
     });
     request.on("timeout", () => {
