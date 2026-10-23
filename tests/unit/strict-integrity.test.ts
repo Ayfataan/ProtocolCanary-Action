@@ -26,6 +26,7 @@ const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
@@ -42,6 +43,7 @@ function clearInputs(): void {
   for (const key of INPUT_KEYS) {
     delete process.env[key];
   }
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
 }
 
 function setStrict(value: string): void {
