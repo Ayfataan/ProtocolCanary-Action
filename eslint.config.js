@@ -53,6 +53,9 @@ module.exports = tseslint.config(
       // Undo the TS-aware rules the unscoped tseslint preset leaks here.
       "@typescript-eslint/no-explicit-any": "off",
       "@typescript-eslint/no-unused-vars": "off",
+      // These files *are* CommonJS modules: `require()` is their module
+      // system, not an interop shortcut.
+      "@typescript-eslint/no-require-imports": "off",
       // Core equivalents for plain CommonJS scripts.
       "no-unused-vars": [
         "error",

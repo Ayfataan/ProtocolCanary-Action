@@ -12,11 +12,17 @@ import type { ActionInputs } from "../../src/inputs";
 import {
   MAX_STDERR_CAPTURE_BYTES,
   STDERR_DROPPED_NOTICE,
+  FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION,
   assertBaselineProtocol,
   buildCheckArgs,
   engineSupportsAllowEmpty,
+  engineSupportsFixtureSurfaceCacheDir,
+  engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
+  fixtureSurfaceCacheDirGateFailure,
+  junitFilePath,
   loadBaselineReport,
+  renderJUnitReport,
   runCheck,
 } from "../../src/runner";
 import { report } from "./helpers";
@@ -61,8 +67,14 @@ const BASE_INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: undefined,
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
+  fixture: undefined,
+  surface: undefined,
+  cacheDir: undefined,
   version: "0.1.0",
   uploadReport: true,
   annotations: true,
@@ -73,7 +85,9 @@ const BASE_INPUTS: ActionInputs = {
   baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  junitReport: false,
   strictIntegrity: false,
+  workingDirectory: path.resolve("."),
 };
 
 describe("buildCheckArgs", () => {
@@ -133,12 +147,106 @@ describe("buildCheckArgs", () => {
     );
   });
 
+  it("forwards passphrase and retry flags to engines that support them", () => {
+    const args = buildCheckArgs(
+      {
+        ...BASE_INPUTS,
+        network: "testnet",
+        networkPassphrase: "Private Network ; October 2026",
+        rpcMaxRetries: 0,
+        rpcRetryDelayMs: 250,
+      },
+      "0.3.0",
+    );
+    expect(args).toEqual(
+      expect.arrayContaining([
+        "--network",
+        "testnet",
+        "--network-passphrase",
+        "Private Network ; October 2026",
+        "--rpc-max-retries",
+        "0",
+        "--rpc-retry-delay-ms",
+        "250",
+      ]),
+    );
+  });
+
+  it("does not pass new flags to older or unknown engines", () => {
+    const inputs = {
+      ...BASE_INPUTS,
+      networkPassphrase: "Private Network ; October 2026",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    };
+    for (const version of ["0.2.0", "", undefined]) {
+      const args = buildCheckArgs(inputs, version);
+      expect(args).not.toContain("--network-passphrase");
+      expect(args).not.toContain("--rpc-max-retries");
+      expect(args).not.toContain("--rpc-retry-delay-ms");
+    }
+  });
+
   it("never concatenates arguments into a single string (command-injection defense)", () => {
     const args = buildCheckArgs({ ...BASE_INPUTS, network: "testnet; rm -rf /" });
     // The dangerous value must appear as exactly one array element, never
     // merged with adjacent flags or split by the shell.
     expect(args).toContain("testnet; rm -rf /");
     expect(args.some((a) => a.includes("--network testnet"))).toBe(false);
+  });
+
+  describe("fixture, surface, and cache-dir forwarding (#458)", () => {
+    const prefix = ["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"];
+
+    it("leaves the argument array identical to before when none of the three is set", () => {
+      expect(buildCheckArgs(BASE_INPUTS, "0.1.0")).toEqual(prefix);
+      expect(buildCheckArgs(BASE_INPUTS, "0.2.0")).toEqual(prefix);
+      expect(buildCheckArgs(BASE_INPUTS)).toEqual(prefix);
+    });
+
+    it("forwards each input set alone as one --flag=value element", () => {
+      expect(buildCheckArgs({ ...BASE_INPUTS, fixture: "p28-xdr-cap83-empty-tx-set" }, "9.9.9")).toEqual([
+        ...prefix,
+        "--fixture=p28-xdr-cap83-empty-tx-set",
+      ]);
+      expect(buildCheckArgs({ ...BASE_INPUTS, surface: "xdr" }, "9.9.9")).toEqual([...prefix, "--surface=xdr"]);
+      expect(buildCheckArgs({ ...BASE_INPUTS, cacheDir: ".stellar-canary-cache" }, "9.9.9")).toEqual([
+        ...prefix,
+        "--cache-dir=.stellar-canary-cache",
+      ]);
+    });
+
+    it("keeps a stable order for every combination", () => {
+      const fixtureSurface = { ...BASE_INPUTS, fixture: "f", surface: "rpc" as const };
+      expect(buildCheckArgs(fixtureSurface, "0.1.0")).toEqual([...prefix, "--fixture=f", "--surface=rpc"]);
+
+      const fixtureCache = { ...BASE_INPUTS, fixture: "f", cacheDir: "c" };
+      expect(buildCheckArgs(fixtureCache, "0.1.0")).toEqual([...prefix, "--fixture=f", "--cache-dir=c"]);
+
+      const surfaceCache = { ...BASE_INPUTS, surface: "soroban" as const, cacheDir: "c" };
+      expect(buildCheckArgs(surfaceCache, "0.1.0")).toEqual([...prefix, "--surface=soroban", "--cache-dir=c"]);
+
+      const all = { ...BASE_INPUTS, fixture: "f", surface: "soroban" as const, cacheDir: "c" };
+      expect(buildCheckArgs(all, "0.1.0")).toEqual([
+        ...prefix,
+        "--fixture=f",
+        "--surface=soroban",
+        "--cache-dir=c",
+      ]);
+    });
+
+    it("passes a value beginning with - as one element, never as a separate option", () => {
+      const args = buildCheckArgs({ ...BASE_INPUTS, fixture: "--weird-id" }, "0.1.0");
+      expect(args).toContain("--fixture=--weird-id");
+      expect(args).not.toContain("--weird-id");
+      expect(args).not.toContain("");
+    });
+
+    it("appends --fixture= after every pre-existing argument", () => {
+      const args = buildCheckArgs({ ...BASE_INPUTS, network: "testnet", fixture: "f" }, "0.1.0");
+      expect(args.indexOf("--fixture=f")).toBe(args.length - 1);
+      expect(args.indexOf("--network")).toBeLessThan(args.indexOf("--fixture=f"));
+    });
   });
 });
 
@@ -249,6 +357,138 @@ describe("allow-empty forwarding", () => {
     [undefined, false],
   ])("engineSupportsAllowEmpty(%j) is %s", (version, expected) => {
     expect(engineSupportsAllowEmpty(version)).toBe(expected);
+  });
+});
+
+describe("network passphrase and RPC retry version gate", () => {
+  it.each([
+    ["0.2.0", false],
+    ["0.2.99", false],
+    ["0.3.0", true],
+    ["0.3.1", true],
+    ["1.0.0", true],
+    ["", false],
+    ["v0.3.0", false],
+    ["0.3.0-rc1", false],
+    [undefined, false],
+  ])("engineSupportsNetworkPassphraseAndRpcRetrySettings(%j) is %s", (version, expected) => {
+    expect(engineSupportsNetworkPassphraseAndRpcRetrySettings(version)).toBe(expected);
+  });
+});
+
+describe("fixture/surface/cache-dir fail-clearly gate (#458)", () => {
+  it("has no minimum release hard-coded while no release supports the flags", () => {
+    // Only change this assertion together with FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION,
+    // after reading CheckArgs at the release a maintainer names on #458.
+    expect(FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION).toBeUndefined();
+  });
+
+  it("reports no support for any engine version while the gate constant is undefined", () => {
+    for (const version of ["0.1.0", "0.2.0", "0.3.0", "9.9.9", "", undefined]) {
+      expect(engineSupportsFixtureSurfaceCacheDir(version)).toBe(false);
+    }
+  });
+
+  it("produces no failure when no scoped input is set, whatever the engine version", () => {
+    expect(fixtureSurfaceCacheDirGateFailure("0.1.0", [])).toBeUndefined();
+    expect(fixtureSurfaceCacheDirGateFailure("9.9.9", [])).toBeUndefined();
+  });
+
+  it.each([["fixture"], ["surface"], ["cache-dir"], ["fixture", "surface"], ["fixture", "surface", "cache-dir"]])(
+    "names the input(s), the resolved version, and the missing support for %j",
+    (...setInputs) => {
+      const message = fixtureSurfaceCacheDirGateFailure("0.2.0", setInputs);
+      expect(message).toBeDefined();
+      const text = message ?? "";
+      for (const name of setInputs) {
+        expect(text).toContain(`"${name}"`);
+      }
+      expect(text).toContain("Canary 0.2.0");
+      expect(text).toMatch(/no released Protocol-Canary engine supports (it|them) yet/);
+      expect(text).toMatch(/different scope than requested/);
+    },
+  );
+});
+
+describe("junit-report rendering through the engine (#423)", () => {
+  let dir: string;
+  let reportPath: string;
+  let previousScenario: string | undefined;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-junit-"));
+    reportPath = path.join(dir, "stellar-canary-report.json");
+    fs.writeFileSync(reportPath, JSON.stringify(report({})), "utf8");
+    previousScenario = process.env.MOCK_CANARY_SCENARIO;
+    delete process.env.MOCK_CANARY_SCENARIO;
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (previousScenario === undefined) {
+      delete process.env.MOCK_CANARY_SCENARIO;
+    } else {
+      process.env.MOCK_CANARY_SCENARIO = previousScenario;
+    }
+  });
+
+  function render(): ReturnType<typeof renderJUnitReport> {
+    return renderJUnitReport(MOCK_CANARY_COMMAND, reportPath, 10_000, MOCK_CANARY_PREFIX);
+  }
+
+  it("derives the JUnit path from the report path", () => {
+    expect(junitFilePath("/tmp/stellar-canary-report.json")).toBe("/tmp/stellar-canary-report.junit.xml");
+    expect(junitFilePath("/tmp/report")).toBe("/tmp/report.junit.xml");
+  });
+
+  it("writes a well-formed XML file and returns its path on success", async () => {
+    const outcome = await render();
+    expect(outcome.reason).toBeUndefined();
+    expect(outcome.path).toBe(path.join(dir, "stellar-canary-report.junit.xml"));
+    const xml = fs.readFileSync(String(outcome.path), "utf8");
+    expect(xml).toMatch(/^<\?xml version="1\.0"/);
+    expect(xml).toContain("<testsuites");
+    expect(xml).toContain("</testsuites>");
+  });
+
+  it("reports an engine without the report command as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-unknown";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 2");
+    expect(outcome.reason).toContain('unknown subcommand "report"');
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports a non-zero render exit as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-fail";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 5");
+    expect(outcome.reason).toContain("internal error while rendering JUnit XML");
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports empty engine output as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-empty";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("produced no output");
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports a missing report file as a failure without throwing", async () => {
+    reportPath = path.join(dir, "absent.json");
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 2");
+    expect(outcome.reason).toContain("report file not found");
+  });
+
+  it("captures a spawn failure as a reason instead of throwing", async () => {
+    const outcome = await renderJUnitReport(path.join(dir, "no-such-binary"), reportPath, 5_000);
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toBeTruthy();
   });
 });
 
@@ -518,7 +758,7 @@ describe("extractDiagnostic", () => {
     const long = `error: ${"x".repeat(5_000)}`;
     const diagnostic = extractDiagnostic(long);
     expect(diagnostic.length).toBe(500);
-    expect(diagnostic.startsWith("error: ")).toBe(true);
+    expect(diagnostic.startsWith("[... earlier output truncated ...]\n")).toBe(true);
   });
 });
 
