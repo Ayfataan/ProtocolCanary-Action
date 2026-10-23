@@ -177,6 +177,9 @@ export function getInputs(): ActionInputs {
   const network = optional(core.getInput("network"));
   const networkPassphrase = parseNetworkPassphrase(core.getInput("network-passphrase", { trimWhitespace: false }));
   const rpcUrl = parseRpcUrl(core.getInput("rpc-url"));
+  if (rpcUrl !== undefined) {
+    maskRpcUrlSecrets(rpcUrl, core.setSecret);
+  }
   const rpcMaxRetries = parseDecimalInteger(
     core.getInput("rpc-max-retries"),
     "rpc-max-retries",
@@ -324,15 +327,66 @@ function parseFixturesPackVersion(raw: string): string | undefined {
 }
 
 /**
- * Validates the "fixtures-pack-protocol" input as a **positive** integer
- * string; `undefined` when unset. Throws {@link InvalidInputError}, naming the
- * input and an accepted example, for anything else.
+ * Masks sensitive components extracted from a validated RPC URL by registering
+ * them with the GitHub Actions runner via `core.setSecret()`.
  *
- * Unlike the `protocol` input — which accepts `0` because a non-negative
- * integer is the right shape there — zero is rejected here: a pack pinned to
- * protocol 0 is not a pack anyone publishes, so accepting it would only defer
- * the error to somewhere less actionable.
+ * This runs after `parseRpcUrl` validation, so malformed URLs are already
+ * rejected. The original URL string is preserved for full-URL masking.
  *
+ * Components masked (if non-empty):
+ *   - Username from URL userinfo (`user:password@host`)
+ *   - Password from URL userinfo
+ *   - Every query parameter value
+ *   - URL fragment
+ *   - The complete RPC URL if any sensitive component is present
+ *
+ * @param rpcUrl The validated RPC URL string (already validated as https:// or
+ *   permitted plain http:// for localhost/127.0.0.1).
+ */
+function maskRpcUrlSecrets(rpcUrl: string, setSecret: (secret: string) => void): void {
+  const parsed = new URL(rpcUrl);
+  let hasSensitive = false;
+
+  // 1. Username and password from URL userinfo.
+  if (parsed.username !== "") {
+    setSecret(parsed.username);
+    hasSensitive = true;
+  }
+  if (parsed.password !== "") {
+    setSecret(parsed.password);
+    hasSensitive = true;
+  }
+
+  // 2. Every query parameter value.
+  if (parsed.searchParams.size > 0) {
+    for (const [, value] of parsed.searchParams.entries()) {
+      const decodedValue = decodeURIComponent(value);
+      if (decodedValue !== "") {
+        setSecret(decodedValue);
+        hasSensitive = true;
+      }
+    }
+  }
+
+  // 3. URL fragment.
+  if (parsed.hash && parsed.hash.length > 1) {
+    const fragment = parsed.hash.slice(1); // strip leading #
+    if (fragment !== "") {
+      setSecret(fragment);
+      hasSensitive = true;
+    }
+  }
+
+  // 4. The complete RPC URL if any sensitive component is present.
+  if (hasSensitive) {
+    setSecret(rpcUrl);
+  }
+}
+
+/**
+ * Validates the "fixtures-pack-version" input as a published fixture-pack
+ * release tag; `undefined` when unset. Throws {@link InvalidInputError},
+ * naming the input and an accepted example, for anything else.
  * Not forwarded to the CLI, for the same reason as
  * {@link parseFixturesPackVersion}.
  */
