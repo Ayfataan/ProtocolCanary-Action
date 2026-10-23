@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import type { CanarySkip } from "../../src/output";
 import { report, result } from "./helpers";
 
 describe("renderSummaryMarkdown", () => {
@@ -105,6 +106,63 @@ describe("renderSummaryMarkdown", () => {
     );
     expect(markdown).toContain("<details><summary>Skipped fixtures</summary>");
     expect(markdown).toContain("p27-xdr-legacy");
+  });
+
+  it("renders a structured skipped-fixtures table grouped by reason code (#341)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        skipped: [
+          {
+            fixtureId: "p28-rpc-missing",
+            surface: "rpc",
+            reason: "project does not declare the rpc capability",
+            code: "MISSING_CAPABILITY",
+          },
+          {
+            fixtureId: "p27-xdr-old",
+            surface: "xdr",
+            reason: "fixture targets protocol 27, this run targets protocol 28",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+          {
+            fixtureId: "p27-rpc-old",
+            surface: "rpc",
+            reason: "fixture targets protocol 27",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("| Reason code | Fixture | Surface | Reason |");
+    expect(markdown).toContain("| `UNSUPPORTED_PROTOCOL` — Unsupported protocol |");
+    expect(markdown).toContain("| `MISSING_CAPABILITY` — Missing capability |");
+    // Group order is deterministic: unsupported protocol rows precede the
+    // missing-capability row, and equal codes sort by fixture id.
+    const unsupported = markdown.indexOf("p27-rpc-old");
+    const unsupported2 = markdown.indexOf("p27-xdr-old");
+    const missing = markdown.indexOf("p28-rpc-missing");
+    expect(unsupported).toBeGreaterThanOrEqual(0);
+    expect(unsupported).toBeLessThan(unsupported2);
+    expect(unsupported2).toBeLessThan(missing);
+  });
+
+  it("renders safe UNKNOWN fallbacks when skip codes or fields are missing (#341)", () => {
+    const skipped = [
+      { fixtureId: "unrecorded", surface: "xdr", reason: "older engine wrote no code" },
+      { fixtureId: "future", surface: "rpc", reason: "a newer code", code: "FROM_THE_FUTURE" },
+      { fixtureId: "", surface: "", reason: "", code: "" },
+    ] as unknown as CanarySkip[];
+
+    const markdown = renderSummaryMarkdown(report({ skipped }));
+
+    expect(markdown).toContain("`UNKNOWN` — Unknown reason");
+    expect(markdown).toContain("older engine wrote no code");
+    expect(markdown).toContain("a newer code");
+    expect(markdown).not.toContain("FROM_THE_FUTURE");
+    expect(markdown).toContain("(unknown fixture)");
+    expect(markdown).toContain("unknown surface");
+    expect(markdown).toContain("no reason recorded");
   });
 
   it("omits the skipped-fixtures section when skipped is an empty array (#264)", () => {

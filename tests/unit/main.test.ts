@@ -111,7 +111,10 @@ const INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: "testnet",
+  networkPassphrase: undefined,
   rpcUrl: undefined,
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
   fixturesDir: "fixtures",
   version: "0.1.0",
   uploadReport: false,
@@ -120,6 +123,7 @@ const INPUTS: ActionInputs = {
   allowEmpty: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
@@ -193,6 +197,37 @@ describe("run", () => {
     await run();
     expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--allow-empty");
     expect(infoMock).toHaveBeenCalledWith(expect.stringContaining('"allow-empty" has no effect with Canary 0.1.1'));
+  });
+
+  it("warns about each new setting ignored by an older engine without exposing the passphrase", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      version: "0.2.0",
+      networkPassphrase: "Private Network ; secret value",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('"network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"'),
+    );
+    expect(warningMock.mock.calls.flat().join(" ")).not.toContain("secret value");
+    expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--network-passphrase");
+  });
+
+  it("does not warn about new settings when the resolved engine supports them", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({ ...INPUTS, version: "0.3.0", rpcMaxRetries: 0 });
+
+    await run();
+
+    expect(warningMock).not.toHaveBeenCalledWith(expect.stringContaining("rpc-max-retries"));
+    expect(runCheckMock.mock.calls[0]?.[1]).toEqual(
+      expect.arrayContaining(["--rpc-max-retries", "0"]),
+    );
   });
 
   // #65: run() derives the install bound from timeout-minutes and hands it to
@@ -597,5 +632,115 @@ describe("run", () => {
       expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
     });
   });
-});
 
+  describe("issue #340: fixture-pack identity outputs", () => {
+    it("sets pack-protocol, pack-version and pack-digest from the report and inputs", async () => {
+      const digest = `sha256:${"b".repeat(64)}`;
+      const testReport = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+        fixturePack: { digest, protocol: 28 },
+      });
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesPackVersion: "v1.2.0", fixturesPackProtocol: 28 });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "28");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "v1.2.0");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", digest);
+    });
+
+    it("sets empty pack outputs when no external pack is in use", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+
+    it("clears pack outputs on an execution failure instead of leaking a stale identity", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+  });
+
+  describe("issue #344: baseline report failure modes", () => {
+    function baselineFile(contents: string): string {
+      const file = path.join(runnerTemp, "baseline.json");
+      fs.writeFileSync(file, contents, "utf8");
+      return file;
+    }
+
+    it("fails before installation on an invalid JSON baseline with a parse annotation", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baselineFile('{"schemaVersion": 1,') });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("baseline-report");
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("could not be parsed as JSON");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("baseline validation failed"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+    });
+
+    it("fails before installation when the baseline schemaVersion is unsupported", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ schemaVersion: 99 }))),
+      });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("schemaVersion 99");
+    });
+
+    it("halts with an incompatibility diagnostic when the baseline targets another protocol", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ targetProtocol: 27 }))),
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failure = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failure).toContain("Incompatible baseline report");
+      expect(failure).toContain("targets protocol 27, but this run targets protocol 28");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("targets protocol 27"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+      // No regression claim is made and no compatibility outputs are published.
+      expect(setOutputMock).not.toHaveBeenCalledWith("status", expect.anything());
+    });
+
+    it("validates a matching baseline without claiming a regression verdict", async () => {
+      const baseline = baselineFile(JSON.stringify(report({ targetProtocol: 28 })));
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baseline });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("validated for protocol 28"));
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("no regression verdict"));
+    });
+  });
+});
