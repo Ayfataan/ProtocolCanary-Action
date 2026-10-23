@@ -76,6 +76,9 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Redact recognized secrets, strip control characters, and bound engine diagnostics
+  in failure annotations and execution-failure summaries. Sanitize failure reasons
+  as well, and redact before selecting or truncating diagnostic text (#499).
 - Bound HTTP response bodies to 4 MiB for GitHub API JSON, 1 MiB for checksum
   manifests, and 64 MiB for prebuilt release assets. Reject oversized or incomplete
   bodies and remove failed downloads before using the existing fallback paths (#500).

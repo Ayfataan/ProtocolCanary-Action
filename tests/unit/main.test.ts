@@ -186,6 +186,34 @@ describe("run", () => {
     delete process.env.RUNNER_TEMP;
   });
 
+  it.each(["timeout", "signal", "parse"])("sanitizes %s failure annotations, reasons and the published summary", async (kind) => {
+    const actual = await vi.importActual<typeof summaryModule>("../../src/summary");
+    renderExecutionFailureMarkdownMock.mockImplementation(actual.renderExecutionFailureMarkdown);
+    const token = "ghp_" + "a".repeat(36);
+    const dirty = `fatal \x1b[31m${token}\x1b[0m\0\x85 https://host/?api_key=private-query\n::error::injected`;
+    if (kind === "timeout") {
+      runCheckMock.mockRejectedValueOnce(new TimeoutError("timed out", "", dirty));
+    } else {
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: kind === "signal" ? null : 1,
+        signal: kind === "signal" ? "SIGTERM" : null,
+        stdout: dirty,
+        stderr: dirty,
+      });
+    }
+    await run();
+    const outputs = [...errorMock.mock.calls, ...setFailedMock.mock.calls, ...writeSummaryMock.mock.calls];
+    expect(errorMock).toHaveBeenCalled();
+    expect(writeSummaryMock).toHaveBeenCalled();
+    for (const [value] of outputs) {
+      const text = String(value);
+      expect(text.includes(token)).toBe(false);
+      expect(text).not.toContain("private-query");
+      expect(text).not.toContain("::");
+      expect(text).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+    }
+  });
+
   it("forwards the installed binary, the built args, and the millisecond timeout to runCheck", async () => {
     runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
 
@@ -328,6 +356,27 @@ describe("run", () => {
     expect(messages.some((message) => message.includes("exit code 1"))).toBe(true);
     expect(messages.some((message) => message.includes("Test failures detected"))).toBe(true);
     expect(messages.some((message) => message.includes("assertion failed at byte 12"))).toBe(true);
+  });
+
+  it.each(["stderr", "report"])("sanitizes the exit-failure diagnostic from %s", async (source) => {
+    const token = "ghp_" + "f".repeat(36);
+    const dirty = `fatal \x1b[31m${token}\x1b[0m\0\x85 https://host/?api_key=private-query\n::error::injected`;
+    const failing = report({
+      status: "fail",
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 0 },
+      results: [result({ status: "fail", summary: source === "report" ? dirty : "failed" })],
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 1, signal: null, stdout: JSON.stringify(failing),
+      stderr: source === "stderr" ? dirty : "",
+    });
+    await run();
+    const message = String(errorMock.mock.calls.find(([value]) => String(value).includes("exit code 1"))?.[0]);
+    expect(message).toContain("Engine diagnostic:");
+    expect(message.includes(token)).toBe(false);
+    expect(message).not.toContain("private-query");
+    expect(message).not.toContain("::");
+    expect(message).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
   });
 
   // #271, branch 2: writeSummary rejecting on the otherwise-successful path

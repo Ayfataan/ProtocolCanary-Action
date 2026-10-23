@@ -14,7 +14,7 @@ import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./cana
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
-import { printLogBlock } from "./log-block";
+import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import { countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
 import type { CanaryReport } from "./output";
 import { buildReceipt, serializeReceipt } from "./receipt";
@@ -74,7 +74,7 @@ async function handleExecutionFailure(
   annotate: boolean,
   engineVersion: string = "",
 ): Promise<void> {
-  core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${reason}`);
+  core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${formatSafeDiagnosticTail(reason)}`);
   if (annotate) {
     emitExecutionFailureAnnotation(reason, diagnostic);
   }
