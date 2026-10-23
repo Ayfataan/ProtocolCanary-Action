@@ -40,6 +40,10 @@ export interface ActionInputs {
   readonly version: string;
   readonly uploadReport: boolean;
   readonly annotations: boolean;
+  /** Opt in to a best-effort redacted diagnostics bundle. Disabled by
+   * default (CF-08 / D-10): such an artifact is readable by anyone who can
+   * read the repository, and redaction by pattern is only best effort. */
+  readonly diagnostics: boolean;
   readonly timeoutMinutes: number;
   /** Pass `--allow-empty` to engines that support it (0.2.0 and newer). */
   readonly allowEmpty: boolean;
@@ -204,6 +208,7 @@ export function getInputs(): ActionInputs {
   const version = parseVersion(core.getInput("version") || "0.2.0");
   const uploadReport = parseBoolean("upload-report", core.getInput("upload-report") || "true");
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
+  const diagnostics = parseBoolean("diagnostics", core.getInput("diagnostics") || "false");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
   const failOnWarning = parseBoolean(
@@ -283,6 +288,7 @@ export function getInputs(): ActionInputs {
     version,
     uploadReport,
     annotations,
+    diagnostics,
     timeoutMinutes,
     allowEmpty,
     failOnWarning,

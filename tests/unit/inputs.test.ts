@@ -40,6 +40,7 @@ const INPUT_KEYS = [
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
+  "INPUT_DIAGNOSTICS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
   "INPUT_FAIL-ON-WARNING",
@@ -84,6 +85,7 @@ describe("getInputs", () => {
       version: "0.2.0",
       uploadReport: true,
       annotations: true,
+      diagnostics: false,
       timeoutMinutes: 15,
       allowEmpty: false,
       failOnWarning: false,
@@ -515,6 +517,49 @@ describe("getInputs", () => {
     process.env["INPUT_GENERATE-RECEIPT"] = "yes";
     expect(() => getInputs()).toThrow(InvalidInputError);
     expect(() => getInputs()).toThrow(/"generate-receipt"/);
+  });
+});
+
+/**
+ * #331 / CF-08 / D-10: `diagnostics` is strictly opt-in and disabled by
+ * default, so an omitted input must never start uploading diagnostic
+ * artifacts. The input only records the workflow author's intent here; the
+ * bundle itself is uploaded by the diagnostics path that consumes it.
+ */
+describe("getInputs diagnostics (#331)", () => {
+  beforeEach(clearInputs);
+  afterEach(clearInputs);
+
+  it("defaults diagnostics to false when omitted", () => {
+    expect(getInputs().diagnostics).toBe(false);
+  });
+
+  it.each([
+    ["true", true],
+    ["True", true],
+    ["TRUE", true],
+    ["false", false],
+    ["False", false],
+    ["FALSE", false],
+  ])("parses diagnostics %s strictly", (value, expected) => {
+    process.env.INPUT_DIAGNOSTICS = value;
+    expect(getInputs().diagnostics).toBe(expected);
+  });
+
+  it.each(["yes", "1", "0", "on", "diagnostics"])(
+    "rejects the non-boolean diagnostics value %s and names the input",
+    (value) => {
+      process.env.INPUT_DIAGNOSTICS = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"diagnostics"/);
+    },
+  );
+
+  it("leaves artifacts disabled when the input is empty", () => {
+    // GitHub passes an omitted input as the empty string, which is not a
+    // boolean literal: the documented default must still apply.
+    process.env.INPUT_DIAGNOSTICS = "";
+    expect(getInputs().diagnostics).toBe(false);
   });
 });
 

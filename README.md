@@ -155,6 +155,7 @@ jobs:
 | `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.2.0` |
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
+| `diagnostics` | Opt in to a best-effort redacted diagnostics log bundle when Canary cannot produce a usable report. Strictly opt-in: the artifact is downloadable by anyone who can read the repository, and the process environment is never included. | `false` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
 | `fail-on-warning` | Treat Protocol Canary warnings as failures (`--fail-on-warning`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
 | `offline` | Skip network-dependent fixtures (`--offline`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |

@@ -127,6 +127,7 @@ const INPUTS: ActionInputs = {
   version: "0.1.0",
   uploadReport: false,
   annotations: true,
+  diagnostics: false,
   timeoutMinutes: 1,
   allowEmpty: false,
   failOnWarning: false,
