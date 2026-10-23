@@ -55,6 +55,13 @@ export interface ActionInputs {
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
   readonly generateReceipt: boolean;
+  /** Render the parsed JSON report to JUnit XML through the engine's own
+   * `report <file> --format junit` command (#423) and expose the file as the
+   * `junit-report-path` output (also included in the artifact upload).
+   * Auxiliary: any failure — an engine without the command, a non-zero exit,
+   * empty output, a missing report file — is a warning only and can never
+   * change the compatibility result. */
+  readonly junitReport: boolean;
   /** Fail closed whenever binary integrity cannot be proven (issue #372).
    * Default `false` preserves the historical degrade-to-pinning behaviour. */
   readonly strictIntegrity: boolean;
@@ -196,6 +203,7 @@ export function getInputs(): ActionInputs {
     core.setSecret(networkPassphrase);
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+  const junitReport = parseBoolean("junit-report", core.getInput("junit-report") || "false");
 
   const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
 
@@ -234,6 +242,7 @@ export function getInputs(): ActionInputs {
     baselineReport,
     githubToken,
     generateReceipt,
+    junitReport,
     strictIntegrity,
   };
 }

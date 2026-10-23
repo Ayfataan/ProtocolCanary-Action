@@ -20,7 +20,9 @@ import {
   engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
   fixtureSurfaceCacheDirGateFailure,
+  junitFilePath,
   loadBaselineReport,
+  renderJUnitReport,
   runCheck,
 } from "../../src/runner";
 import { report } from "./helpers";
@@ -83,6 +85,7 @@ const BASE_INPUTS: ActionInputs = {
   baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  junitReport: false,
   strictIntegrity: false,
 };
 
@@ -404,6 +407,88 @@ describe("fixture/surface/cache-dir fail-clearly gate (#458)", () => {
       expect(text).toMatch(/different scope than requested/);
     },
   );
+});
+
+describe("junit-report rendering through the engine (#423)", () => {
+  let dir: string;
+  let reportPath: string;
+  let previousScenario: string | undefined;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-junit-"));
+    reportPath = path.join(dir, "stellar-canary-report.json");
+    fs.writeFileSync(reportPath, JSON.stringify(report({})), "utf8");
+    previousScenario = process.env.MOCK_CANARY_SCENARIO;
+    delete process.env.MOCK_CANARY_SCENARIO;
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (previousScenario === undefined) {
+      delete process.env.MOCK_CANARY_SCENARIO;
+    } else {
+      process.env.MOCK_CANARY_SCENARIO = previousScenario;
+    }
+  });
+
+  function render(): ReturnType<typeof renderJUnitReport> {
+    return renderJUnitReport(MOCK_CANARY_COMMAND, reportPath, 10_000, MOCK_CANARY_PREFIX);
+  }
+
+  it("derives the JUnit path from the report path", () => {
+    expect(junitFilePath("/tmp/stellar-canary-report.json")).toBe("/tmp/stellar-canary-report.junit.xml");
+    expect(junitFilePath("/tmp/report")).toBe("/tmp/report.junit.xml");
+  });
+
+  it("writes a well-formed XML file and returns its path on success", async () => {
+    const outcome = await render();
+    expect(outcome.reason).toBeUndefined();
+    expect(outcome.path).toBe(path.join(dir, "stellar-canary-report.junit.xml"));
+    const xml = fs.readFileSync(String(outcome.path), "utf8");
+    expect(xml).toMatch(/^<\?xml version="1\.0"/);
+    expect(xml).toContain("<testsuites");
+    expect(xml).toContain("</testsuites>");
+  });
+
+  it("reports an engine without the report command as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-unknown";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 2");
+    expect(outcome.reason).toContain('unknown subcommand "report"');
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports a non-zero render exit as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-fail";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 5");
+    expect(outcome.reason).toContain("internal error while rendering JUnit XML");
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports empty engine output as a failure, producing nothing", async () => {
+    process.env.MOCK_CANARY_SCENARIO = "junit-empty";
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("produced no output");
+    expect(fs.existsSync(path.join(dir, "stellar-canary-report.junit.xml"))).toBe(false);
+  });
+
+  it("reports a missing report file as a failure without throwing", async () => {
+    reportPath = path.join(dir, "absent.json");
+    const outcome = await render();
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toContain("exited with code 2");
+    expect(outcome.reason).toContain("report file not found");
+  });
+
+  it("captures a spawn failure as a reason instead of throwing", async () => {
+    const outcome = await renderJUnitReport(path.join(dir, "no-such-binary"), reportPath, 5_000);
+    expect(outcome.path).toBeUndefined();
+    expect(outcome.reason).toBeTruthy();
+  });
 });
 
 describe("runCheck", () => {

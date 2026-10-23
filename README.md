@@ -155,6 +155,7 @@ jobs:
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
+| `junit-report` | Render the JSON report to JUnit XML using the engine's own `stellar-canary report <file> --format junit` command and expose the file as the `junit-report-path` output. Written next to the JSON report and included in the artifact when `upload-report` is `true`. **Minimum engine version:** the release that adds `report --format junit` (Protocol-Canary #434; not in `0.2.0`) — with an older engine nothing is produced and a warning is logged. Any failure (unsupported engine, non-zero exit, empty output, missing report file) is a warning only: it never changes `status` and never fails the job. | `false` |
 | `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
 | `github-token` | Optional token for read-only requests to `api.github.com` for version resolution and checksum discovery. Set it to `${{ github.token }}` to authenticate (requires `contents: read`); otherwise requests are unauthenticated unless `GITHUB_TOKEN` is present in the environment. Pass an empty string (`""`) to disable authentication. | (none) |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
@@ -188,6 +189,7 @@ literals below.
 | `pack-version` | Release tag/version of the resolved fixture pack, from `fixturePack.version`/`tag` or the `fixtures-pack-version` input. Empty when no pack identity is recorded. | `"v1.2.0"` |
 | `pack-digest` | Canonical content digest of the resolved fixture pack, formatted as `sha256:<64 lowercase hex>`, when the report records one. Empty when no digest is recorded or the recorded value is malformed; the Action never fabricates a digest. | `"sha256:…"` |
 | `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `junit-report-path` | Absolute path to the generated JUnit XML file. Only set when `junit-report` is `true` **and** the engine's render succeeded; unset otherwise (input disabled, engine without the command, failed/empty render) and on an execution failure. A failed render is always a warning, never a status change. | `/home/runner/work/_temp/stellar-canary-report.junit.xml` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
 
@@ -576,7 +578,10 @@ comparison, fixture releases, project roots) are specified in
 Repositories that want a single-declaration compatibility check can call the
 maintained reusable workflow; its inputs, outputs, and matrix, monorepo, and
 PR-gating examples are documented in
-[`docs/reusable-workflow.md`](docs/reusable-workflow.md).
+[`docs/reusable-workflow.md`](docs/reusable-workflow.md), together with
+[what your pin of that workflow guarantees](docs/reusable-workflow.md#what-your-pin-guarantees-457)
+— release stamping keeps the workflow's internal Action reference aligned
+with the release you pinned (#457).
 The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail-closed policy are documented in [`docs/integrity-model.md`](docs/integrity-model.md).
 
 ## License

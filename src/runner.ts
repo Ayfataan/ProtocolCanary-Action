@@ -178,6 +178,64 @@ export function fixtureSurfaceCacheDirGateFailure(
   );
 }
 
+/** Outcome of an optional JUnit rendering attempt (#423). Exactly one field
+ * is present: `path` when the XML file was written, `reason` otherwise. */
+export interface JUnitRenderOutcome {
+  readonly path?: string;
+  readonly reason?: string;
+}
+
+/** Path of the JUnit file derived from the JSON report path: the report's
+ * `.json` suffix (or the whole path when it has none) plus `.junit.xml`, so
+ * both files always live in the same directory. */
+export function junitFilePath(reportPath: string): string {
+  return reportPath.endsWith(".json") ? `${reportPath.slice(0, -5)}.junit.xml` : `${reportPath}.junit.xml`;
+}
+
+/**
+ * Renders the JSON report to JUnit XML through the engine's own command:
+ * `stellar-canary report <report.json> --format junit` (#423). Uses the
+ * engine's renderer so the format has exactly one definition; this Action
+ * never writes XML itself.
+ *
+ * Auxiliary by design: every failure mode — an engine release without the
+ * `report` command (it exits non-zero), a failing render, empty stdout, a
+ * missing report file, a spawn/timeout error — is captured as a `reason`
+ * instead of thrown, so the caller can warn and leave `status` untouched.
+ * `leadArgs` carries leading argv elements (the Windows test fixture runs
+ * the mock script through `node`); production callers pass nothing.
+ */
+export async function renderJUnitReport(
+  binaryPath: string,
+  reportPath: string,
+  timeoutMs: number,
+  leadArgs: readonly string[] = [],
+): Promise<JUnitRenderOutcome> {
+  const junitPath = junitFilePath(reportPath);
+  try {
+    const execution = await runCheck(
+      binaryPath,
+      [...leadArgs, "report", reportPath, "--format", "junit"],
+      timeoutMs,
+    );
+    if (execution.exitCode !== 0) {
+      const diagnostic = extractDiagnostic(execution.stderr);
+      return {
+        reason:
+          `the engine's report command exited with code ${String(execution.exitCode)}` +
+          (diagnostic !== "" ? `: ${diagnostic}` : ""),
+      };
+    }
+    if (execution.stdout.trim() === "") {
+      return { reason: "the engine's report command produced no output" };
+    }
+    fs.writeFileSync(junitPath, execution.stdout, "utf8");
+    return { path: junitPath };
+  } catch (error) {
+    return { reason: describeError(error) };
+  }
+}
+
 /**
  * Reads and validates a `baseline-report` file (#344).
  *

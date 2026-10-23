@@ -251,6 +251,22 @@ inputs:
     required: false
     default: "false"
 
+  junit-report:
+    description: >-
+      Render the parsed JSON report to JUnit XML using the engine's own
+      command (`stellar-canary report <report.json> --format junit`) and
+      expose the file as the `junit-report-path` output. Written next to the
+      JSON report (same directory), and included in the workflow artifact
+      when `upload-report` is `true`. Requires a Protocol-Canary release
+      whose `report` command supports `--format junit` (Protocol-Canary
+      #434; not in 0.2.0): with an older engine nothing is produced and a
+      warning is logged. Any failure of this step — unsupported engine,
+      non-zero exit, empty output, missing report file — is a warning only:
+      it never changes `status` and never fails the job. Defaults to `false`,
+      so the default behaviour is unchanged.
+    required: false
+    default: "false"
+
   generate-receipt:
     description: >-
       Generate a machine-readable Execution Receipt (`receiptVersion: 1`)
@@ -333,6 +349,13 @@ outputs:
       Absolute path to the generated Execution Receipt JSON. Only set when
       `generate-receipt` is `true` and Canary produced a parseable report;
       unset otherwise, including on an execution failure.
+  junit-report-path:
+    description: >-
+      Absolute path to the generated JUnit XML file. Only set when
+      `junit-report` is `true` and the engine's `report --format junit`
+      command succeeded; unset otherwise (input disabled, engine without
+      the command, or a failed/empty render) and on an execution failure.
+      A failed render is always a warning, never a status change.
 
 runs:
   using: node24

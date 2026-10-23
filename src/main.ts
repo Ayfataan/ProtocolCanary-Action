@@ -26,6 +26,7 @@ import {
   extractDiagnostic,
   fixtureSurfaceCacheDirGateFailure,
   loadBaselineReport,
+  renderJUnitReport,
   runCheck,
 } from "./runner";
 import { renderExecutionFailureMarkdown, renderSummaryMarkdown, writeSummary } from "./summary";
@@ -335,8 +336,30 @@ export async function run(): Promise<void> {
   core.setOutput("pack-digest", packIdentity.digest ?? "");
   core.setOutput("report", reportPath);
 
+  // #423: optional JUnit rendering through the engine's own `report` command,
+  // before the artifact upload so the XML ships with the JSON report. Like
+  // the artifact and the receipt, it is auxiliary: any failure (an engine
+  // release without the command, a non-zero exit, empty output, a missing
+  // report file) is a warning only and can never change `status` or fail the
+  // job.
+  let junitPath: string | undefined;
+  if (inputs.junitReport) {
+    const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
+    if (junit.path !== undefined) {
+      junitPath = junit.path;
+      core.setOutput("junit-report-path", junit.path);
+      core.info(`Wrote JUnit report to ${junit.path}.`);
+    } else {
+      core.warning(
+        `JUnit report not produced: ${junit.reason ?? "unknown reason"}. The compatibility ` +
+          "result and status are unchanged. Rendering requires a Protocol-Canary release whose " +
+          "`report` command supports `--format junit` (Protocol-Canary #434).",
+      );
+    }
+  }
+
   if (inputs.uploadReport) {
-    await uploadReport(reportPath, artifactDifferentiator(inputs));
+    await uploadReport(reportPath, artifactDifferentiator(inputs), junitPath === undefined ? [] : [junitPath]);
   }
 
   // #362: strictly opt-in, and auxiliary like the report artifact. A receipt

@@ -46,6 +46,7 @@ const INPUT_KEYS = [
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_JUNIT-REPORT",
 ];
 
 function clearInputs(): void {
@@ -83,6 +84,7 @@ describe("getInputs", () => {
       baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      junitReport: false,
       strictIntegrity: false,
     });
   });
@@ -779,6 +781,28 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       const inputs = getInputs();
       expect(inputs.fixture).toBe("-weird id.v1/x");
       expect(inputs.cacheDir).toBe("-cache dir/./nested");
+    });
+  });
+
+  describe("junit-report input (#423)", () => {
+    it("defaults to false", () => {
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it.each([["true"], ["True"], ["TRUE"]])("parses %j as enabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(true);
+    });
+
+    it.each([["false"], ["False"], [""]])("parses %j as disabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it("rejects an undocumented boolean form by name", () => {
+      process.env["INPUT_JUNIT-REPORT"] = "yes";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"junit-report"/);
     });
   });
 });
