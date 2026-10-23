@@ -1003,21 +1003,87 @@ async function extractPrebuiltArchive(archivePath: string, destDir: string): Pro
   }
 }
 
-/** Recursively locates the `stellar-canary` executable inside an extracted
- * archive, which may or may not wrap it in a top-level directory. */
-function findExtractedBinary(dir: string, name: string): string | undefined {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      const nested = findExtractedBinary(full, name);
-      if (nested !== undefined) {
-        return nested;
+interface DiscoveryResult {
+  binaryPath?: string | undefined;
+  errorReason?: string | undefined;
+}
+
+/**
+ * Discovers the target executable inside an extracted directory. Accepts
+ * exactly one regular file matching `targetName`. Rejects symlinks,
+ * directories, path escapes, missing binaries, and duplicate binaries.
+ */
+function discoverExtractedBinary(extractDir: string, targetName: string): DiscoveryResult {
+  const canonicalExtractDir = path.resolve(extractDir);
+  const foundBinaries: string[] = [];
+  let hasUnsafeEntry = false;
+
+  function traverse(currentDir: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch {
+      hasUnsafeEntry = true;
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
+      const resolvedPath = path.resolve(fullPath);
+
+      if (!resolvedPath.startsWith(canonicalExtractDir + path.sep) && resolvedPath !== canonicalExtractDir) {
+        hasUnsafeEntry = true;
+        continue;
       }
-    } else if (entry.isFile() && entry.name === name) {
-      return full;
+
+      let lstat: fs.Stats;
+      try {
+        lstat = fs.lstatSync(fullPath);
+      } catch {
+        hasUnsafeEntry = true;
+        continue;
+      }
+
+      if (lstat.isSymbolicLink()) {
+        hasUnsafeEntry = true;
+        continue;
+      }
+
+      if (lstat.isDirectory()) {
+        if (entry.name === targetName) {
+          hasUnsafeEntry = true;
+        } else {
+          traverse(fullPath);
+        }
+      } else if (lstat.isFile()) {
+        if (entry.name === targetName) {
+          foundBinaries.push(fullPath);
+        }
+      } else if (entry.name === targetName) {
+        hasUnsafeEntry = true;
+      }
     }
   }
-  return undefined;
+
+  traverse(extractDir);
+
+  if (hasUnsafeEntry) {
+    return {
+      errorReason: "contains invalid or unsafe entries (symlinks, directories, or path escapes)",
+    };
+  }
+  if (foundBinaries.length === 0) {
+    return {
+      errorReason: `contains no ${targetName} executable`,
+    };
+  }
+  if (foundBinaries.length > 1) {
+    return {
+      errorReason: `contains multiple ${targetName} executables`,
+    };
+  }
+
+  return { binaryPath: foundBinaries[0] };
 }
 
 /**
@@ -1101,6 +1167,10 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "protocolcanary-prebuilt-"));
   const archivePath = path.join(stagingDir, assetName);
   const installDir = path.join(toolCacheRoot(), "stellar-canary", resolved.version, process.arch);
+  const parentDir = path.dirname(installDir);
+  fs.mkdirSync(parentDir, { recursive: true });
+  const extractTmpDir = fs.mkdtempSync(path.join(parentDir, ".tmp-extract-"));
+
   try {
     try {
       await httpsGetFile(downloadUrl, archivePath, MAX_DOWNLOAD_REDIRECTS);
@@ -1128,7 +1198,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
     }
 
     try {
-      await extractPrebuiltArchive(archivePath, installDir);
+      await extractPrebuiltArchive(archivePath, extractTmpDir);
     } catch (error) {
       core.warning(
         `Could not extract the prebuilt Protocol-Canary asset ${assetName}: ` +
@@ -1137,16 +1207,23 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
       return undefined;
     }
 
-    const extracted = findExtractedBinary(installDir, binaryName());
-    if (extracted === undefined) {
+    const discovery = discoverExtractedBinary(extractTmpDir, binaryName());
+    if (discovery.binaryPath === undefined) {
       core.warning(
-        `The extracted prebuilt archive ${assetName} contains no ${binaryName()} executable; ` +
+        `The extracted prebuilt archive ${assetName} ${discovery.errorReason ?? "is invalid"}; ` +
           "falling back to a source install.",
       );
       return undefined;
     }
+    const extracted = discovery.binaryPath;
+
     if (process.platform !== "win32") {
-      fs.chmodSync(extracted, 0o755);
+      try {
+        fs.chmodSync(extracted, 0o755);
+      } catch {
+        core.warning(`Could not set executable permissions on ${extracted}; falling back to a source install.`);
+        return undefined;
+      }
     }
 
     const version = await getInstalledVersion(extracted);
@@ -1158,10 +1235,25 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
       return undefined;
     }
 
-    core.addPath(path.dirname(extracted));
+    const relativeBinaryPath = path.relative(extractTmpDir, extracted);
+
+    try {
+      fs.rmSync(installDir, { recursive: true, force: true });
+      fs.renameSync(extractTmpDir, installDir);
+    } catch (error) {
+      core.warning(
+        `Failed to move extracted prebuilt asset into ${installDir}: ` +
+          `${error instanceof Error ? error.message : String(error)}; falling back to a source install.`,
+      );
+      return undefined;
+    }
+
+    const finalBinaryPath = path.join(installDir, relativeBinaryPath);
+    core.addPath(path.dirname(finalBinaryPath));
     core.info(`Installed stellar-canary ${version} from the prebuilt release asset ${assetName} into ${installDir}.`);
-    return { binaryPath: extracted, version };
+    return { binaryPath: finalBinaryPath, version };
   } finally {
+    fs.rmSync(extractTmpDir, { recursive: true, force: true });
     fs.rmSync(stagingDir, { recursive: true, force: true });
   }
 }

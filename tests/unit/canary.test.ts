@@ -1519,6 +1519,126 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("Unsupported platform linux-arm"));
       expect(spawnMock).toHaveBeenCalled();
     });
+
+    describe("issue #509 — secure prebuilt extraction & binary discovery", () => {
+      it("rejects archives with symlinks in the extracted contents", async () => {
+        const archiveBytes = Buffer.from("symlink-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(dest, { recursive: true });
+          fs.writeFileSync(path.join(dest, "real-binary"), "executable");
+          try {
+            fs.symlinkSync("real-binary", path.join(dest, "stellar-canary"));
+          } catch {
+            // fall back if symlinks not supported on test host
+          }
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains invalid or unsafe entries"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("rejects archives where stellar-canary is a directory instead of a regular file", async () => {
+        const archiveBytes = Buffer.from("dir-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(path.join(dest, "stellar-canary"), { recursive: true });
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains invalid or unsafe entries"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("rejects archives with multiple stellar-canary binaries", async () => {
+        const archiveBytes = Buffer.from("duplicate-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(path.join(dest, "dir1"), { recursive: true });
+          fs.mkdirSync(path.join(dest, "dir2"), { recursive: true });
+          fs.writeFileSync(path.join(dest, "dir1", "stellar-canary"), "bin1");
+          fs.writeFileSync(path.join(dest, "dir2", "stellar-canary"), "bin2");
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains multiple stellar-canary executables"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("falls back to source install and preserves previous installation when extraction fails", async () => {
+        const archiveBytes = Buffer.from("extract-fail-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockExecWithFakeTar((_archive, _dest) => {
+          // Simulate tar failure by throwing
+          throw new Error("tar exit code 1");
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("Could not extract the prebuilt Protocol-Canary asset"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+    });
   });
 });
 

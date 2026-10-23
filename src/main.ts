@@ -222,8 +222,27 @@ export async function run(): Promise<void> {
   }
 
   const reportPath = reportFilePath();
+  let reportWritten = false;
+  let reportWriteError: string | undefined;
+
   if (execution.stdout.trim() !== "") {
-    fs.writeFileSync(reportPath, execution.stdout, "utf8");
+    try {
+      fs.writeFileSync(reportPath, execution.stdout, "utf8");
+      reportWritten = true;
+    } catch (error) {
+      const err = error as { code?: string };
+      reportWriteError = typeof err?.code === "string" ? err.code : describeError(error);
+      core.warning(
+        `Failed to write JSON report to ${reportPath} (${reportWriteError}): report artifact will not be uploaded.`,
+      );
+      try {
+        if (fs.existsSync(reportPath)) {
+          fs.rmSync(reportPath, { force: true });
+        }
+      } catch {
+        // Cleanup failure must never abort execution
+      }
+    }
   }
 
   if (execution.exitCode === null) {
@@ -308,6 +327,7 @@ export async function run(): Promise<void> {
         // Reproduction command (issue #416): the exact argument array the
         // engine was invoked with, so a reader can rerun the same check.
         engineArgs,
+        reportWriteError,
       });
     await writeSummary(summaryMarkdown);
     if (inputs.prComment) {
@@ -352,7 +372,9 @@ export async function run(): Promise<void> {
   core.setOutput("pack-protocol", packIdentity.protocol === undefined ? "" : String(packIdentity.protocol));
   core.setOutput("pack-version", packIdentity.version ?? "");
   core.setOutput("pack-digest", packIdentity.digest ?? "");
-  core.setOutput("report", reportPath);
+  if (reportWritten) {
+    core.setOutput("report", reportPath);
+  }
 
   // #423: optional JUnit rendering through the engine's own `report` command,
   // before the artifact upload so the XML ships with the JSON report. Like
@@ -361,7 +383,7 @@ export async function run(): Promise<void> {
   // report file) is a warning only and can never change `status` or fail the
   // job.
   let junitPath: string | undefined;
-  if (inputs.junitReport) {
+  if (inputs.junitReport && reportWritten) {
     const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
     if (junit.path !== undefined) {
       junitPath = junit.path;
@@ -376,7 +398,7 @@ export async function run(): Promise<void> {
     }
   }
 
-  if (inputs.uploadReport) {
+  if (inputs.uploadReport && reportWritten) {
     await uploadReport(reportPath, artifactDifferentiator(inputs), junitPath === undefined ? [] : [junitPath]);
   }
 

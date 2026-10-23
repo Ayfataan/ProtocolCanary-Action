@@ -66,7 +66,10 @@ which:
   fetches and runs;
 - verifies the installed or cached binary against the checksum manifest
   published with the release, when one exists, and refuses to use a binary
-  that does not match (see [Checksum verification](#checksum-verification)).
+  that does not match (see [Checksum verification](#checksum-verification));
+- extracts prebuilt archives into a fresh temporary directory, validating that
+  exactly one regular `stellar-canary` binary exists and rejecting symlinks,
+  path escapes, or duplicate binaries before atomic placement into the tool cache.
 
 ### Checksum verification
 
