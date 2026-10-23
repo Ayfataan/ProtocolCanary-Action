@@ -9,6 +9,17 @@ Node 24. The root [`.nvmrc`](.nvmrc) pins it (`nvm use`), matching the
 code and local setup should target 24. npm is the package manager; the
 lockfile (`package-lock.json`) is committed and authoritative.
 
+Three command-line tools must also be on `PATH`: `bash`, `jq`, and
+`python3`. The reusable-workflow conformance tests
+(`tests/unit/reusable-workflow-conformance.test.ts`) execute the shipped
+step scripts with `bash`, parse the GitHub artifacts listing with `jq`,
+and build and unpack the zip fixtures with `python3`. GitHub-hosted
+runners ship all three. When one is missing on a local machine, exactly
+the tests that need it are skipped with a message naming the tool; when
+one is missing in CI (the `CI` environment variable is set), that test
+file fails with a single error naming it instead, so a runner image that
+loses a tool can never silently skip the conformance tests.
+
 ```bash
 npm ci
 npm run audit
