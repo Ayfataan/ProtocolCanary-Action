@@ -85,6 +85,14 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- A rejected `rpc-url` no longer echoes the value it rejected. The error for a
+  URL with the wrong scheme now shows the scheme, host, port and path with
+  userinfo replaced by `[REDACTED]` and any query string or fragment dropped
+  (a recognised token in the path is masked too), and the error for a value
+  that cannot be parsed as a URL reports only its length and whether it
+  contains whitespace. Previously both messages printed the whole value, so a
+  credential in a mistyped endpoint reached the run log and the failure
+  annotation (#510).
 - Redact recognized secrets, strip control characters, and bound engine diagnostics
   in failure annotations and execution-failure summaries. Sanitize failure reasons
   as well, and redact before selecting or truncating diagnostic text (#499).
