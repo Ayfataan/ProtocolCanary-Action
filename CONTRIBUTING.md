@@ -111,14 +111,22 @@ the codebase, these thresholds are ratcheted upward. Run `npm run test:coverage`
 locally to verify your changes satisfy the coverage gate.
 
 Unit and integration tests must never require network access or a real
-`stellar-canary` binary: they run against
+`stellar-canary` binary by default: they run against
 [`tests/fixtures/mock-canary.cjs`](tests/fixtures/mock-canary.cjs), a fake
 CLI that simulates every documented result state (`pass`, `warning`,
 `fail`, `config-error`, `rpc-error`, `fixture-error`, `internal-error`,
 `malformed-json`, `timeout`) via the `MOCK_CANARY_SCENARIO` environment
-variable. `.github/workflows/integration.yml` is the only place this
-repository talks to a real Canary build and a real Testnet endpoint, and it
-never gates a pull request.
+variable. Real-engine checks run separately: `.github/workflows/weekly-live.yml`
+runs on a weekly schedule or manual dispatch against a real Canary build and
+live Testnet/Futurenet endpoints (network required);
+`.github/workflows/engine-compat.yml` runs only on manual dispatch, builds
+real engines from source, and exercises offline scenarios without network
+access; `tests/integration/real-engine.test.ts` is skipped unless
+`STELLAR_CANARY_BIN` points to a real engine. The `smoke-test` job in
+`.github/workflows/release.yml` runs the published Action with a real engine
+after a version-tag release or on manual dispatch. None of these real-engine
+workflows gates a pull request; `.github/workflows/ci.yml` provides the
+required pull-request checks.
 
 For tests that need to observe what the Action reports through
 `@actions/core`, use the partial-mock convention described in [Mocking
