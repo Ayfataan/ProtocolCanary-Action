@@ -23,11 +23,20 @@ permissions:
 
 jobs:
   real-engine:
-    name: Action against Protocol-Canary ${{ inputs.engine_ref }} and ${{ inputs.legacy_ref }}
-    runs-on: ubuntu-latest
+    name: Action against Protocol-Canary ${{ inputs.engine_ref }} and ${{ inputs.legacy_ref }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout Action
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -58,8 +67,14 @@ jobs:
         run: |
           (cd engine-under-test && cargo build --release --locked)
           (cd engine-legacy && cargo build --release --locked)
-          echo "STELLAR_CANARY_BIN=$PWD/engine-under-test/target/release/stellar-canary" >> "$GITHUB_ENV"
-          echo "STELLAR_CANARY_LEGACY_BIN=$PWD/engine-legacy/target/release/stellar-canary" >> "$GITHUB_ENV"
+          bin_suffix=""
+          root_dir="$PWD"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin_suffix=".exe"
+            root_dir="$(pwd -W 2>/dev/null || cygpath -m "$PWD" 2>/dev/null || echo "$PWD")"
+          fi
+          echo "STELLAR_CANARY_BIN=$root_dir/engine-under-test/target/release/stellar-canary$bin_suffix" >> "$GITHUB_ENV"
+          echo "STELLAR_CANARY_LEGACY_BIN=$root_dir/engine-legacy/target/release/stellar-canary$bin_suffix" >> "$GITHUB_ENV"
 
       - name: Report the engine versions being tested
         run: |

@@ -1,4 +1,5 @@
 import type { CanaryReport } from "./output";
+import { REDACTED, redactSecrets } from "./redact";
 
 /**
  * The Execution Receipt model (`receiptVersion: 1`).
@@ -60,21 +61,68 @@ function asString(value: unknown): string | undefined {
 }
 
 /**
+ * Absolute POSIX paths (`/home/runner/work/...`, `/tmp/...`) as two or more
+ * root-anchored path segments. A single segment (`/main`) is not enough:
+ * it occurs in ordinary identifiers, while real filesystem paths always
+ * carry at least a directory below the root.
+ */
+const POSIX_ABSOLUTE_PATH_PATTERN = /(?:\/[A-Za-z0-9._+-]+){2,}/g;
+
+/**
+ * Absolute Windows paths (`C:\a\runner\...`): a drive letter, `:\`, and at
+ * least one path character. Stops at whitespace and shell metacharacters so
+ * a masked path cannot swallow the rest of the field.
+ */
+const WINDOWS_ABSOLUTE_PATH_PATTERN = /\b[A-Za-z]:\\[^\s"'`<>|]+/g;
+
+/**
+ * The CF-08 redaction boundary for receipt string fields (#364).
+ *
+ * Receipts are published as workflow artifacts readable by anyone who can
+ * see the repository, so every string that leaves this module passes through
+ * here: recognised credential shapes (GitHub tokens, Stellar secret seeds,
+ * URL credentials, sensitive environment values) are masked via
+ * `redactSecrets` from `src/redact.ts`, and machine-specific absolute
+ * filesystem paths are replaced with the same `[REDACTED]` placeholder.
+ *
+ * `redactSecrets` is used rather than `redact` because a receipt is a pure
+ * JSON artifact, never a log line: `escapeWorkflowCommands` would corrupt
+ * legitimate values (a digest like `sha256:...` contains `:`) with
+ * backslash escapes that no JSON consumer can undo.
+ *
+ * The function is idempotent, which lets {@link buildReceipt} scrub at the
+ * source and {@link serializeReceipt} scrub again at the byte boundary
+ * without the two passes interfering. Semantic identifiers that receipts
+ * actually carry — hex commit SHAs, `sha256:` digests, semver, ISO-8601
+ * timestamps — match none of these patterns and are preserved verbatim.
+ */
+function redactReceiptString(value: string): string {
+  return redactSecrets(value)
+    .replace(POSIX_ABSOLUTE_PATH_PATTERN, REDACTED)
+    .replace(WINDOWS_ABSOLUTE_PATH_PATTERN, REDACTED);
+}
+
+/**
  * Builds the provenance receipt for one Canary report. Missing or
  * ill-typed fields fall back to `"unknown"`; this never throws, whatever
  * shape the engine produced.
+ *
+ * Every string field is passed through the CF-08 redaction boundary
+ * ({@link redactReceiptString}) at the source, so a receipt object is already
+ * free of runner paths and credential-shaped values — not just its
+ * serialization.
  */
 export function buildReceipt(report: CanaryReport, timestamp: string = new Date().toISOString()): ExecutionReceipt {
   const source = report as unknown as ReceiptSourceFields;
   return {
     receiptVersion: RECEIPT_VERSION,
-    engineVersion: asString(source.toolVersion) ?? UNKNOWN,
-    engineCommit: asString(source.engineCommit) ?? UNKNOWN,
-    packDigest: asString(source.packDigest) ?? UNKNOWN,
+    engineVersion: redactReceiptString(asString(source.toolVersion) ?? UNKNOWN),
+    engineCommit: redactReceiptString(asString(source.engineCommit) ?? UNKNOWN),
+    packDigest: redactReceiptString(asString(source.packDigest) ?? UNKNOWN),
     protocol: typeof source.targetProtocol === "number" ? source.targetProtocol : UNKNOWN,
     observedProtocol:
       typeof source.network?.observedProtocol === "number" ? source.network.observedProtocol : UNKNOWN,
-    timestamp,
+    timestamp: redactReceiptString(timestamp),
   };
 }
 
@@ -83,16 +131,25 @@ export function buildReceipt(report: CanaryReport, timestamp: string = new Date(
  * documented order (regardless of the caller object's own key order), with
  * stable two-space indentation, so the same receipt always yields the same
  * bytes.
+ *
+ * The four string fields are re-scrubbed through {@link redactReceiptString}
+ * here at the byte boundary — receipts are also consumed by callers that
+ * hand-construct the object (e.g. parsed from an artifact), and the redaction
+ * must not be avoidable by skipping {@link buildReceipt}. The function remains
+ * idempotent for receipts that already came from `buildReceipt`. The protocol
+ * fields are not scrubbed: by construction they are either numeric or the
+ * `"unknown"` sentinel, and stringifying them would corrupt a legitimate
+ * value rather than protect one.
  */
 export function serializeReceipt(receipt: ExecutionReceipt): string {
   const ordered: ExecutionReceipt = {
     receiptVersion: receipt.receiptVersion,
-    engineVersion: receipt.engineVersion,
-    engineCommit: receipt.engineCommit,
-    packDigest: receipt.packDigest,
+    engineVersion: redactReceiptString(receipt.engineVersion),
+    engineCommit: redactReceiptString(receipt.engineCommit),
+    packDigest: redactReceiptString(receipt.packDigest),
     protocol: receipt.protocol,
     observedProtocol: receipt.observedProtocol,
-    timestamp: receipt.timestamp,
+    timestamp: redactReceiptString(receipt.timestamp),
   };
   return JSON.stringify(ordered, null, 2);
 }

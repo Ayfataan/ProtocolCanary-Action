@@ -4,13 +4,24 @@ import * as exec from "@actions/exec";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as https from "node:https";
+import type { ClientRequest, IncomingMessage } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+  consumeResponse,
+  MAX_API_RESPONSE_BYTES,
+  MAX_CHECKSUM_MANIFEST_BYTES,
+  MAX_RELEASE_ASSET_BYTES,
+  readResponseText,
+} from "./http-response";
+
+import {
   CanaryExecutionFailedError,
   CanaryNotFoundError,
+  ChecksumMismatchError,
   InstallationFailedError,
+  InvalidInputError,
   TimeoutError,
 } from "./errors";
 import { resolveGithubToken } from "./inputs";
@@ -100,14 +111,27 @@ const MAX_DOWNLOAD_REDIRECTS = 5;
 /** GETs a URL as binary content and writes it to `destPath`, following up to
  * `redirectsLeft` 3xx redirects (GitHub release downloads redirect from
  * `github.com` to a signed object host). Rejects on any non-2xx/3xx response,
- * a timeout, a redirect without a `Location`, or a write failure. */
-function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Promise<void> {
+ * a timeout, a redirect without a `Location`, an oversized/incomplete body,
+ * or a write failure. Failed downloads are closed and removed before rejection. */
+export function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let request: ClientRequest | undefined = undefined;
+    let file: fs.WriteStream | undefined;
+    let responseBody: IncomingMessage | undefined;
     const fail = (error: Error): void => {
-      if (!settled) {
-        settled = true;
-        reject(error);
+      if (settled) return;
+      settled = true;
+      responseBody?.destroy();
+      request?.destroy();
+      const removePartial = (): void => {
+        fs.rm(destPath, { force: true }, (cleanupError) => reject(cleanupError ?? error));
+      };
+      if (file !== undefined && !file.closed) {
+        file.once("close", removePartial);
+        file.destroy();
+      } else {
+        removePartial();
       }
     };
     const succeed = (): void => {
@@ -117,7 +141,7 @@ function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Pro
       }
     };
 
-    const request = https.get(url, { headers: { "User-Agent": "ProtocolCanary-Action" }, timeout: PREBUILT_DOWNLOAD_TIMEOUT_MS }, (response) => {
+    request = https.get(url, { headers: { "User-Agent": "ProtocolCanary-Action" }, timeout: PREBUILT_DOWNLOAD_TIMEOUT_MS }, (response) => {
       const status = response.statusCode ?? 0;
       if (status >= 300 && status < 400) {
         const location = response.headers.location;
@@ -141,25 +165,21 @@ function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Pro
         fail(new Error(`GitHub returned status ${String(status)} for ${url}`));
         return;
       }
-      // Chunks are written manually (the same event style as
-      // `httpsGetText`) rather than via `pipe`, keeping the download
-      // handler symmetric with the text getter's mocked response surface.
-      const file = fs.createWriteStream(destPath);
-      file.on("error", fail);
-      response.on("data", (chunk: Buffer | string) => {
-        file.write(chunk);
-      });
-      response.on("error", (error: Error) => {
-        file.destroy();
-        fail(error);
-      });
-      response.on("end", () => {
-        file.end();
-      });
-      file.on("finish", succeed);
+      responseBody = response;
+      file = fs.createWriteStream(destPath);
+      const destination = file;
+      destination.on("error", fail);
+      destination.on("finish", succeed);
+      destination.on("drain", () => response.resume());
+      consumeResponse(response, url, MAX_RELEASE_ASSET_BYTES, (chunk) => {
+        if (!destination.write(chunk)) response.pause();
+      }).then(() => {
+        if (!settled) destination.end();
+      }).catch(fail);
     });
+    if (settled) request.destroy();
     request.on("timeout", () => {
-      request.destroy(new Error(`timed out downloading ${url}`));
+      request?.destroy(new Error(`timed out downloading ${url}`));
     });
     request.on("error", fail);
   });
@@ -176,8 +196,9 @@ interface ReleaseAsset {
 }
 
 /** GETs a URL as text, authenticating when a token is available and the host is api.github.com.
- * Rejects on any non-200 response, timeout, or transport error. */
-function httpsGetText(url: string, token: string | undefined): Promise<string> {
+ * Rejects on any non-200 response, timeout, transport error, or oversized/
+ * incomplete body. Manifest callers supply their smaller dedicated limit. */
+export function httpsGetText(url: string, token: string | undefined, maxBytes: number = MAX_API_RESPONSE_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     let hostname: string;
     try {
@@ -201,13 +222,9 @@ function httpsGetText(url: string, token: string | undefined): Promise<string> {
         reject(new Error(`GitHub returned status ${String(response.statusCode)} for ${url}`));
         return;
       }
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk: string) => {
-        body += chunk;
-      });
-      response.on("end", () => {
-        resolve(body);
+      readResponseText(response, url, maxBytes).then(resolve).catch((error: unknown) => {
+        request.destroy();
+        reject(error);
       });
     });
     request.on("timeout", () => {
@@ -265,7 +282,7 @@ async function lookupPublishedChecksums(version: string, explicitToken?: string)
     if (checksumAsset === undefined) {
       return undefined;
     }
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token);
+    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token, MAX_CHECKSUM_MANIFEST_BYTES);
     const entries = parseChecksumManifest(manifest);
     return entries.size > 0 ? entries : undefined;
   } catch (error) {
@@ -362,6 +379,247 @@ export async function sha256File(filePath: string): Promise<string> {
   });
 }
 
+/** Canonical fixture-pack digest (CF-02): the `sha256:` scheme prefix
+ * followed by exactly 64 lowercase hexadecimal characters — the registry's
+ * canonical spelling of a pack digest. Anything else is not canonical and
+ * cannot be compared. */
+const PACK_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * True when `value` is a canonical CF-02 pack digest (`sha256:<64 lowercase
+ * hex>`). The scheme prefix and the lowercase hex body are both required, so
+ * a bare hex string or an uppercase-hex digest is rejected rather than guessed
+ * at.
+ */
+export function isCanonicalPackDigest(value: unknown): value is string {
+  return typeof value === "string" && PACK_DIGEST_PATTERN.test(value);
+}
+
+/**
+ * Computes the CF-02 canonical pack digest of an extracted fixture pack:
+ * SHA-256 over one `sha256:<file-content-digest>  <relative-path>` line per
+ * regular file below `rootDir`, in sorted path order — a pure function of the
+ * pack's contents, independent of directory iteration order.
+ */
+export function computePackDigest(rootDir: string): string {
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        files.push(path.relative(rootDir, full).split(path.sep).join("/"));
+      }
+    }
+  };
+  walk(rootDir);
+  files.sort();
+  const hash = crypto.createHash("sha256");
+  for (const relativePath of files) {
+    const contentDigest = crypto.createHash("sha256").update(fs.readFileSync(path.join(rootDir, relativePath))).digest("hex");
+    hash.update(`sha256:${contentDigest}  ${relativePath}\n`);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+/**
+ * Verifies the canonical pack digest of an extracted fixture pack against the
+ * expected registry digest, throwing {@link ChecksumMismatchError} when the
+ * expected value is not canonical or when the computed digest diverges — so a
+ * tampered or truncated pack is never used.
+ *
+ * Returns the computed digest when it matches.
+ */
+export function verifyPackDigest(rootDir: string, expectedDigest: string): string {
+  const computed = computePackDigest(rootDir);
+  if (!isCanonicalPackDigest(expectedDigest)) {
+    throw new ChecksumMismatchError(
+      `The expected fixture-pack digest ${JSON.stringify(expectedDigest)} is not a canonical CF-02 pack digest ` +
+        `(sha256:<64 lowercase hex>); refusing to compare it.`,
+    );
+  }
+  if (computed !== expectedDigest) {
+    throw new ChecksumMismatchError(
+      `Checksum verification failed for the fixture pack at ${rootDir}: expected pack digest ${expectedDigest}, ` +
+        `but the extracted pack hashes to ${computed}. Refusing to use it.`,
+    );
+  }
+  return computed;
+}
+
+/**
+ * Verifies a downloaded fixture pack archive against its published SHA-256
+ * checksum *before* the archive is ever handed to the extractor: a corrupted
+ * or truncated download fails here, before extraction, so no partial artifact
+ * is ever unpacked. Returns the verified digest.
+ */
+export async function verifyDownloadedArchive(archivePath: string, expectedChecksum: string): Promise<string> {
+  const actual = await sha256File(archivePath);
+  if (actual !== expectedChecksum) {
+    throw new ChecksumMismatchError(
+      `Checksum verification failed for the downloaded pack archive ${path.basename(archivePath)}: expected ` +
+        `SHA-256 ${expectedChecksum}, but the download hashes to ${actual}. Refusing to extract it.`,
+    );
+  }
+  return actual;
+}
+
+/**
+ * Verifies a downloaded fixture pack end to end before it is used (#339,
+ * #346): the archive must hash to the published checksum and the extracted
+ * tree must carry the canonical registry pack digest. The archive checksum is
+ * verified first, so a corrupted download aborts before any extraction runs;
+ * the canonical pack digest is then checked, and any divergence throws
+ * {@link ChecksumMismatchError}.
+ */
+export async function downloadAndVerifyPack(
+  archivePath: string,
+  expectedChecksum: string,
+  extractedDir: string,
+  expectedPackDigest?: string,
+): Promise<string> {
+  // Archive checksum first: a corrupted or truncated download throws here,
+  // before the archive is ever handed to the extractor.
+  await verifyDownloadedArchive(archivePath, expectedChecksum);
+  // Then the canonical pack digest of the extracted tree, if one was provided.
+  if (expectedPackDigest !== undefined) {
+    return verifyPackDigest(extractedDir, expectedPackDigest);
+  }
+  return computePackDigest(extractedDir);
+}
+
+/** GitHub API repository that publishes the canonical fixture packs
+ * (ProtocolCanary-Fixtures), as opposed to the engine repository that
+ * publishes the prebuilt binaries this Action installs from. */
+const FIXTURE_PACKS_API_REPO = "StellarCanary/ProtocolCanary-Fixtures";
+
+/**
+ * GitHub REST API base URL for a repository, e.g.
+ * `https://api.github.com/repos/StellarCanary/Protocol-Canary`. Derived from
+ * the `owner/name` form so the engine and the fixtures registry share one
+ * helper.
+ */
+function githubApiBase(repo: string): string {
+  const separator = repo.indexOf("/");
+  const owner = separator === -1 ? repo : repo.slice(0, separator);
+  const name = separator === -1 ? "" : repo.slice(separator + 1);
+  return `https://api.github.com/repos/${owner}/${name}`;
+}
+
+/**
+ * Fetches the release assets of any published release (the engine releases
+ * this Action installs binaries from, the fixture-pack releases whose
+ * archives are verified here) over the authenticated GitHub API.
+ */
+async function fetchReleaseAssetsFor(repo: string, version: string): Promise<ReleaseAsset[]> {
+  const releaseBody = await httpsGetText(`${githubApiBase(repo)}/releases/tags/v${version}`, installApiToken());
+  const parsed = JSON.parse(releaseBody) as unknown;
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error(`unexpected release response shape for v${version}`);
+  }
+  const assets = (parsed as { assets?: unknown }).assets;
+  if (!Array.isArray(assets)) {
+    throw new Error(`release v${version} carries no asset list`);
+  }
+  return assets as ReleaseAsset[];
+}
+
+/**
+ * Fetches the published checksum manifest entries of any release (engine
+ * releases or fixture packs) over the authenticated GitHub API, keyed by file
+ * name. Returns `undefined` — never throws — when the release carries no
+ * checksum asset or the lookup cannot complete, so callers degrade exactly as
+ * the engine-side lookup does.
+ */
+async function lookupPublishedChecksumsFor(
+  repo: string,
+  version: string,
+  explicitToken?: string,
+): Promise<Map<string, string> | undefined> {
+  const token = resolveGithubToken(explicitToken);
+  try {
+    const releaseBody = await httpsGetText(`${githubApiBase(repo)}/releases/tags/v${version}`, token);
+    const parsed = JSON.parse(releaseBody) as unknown;
+    if (typeof parsed !== "object" || parsed === null) {
+      return undefined;
+    }
+    const assets = (parsed as { assets?: unknown }).assets;
+    if (!Array.isArray(assets)) {
+      return undefined;
+    }
+    const checksumAsset = (assets as ReleaseAsset[]).find(
+      (asset) =>
+        typeof asset.name === "string" &&
+        CHECKSUM_ASSET_PATTERN.test(asset.name) &&
+        typeof asset.browser_download_url === "string",
+    );
+    if (checksumAsset === undefined) {
+      return undefined;
+    }
+    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token);
+    const entries = parseChecksumManifest(manifest);
+    return entries.size > 0 ? entries : undefined;
+  } catch (error) {
+    core.debug(`Could not look up a published checksum for release v${version}: ${String(error)}`);
+    return undefined;
+  }
+}
+
+/** Looks up the published checksum entries of the engine repository. */
+
+/**
+ * Downloads the canonical fixture pack archive for a pack release tag,
+ * verifies it against the published checksum manifest and the canonical
+ * registry pack digest, extracts it, and cleans the staging directory up on
+ * every exit path (#339, #346).
+ *
+ * The archive checksum is verified *before* extraction, so a corrupted or
+ * truncated download aborts with a {@link ChecksumMismatchError} and never
+ * reaches the extractor; the extracted tree is then checked against the
+ * canonical pack digest. Any divergence throws {@link ChecksumMismatchError}.
+ *
+ * Returns the directory the extracted pack should be consumed from; the
+ * staging directory is removed once the verification succeeded, and on every
+ * failure path.
+ */
+export async function downloadVerifiedPack(version: string, protocol: number, token?: string): Promise<string> {
+  const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "protocolcanary-pack-"));
+  const archiveName = `protocol-${protocol}-${version}.tar.gz`;
+  const archivePath = path.join(stagingDir, archiveName);
+  let keepStaging = false;
+  try {
+    const assets = await fetchReleaseAssetsFor(FIXTURE_PACKS_API_REPO, version);
+    const archive = assets.find(
+      (asset) =>
+        typeof asset.name === "string" &&
+        (asset.name.endsWith(".tar.gz") || asset.name.endsWith(".zip")) &&
+        asset.name.includes(`protocol-${String(protocol)}`),
+    );
+    if (archive === undefined || typeof archive.name !== "string" || typeof archive.browser_download_url !== "string") {
+      throw new Error(`Release v${version} publishes no fixture pack archive for protocol ${String(protocol)}.`);
+    }
+    const checksums = await lookupPublishedChecksumsFor(FIXTURE_PACKS_API_REPO, version, token);
+    const expectedChecksum = checksums?.get(archive.name);
+    if (expectedChecksum === undefined) {
+      throw new Error(
+        `The release v${version} publishes no usable checksum entry for the fixture pack archive ${archive.name}; refusing to extract it.`,
+      );
+    }
+    await httpsGetFile(archive.browser_download_url, archivePath, MAX_DOWNLOAD_REDIRECTS);
+    await extractPrebuiltArchive(archivePath, stagingDir);
+    const digest = await downloadAndVerifyPack(archivePath, expectedChecksum, stagingDir);
+    core.info(`Verified fixture pack ${archive.name} (digest ${digest}) before extraction.`);
+    keepStaging = true;
+    return stagingDir;
+  } finally {
+    if (!keepStaging) {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    }
+  }
+}
+
+
 /**
  * Verifies an installed or cached binary against the checksum published with
  * its release, when one exists. When Protocol-Canary has not published a
@@ -372,7 +630,7 @@ export async function sha256File(filePath: string): Promise<string> {
  * With `strictIntegrity` (issue #372) the degrades are themselves fatal: the
  * run fails closed whenever integrity cannot be *proven*, not only when it
  * is disproven. Redirected and unencrypted manifest lookups surface through
- * {@link lookupPublishedChecksums} as "no manifest", so the strict branches
+ * {@link lookupPublishedChecksumsEngine} as "no manifest", so the strict branches
  * below also implement the D-11 boundary: no redirect is ever followed.
 >
  *
@@ -551,6 +809,176 @@ async function saveToCache(resolved: ResolvedVersion, binaryPath: string): Promi
   }
 }
 
+/** Provenance marker written inside a cached pack directory. */
+const PACK_MARKER_FILE = ".stellar-canary-pack.json";
+
+export interface PackMarker {
+  readonly protocol: number;
+  readonly packDigest: string;
+}
+
+/**
+ * Deterministic Actions-cache key for a verified fixture pack (#345). The
+ * protocol number scopes the key and the canonical digest makes it
+ * content-addressed, so a republished or mutated pack can never alias a
+ * cached one.
+ *
+ * @throws {InvalidInputError} When `protocol` is not a non-negative integer
+ * or `packDigest` is not a `sha256:<64 lowercase hex>` digest.
+ */
+export function packCacheKey(protocol: number, packDigest: string): string {
+  if (!Number.isInteger(protocol) || protocol < 0) {
+    throw new InvalidInputError(
+      `Invalid fixture-pack protocol ${String(protocol)}: expected a non-negative integer.`,
+    );
+  }
+  if (!PACK_DIGEST_PATTERN.test(packDigest)) {
+    throw new InvalidInputError(
+      `Invalid fixture-pack digest ${JSON.stringify(packDigest)}: expected the canonical form ` +
+        '"sha256:<64 lowercase hex characters>".',
+    );
+  }
+  return `stellar-canary-pack-${String(protocol)}-${packDigest}`;
+}
+
+/** Reads the provenance marker from a restored pack directory, if any. */
+function readPackMarker(directory: string): PackMarker | undefined {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(directory, PACK_MARKER_FILE), "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) {
+      return undefined;
+    }
+    const marker = parsed as Partial<PackMarker>;
+    if (typeof marker.protocol !== "number" || typeof marker.packDigest !== "string") {
+      return undefined;
+    }
+    return { protocol: marker.protocol, packDigest: marker.packDigest };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Writes the provenance marker that makes a cached pack self-describing. */
+function writePackMarker(directory: string, protocol: number, packDigest: string): void {
+  // Deterministic serialization: a fixed key order and no insignificant
+  // whitespace, so a cached marker is byte-identical for the same pack.
+  fs.writeFileSync(
+    path.join(directory, PACK_MARKER_FILE),
+    `${JSON.stringify({ protocol, packDigest })}\n`,
+    "utf8",
+  );
+}
+
+/**
+ * Attempts to restore a previously verified fixture pack from the Actions
+ * cache. Returns `true` only when the restored directory carries a provenance
+ * marker matching the requested protocol and digest; a missing marker, a
+ * mismatched one, a cache miss, an unavailable cache service, or a restore
+ * error all return `false` (and remove a corrupt restored directory) so the
+ * caller downloads a fresh, verified pack.
+ *
+ * Caching is a pure optimization: no failure here is ever surfaced as an
+ * error.
+ */
+export async function restoreVerifiedPack(
+  protocol: number,
+  packDigest: string,
+  directory: string,
+): Promise<boolean> {
+  const key = packCacheKey(protocol, packDigest);
+  if (!cache.isFeatureAvailable()) {
+    return false;
+  }
+  let hit: string | undefined;
+  try {
+    hit = await cache.restoreCache([directory], key);
+  } catch (error) {
+    core.debug(`Fixture-pack cache restore failed, continuing without it: ${String(error)}`);
+    return false;
+  }
+  if (hit === undefined) {
+    return false;
+  }
+
+  const marker = readPackMarker(directory);
+  if (marker === undefined || marker.protocol !== protocol || marker.packDigest !== packDigest) {
+    core.debug(
+      `Cached fixture pack at ${directory} (key: ${key}) failed provenance validation; ` +
+        "discarding it and downloading a fresh copy.",
+    );
+    fs.rmSync(directory, { recursive: true, force: true });
+    return false;
+  }
+
+  core.info(`Restored verified fixture pack for protocol ${String(protocol)} from cache (key: ${key}).`);
+  return true;
+}
+
+/**
+ * Saves a verified fixture pack directory to the Actions cache, writing the
+ * provenance marker first. Failures are swallowed after a `core.debug` log:
+ * a cache outage must never fail a run that already has a verified pack.
+ */
+export async function saveVerifiedPack(
+  protocol: number,
+  packDigest: string,
+  directory: string,
+): Promise<void> {
+  const key = packCacheKey(protocol, packDigest);
+  try {
+    writePackMarker(directory, protocol, packDigest);
+  } catch (error) {
+    core.debug(`Could not write the fixture-pack provenance marker, skipping cache save: ${String(error)}`);
+    return;
+  }
+  if (!cache.isFeatureAvailable()) {
+    return;
+  }
+  try {
+    await cache.saveCache([directory], key);
+  } catch (error) {
+    // A cache save conflict or service outage is not a run failure.
+    core.debug(`Fixture-pack cache save failed, ignoring: ${String(error)}`);
+  }
+}
+
+export type PackCacheOutcome = "cache-hit" | "downloaded";
+
+export interface VerifiedPackRequest {
+  /** Protocol version the pack is pinned to. */
+  readonly protocol: number;
+  /** Canonical `sha256:<64 hex>` digest of the verified pack. */
+  readonly packDigest: string;
+  /** Directory the caller owns; it is restored into or downloaded into. */
+  readonly directory: string;
+  /** Downloads, verifies, and extracts the pack into `directory`. */
+  readonly download: (directory: string) => Promise<void>;
+}
+
+/**
+ * Makes a verified fixture pack available in `request.directory`, restoring
+ * it from the Actions cache when a valid entry exists and otherwise invoking
+ * `request.download` (the checksum/digest-verifying downloader) and saving
+ * the result for later runs.
+ *
+ * A cache hit skips both download and extraction entirely. A cache miss,
+ * restore failure, or cached entry whose provenance marker does not match the
+ * requested protocol/digest all fall through to a fresh download.
+ */
+export async function ensureVerifiedPack(request: VerifiedPackRequest): Promise<PackCacheOutcome> {
+  if (await restoreVerifiedPack(request.protocol, request.packDigest, request.directory)) {
+    return "cache-hit";
+  }
+
+  // Start from a clean directory: a restore that was rejected (or a partial
+  // one) must not leave stale fixtures mixed into the fresh download.
+  fs.rmSync(request.directory, { recursive: true, force: true });
+  fs.mkdirSync(request.directory, { recursive: true });
+  await request.download(request.directory);
+  await saveVerifiedPack(request.protocol, request.packDigest, request.directory);
+  return "downloaded";
+}
+
 /**
  * Extracts a prebuilt archive into `destDir` with the runner's system `tar`
  * (GNU tar on Linux; bsdtar on macOS and Windows runners, which also handles
@@ -656,7 +1084,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
   }
   let expectedChecksum: string | undefined;
   try {
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, installApiToken());
+    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, installApiToken(), MAX_CHECKSUM_MANIFEST_BYTES);
     expectedChecksum = parseChecksumManifest(manifest).get(assetName);
   } catch (error) {
     core.debug(`Could not fetch the checksum manifest for ${assetName}: ${String(error)}`);
