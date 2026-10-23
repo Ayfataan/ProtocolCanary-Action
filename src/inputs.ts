@@ -7,6 +7,12 @@ import { ConfigNotFoundError, InvalidInputError } from "./errors";
 export interface ActionInputs {
   readonly protocol: number | undefined;
   readonly config: string | undefined;
+  /** Directory treated as Canary's project root (#348), resolved to an
+   * absolute path against the working directory; defaults to `.` (the
+   * workspace itself). Forwarded as `--project-root` only when it differs
+   * from the working directory — see {@link parseWorkingDirectory} and
+   * `buildCheckArgs` for why the default is deliberately not forwarded. */
+  readonly workingDirectory: string;
   readonly network: string | undefined;
   readonly networkPassphrase: string | undefined;
   readonly rpcUrl: string | undefined;
@@ -142,6 +148,7 @@ const PACK_VERSION_LIKE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-
 export function getInputs(): ActionInputs {
   const protocol = parseProtocol(core.getInput("protocol"));
   const config = parseConfig(core.getInput("config"));
+  const workingDirectory = parseWorkingDirectory(core.getInput("working-directory"));
   const network = optional(core.getInput("network"));
   const networkPassphrase = parseNetworkPassphrase(core.getInput("network-passphrase", { trimWhitespace: false }));
   const rpcUrl = parseRpcUrl(core.getInput("rpc-url"));
@@ -171,6 +178,18 @@ export function getInputs(): ActionInputs {
   if (githubToken !== undefined) {
     core.setSecret(githubToken);
   }
+  // A `working-directory` that resolves to the workspace itself is exactly
+  // what the engine already uses as its project root, so the default run is
+  // not forwarded anything and needs no explanation. Any other value changes
+  // what the engine treats as the project root and requires an engine that
+  // accepts `--project-root`; say so up front instead of leaving the user to
+  // infer it from a version-dependent CLI usage error.
+  if (workingDirectory !== path.resolve(".")) {
+    core.info(
+      `"working-directory" will be forwarded to Canary as --project-root (${JSON.stringify(workingDirectory)}). ` +
+        "This requires a Protocol-Canary release whose CLI supports --project-root; older releases reject the argument.",
+    );
+  }
   if (networkPassphrase !== undefined) {
     core.setSecret(networkPassphrase);
   }
@@ -194,6 +213,7 @@ export function getInputs(): ActionInputs {
   return {
     protocol,
     config,
+    workingDirectory,
     network,
     networkPassphrase,
     rpcUrl,
@@ -382,6 +402,45 @@ function parseConfig(raw: string): string | undefined {
     throw new InvalidInputError(
       `Invalid "config" input: ${JSON.stringify(value)}. Expected a path to a configuration ` +
         "file, but the path is a directory.",
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Validates the "working-directory" input (#348) as a path to an existing
+ * directory, resolved against the current working directory; defaults to
+ * `.` (the workspace itself) when unset or whitespace-only, matching the
+ * declared default in `action.yml`.
+ *
+ * Throws {@link InvalidInputError} — naming the input, quoting the value as
+ * written, and including the resolved path — when nothing exists at that
+ * path or when it exists but is not a directory (e.g. a regular file), so
+ * the mistake is caught here rather than surfacing later as an engine exit
+ * code 2 with no actionable path context.
+ *
+ * Returns the *resolved* path rather than the raw input, for the same
+ * reason {@link parseConfig} does: the directory this function validated is
+ * then forwarded to the CLI as `--project-root`, and the two must be the
+ * same path by construction regardless of the working directory the engine
+ * happens to inherit.
+ */
+function parseWorkingDirectory(raw: string): string {
+  const value = optional(raw) ?? ".";
+  const resolved = path.resolve(value);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    throw new InvalidInputError(
+      `Invalid "working-directory" input: ${JSON.stringify(value)}. Expected a path to an existing ` +
+        `directory, but no such path exists (resolved to ${JSON.stringify(resolved)}).`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new InvalidInputError(
+      `Invalid "working-directory" input: ${JSON.stringify(value)}. Expected a path to a directory, ` +
+        `but the path is not a directory (resolved to ${JSON.stringify(resolved)}).`,
     );
   }
   return resolved;

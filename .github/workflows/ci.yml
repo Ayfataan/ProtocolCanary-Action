@@ -42,7 +42,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # #347: the whole suite runs on all three hosted platforms so path
+        # separator, executable-name, and line-ending regressions surface on
+        # every pull request, not only on Linux.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

@@ -78,6 +78,7 @@ const BASE_INPUTS: ActionInputs = {
   githubToken: undefined,
   generateReceipt: false,
   strictIntegrity: false,
+  workingDirectory: path.resolve("."),
 };
 
 describe("buildCheckArgs", () => {
