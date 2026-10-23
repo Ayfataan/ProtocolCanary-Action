@@ -192,3 +192,8 @@ release depend on the severity and complexity of the issue. If you have
 not received an acknowledgement within 5 business days, please follow up
 on your existing private report thread rather than opening a public issue,
 so the report is not lost or unintentionally disclosed.
+
+
+### Experimental pull request comment security
+
+The opt-in `pr-comment` feature requests `pull-requests: write` only when consumers explicitly configure it. Do not use `pull_request_target` or run untrusted fork code with a write token. Fork PRs are skipped. The comment is based on the existing escaped job-summary renderer, bounded to 60,000 characters, and attempts to update only bot-authored comments with the matching workflow/job marker. API permission errors are warnings. This implementation is provisional until a maintainer-approved permission model is recorded in the engine contract decisions.

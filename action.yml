@@ -286,6 +286,14 @@ inputs:
     required: false
     default: "false"
 
+  pr-comment:
+    description: >-
+      Opt in to a bounded pull request summary comment. Requires pull-requests: write
+      on same-repository pull_request workflows. Fork PRs and other events are skipped.
+      Permission failures are warnings, not failed checks. Defaults to false.
+    required: false
+    default: "false"
+
   junit-report:
     description: >-
       Render the parsed JSON report to JUnit XML using the engine's own

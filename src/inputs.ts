@@ -75,6 +75,7 @@ export interface ActionInputs {
   /** Fail closed whenever binary integrity cannot be proven (issue #372).
    * Default `false` preserves the historical degrade-to-pinning behaviour. */
   readonly strictIntegrity: boolean;
+  readonly prComment: boolean;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;
@@ -293,6 +294,7 @@ export function getInputs(): ActionInputs {
     generateReceipt,
     junitReport,
     strictIntegrity,
+    prComment: parseBoolean("pr-comment", core.getInput("pr-comment") || "false"),
   };
 }
 
