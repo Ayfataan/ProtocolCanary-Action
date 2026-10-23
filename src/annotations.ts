@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 
+import { formatSafeDiagnosticTail } from "./log-block";
 import { describeExitCode } from "./output";
 import type { CanaryReport } from "./output";
 import { protocolMismatchMessage } from "./summary";
@@ -46,11 +47,14 @@ export function emitAnnotations(report: CanaryReport): void {
  *
  * When a diagnostic is available (the engine's stderr, a timeout notice), it
  * is appended so the annotation shows the engine's own reason instead of only
- * a generic "could not be executed" (issue #351).
+ * a generic "could not be executed" (issue #351). Reasons and diagnostics
+ * are sanitized before bounding: each retains at most 40 tail lines plus
+ * the truncation notice, within 8 KiB UTF-8 including that notice. Fixed
+ * annotation labels are outside this content budget (#499).
  */
 export function emitExecutionFailureAnnotation(reason: string, diagnostic?: string): void {
-  const message = `Protocol Canary could not be executed: ${reason}`;
-  const detail = diagnostic?.trim() ?? "";
+  const message = `Protocol Canary could not be executed: ${formatSafeDiagnosticTail(reason)}`;
+  const detail = formatSafeDiagnosticTail(diagnostic ?? "").trim();
   core.error(detail === "" ? message : `${message}\nEngine diagnostic: ${detail}`, { title: TITLE });
 }
 
@@ -75,12 +79,15 @@ export function emitBaselineFailureAnnotation(reason: string): void {
  * unexpected runtime crash — never as a regression — following
  * {@link describeExitCode}'s contract table.
  *
+ * Diagnostics use the same 8 KiB / 40 tail-line budget as execution
+ * failures, including the truncation notice in the byte budget (#499).
+ *
  * Like every other annotation this Action emits, it carries no file/line
  * location: no fixture in the report schema carries one.
  */
 export function emitExitFailureAnnotation(exitCode: number, diagnostic: string): void {
   const exitInfo = describeExitCode(exitCode);
   const message = `Stellar Protocol Canary reported a failure (exit code ${String(exitCode)}): ${exitInfo.description}`;
-  const detail = diagnostic.trim();
+  const detail = formatSafeDiagnosticTail(diagnostic).trim();
   core.error(detail === "" ? message : `${message}\nEngine diagnostic: ${detail}`, { title: TITLE });
 }
