@@ -4,8 +4,17 @@ import * as exec from "@actions/exec";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as https from "node:https";
+import type { ClientRequest, IncomingMessage } from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+
+import {
+  consumeResponse,
+  MAX_API_RESPONSE_BYTES,
+  MAX_CHECKSUM_MANIFEST_BYTES,
+  MAX_RELEASE_ASSET_BYTES,
+  readResponseText,
+} from "./http-response";
 
 import {
   CanaryExecutionFailedError,
@@ -101,14 +110,27 @@ const MAX_DOWNLOAD_REDIRECTS = 5;
 /** GETs a URL as binary content and writes it to `destPath`, following up to
  * `redirectsLeft` 3xx redirects (GitHub release downloads redirect from
  * `github.com` to a signed object host). Rejects on any non-2xx/3xx response,
- * a timeout, a redirect without a `Location`, or a write failure. */
-function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Promise<void> {
+ * a timeout, a redirect without a `Location`, an oversized/incomplete body,
+ * or a write failure. Failed downloads are closed and removed before rejection. */
+export function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let request: ClientRequest | undefined = undefined;
+    let file: fs.WriteStream | undefined;
+    let responseBody: IncomingMessage | undefined;
     const fail = (error: Error): void => {
-      if (!settled) {
-        settled = true;
-        reject(error);
+      if (settled) return;
+      settled = true;
+      responseBody?.destroy();
+      request?.destroy();
+      const removePartial = (): void => {
+        fs.rm(destPath, { force: true }, (cleanupError) => reject(cleanupError ?? error));
+      };
+      if (file !== undefined && !file.closed) {
+        file.once("close", removePartial);
+        file.destroy();
+      } else {
+        removePartial();
       }
     };
     const succeed = (): void => {
@@ -118,7 +140,7 @@ function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Pro
       }
     };
 
-    const request = https.get(url, { headers: { "User-Agent": "ProtocolCanary-Action" }, timeout: PREBUILT_DOWNLOAD_TIMEOUT_MS }, (response) => {
+    request = https.get(url, { headers: { "User-Agent": "ProtocolCanary-Action" }, timeout: PREBUILT_DOWNLOAD_TIMEOUT_MS }, (response) => {
       const status = response.statusCode ?? 0;
       if (status >= 300 && status < 400) {
         const location = response.headers.location;
@@ -142,25 +164,21 @@ function httpsGetFile(url: string, destPath: string, redirectsLeft: number): Pro
         fail(new Error(`GitHub returned status ${String(status)} for ${url}`));
         return;
       }
-      // Chunks are written manually (the same event style as
-      // `httpsGetText`) rather than via `pipe`, keeping the download
-      // handler symmetric with the text getter's mocked response surface.
-      const file = fs.createWriteStream(destPath);
-      file.on("error", fail);
-      response.on("data", (chunk: Buffer | string) => {
-        file.write(chunk);
-      });
-      response.on("error", (error: Error) => {
-        file.destroy();
-        fail(error);
-      });
-      response.on("end", () => {
-        file.end();
-      });
-      file.on("finish", succeed);
+      responseBody = response;
+      file = fs.createWriteStream(destPath);
+      const destination = file;
+      destination.on("error", fail);
+      destination.on("finish", succeed);
+      destination.on("drain", () => response.resume());
+      consumeResponse(response, url, MAX_RELEASE_ASSET_BYTES, (chunk) => {
+        if (!destination.write(chunk)) response.pause();
+      }).then(() => {
+        if (!settled) destination.end();
+      }).catch(fail);
     });
+    if (settled) request.destroy();
     request.on("timeout", () => {
-      request.destroy(new Error(`timed out downloading ${url}`));
+      request?.destroy(new Error(`timed out downloading ${url}`));
     });
     request.on("error", fail);
   });
@@ -177,8 +195,9 @@ interface ReleaseAsset {
 }
 
 /** GETs a URL as text, authenticating when a token is available and the host is api.github.com.
- * Rejects on any non-200 response, timeout, or transport error. */
-function httpsGetText(url: string, token: string | undefined): Promise<string> {
+ * Rejects on any non-200 response, timeout, transport error, or oversized/
+ * incomplete body. Manifest callers supply their smaller dedicated limit. */
+export function httpsGetText(url: string, token: string | undefined, maxBytes: number = MAX_API_RESPONSE_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
     let hostname: string;
     try {
@@ -202,13 +221,9 @@ function httpsGetText(url: string, token: string | undefined): Promise<string> {
         reject(new Error(`GitHub returned status ${String(response.statusCode)} for ${url}`));
         return;
       }
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk: string) => {
-        body += chunk;
-      });
-      response.on("end", () => {
-        resolve(body);
+      readResponseText(response, url, maxBytes).then(resolve).catch((error: unknown) => {
+        request.destroy();
+        reject(error);
       });
     });
     request.on("timeout", () => {
@@ -266,7 +281,7 @@ async function lookupPublishedChecksums(version: string, explicitToken?: string)
     if (checksumAsset === undefined) {
       return undefined;
     }
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token);
+    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token, MAX_CHECKSUM_MANIFEST_BYTES);
     const entries = parseChecksumManifest(manifest);
     return entries.size > 0 ? entries : undefined;
   } catch (error) {
@@ -830,7 +845,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
   }
   let expectedChecksum: string | undefined;
   try {
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, installApiToken());
+    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, installApiToken(), MAX_CHECKSUM_MANIFEST_BYTES);
     expectedChecksum = parseChecksumManifest(manifest).get(assetName);
   } catch (error) {
     core.debug(`Could not fetch the checksum manifest for ${assetName}: ${String(error)}`);

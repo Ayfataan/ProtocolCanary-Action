@@ -76,6 +76,10 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Bound HTTP response bodies to 4 MiB for GitHub API JSON, 1 MiB for checksum
+  manifests, and 64 MiB for prebuilt release assets. Reject oversized or incomplete
+  bodies and remove failed downloads before using the existing fallback paths (#500).
+
 - Execution-failure job summaries no longer break when the raw diagnostic
   (Canary's stderr, a timeout notice) itself contains a ``` sequence, e.g.
   a compiler or panic message quoting a code block: the diagnostic fence is

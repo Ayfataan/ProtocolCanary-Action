@@ -12,9 +12,12 @@ vi.mock("@actions/core", () => ({
 
 import * as core from "@actions/core";
 import * as https from "node:https";
+import { MAX_API_RESPONSE_BYTES } from "../../src/http-response";
 import { resolveVersion } from "../../src/version";
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string | string[] | undefined>;
   constructor(statusCode: number, headers: Record<string, string | string[] | undefined> = {}) {
@@ -387,5 +390,40 @@ describe("resolveVersion", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]?.headers.Authorization).toBe("Bearer secret-token");
     expect(calls[1]?.headers.Authorization).toBeUndefined();
+  });
+});
+
+
+describe("bounded tag pages (#500)", () => {
+  it.each(["exact", "oversized", "header", "lying", "aborted", "short", "split"])("handles a %s response without using partial JSON", async (kind) => {
+    const body = Buffer.from(tagsBody([{ name: "v0.2.0", sha: "a".repeat(40) }]) + " ".repeat(MAX_API_RESPONSE_BYTES));
+    const response = new FakeResponse(200, kind === "header" ? { "content-length": String(MAX_API_RESPONSE_BYTES + 1) } : kind === "lying" ? { "content-length": "1" } : kind === "short" ? { "content-length": String(MAX_API_RESPONSE_BYTES) } : {});
+    const destroyed = vi.spyOn(response, "destroy");
+    const request = new FakeRequest();
+    const requestDestroyed = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    vi.mocked(https.get).mockImplementation((_url, _options, callback) => {
+      queueMicrotask(() => {
+        callback!(response as unknown as Parameters<NonNullable<typeof callback>>[0]);
+        const bytes = kind === "split" ? Buffer.from('[{"name":"v0.2.0","commit":{"sha":"é"}}]') : body.subarray(0, kind === "short" ? 100 : MAX_API_RESPONSE_BYTES);
+        const split = kind === "split" ? bytes.indexOf(0xc3) + 1 : bytes.length;
+        const chunks = [bytes.subarray(0, split), bytes.subarray(split)];
+        if (kind === "oversized" || kind === "lying") chunks.push(Buffer.from(" "));
+        for (const chunk of chunks) {
+          if (destroyed.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        response.emit(kind === "aborted" ? "aborted" : "end");
+      });
+      return request as unknown as ReturnType<typeof https.get>;
+    });
+    const result = await resolveVersion("0.2.0");
+    expect(result.commitSha).toBe(kind === "exact" ? "a".repeat(40) : kind === "split" ? "é" : undefined);
+    if (kind === "header") expect(delivered).toBe(0);
+    if (kind !== "exact" && kind !== "split") {
+      expect(destroyed).toHaveBeenCalled();
+      expect(requestDestroyed).toHaveBeenCalled();
+    }
   });
 });
