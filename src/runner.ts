@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
+import { engineSupportsFailOnWarningAndOffline } from "./inputs";
 import { sanitizeLogText, truncateLogTail } from "./log-block";
 import type { ActionInputs } from "./inputs";
 import { CanaryExecutionFailedError, InvalidInputError, TimeoutError, describeError } from "./errors";
@@ -77,6 +78,14 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   args.push("--fixtures-dir", inputs.fixturesDir);
   if (inputs.allowEmpty && engineSupportsAllowEmpty(engineVersion)) {
     args.push("--allow-empty");
+  }
+  if (engineSupportsFailOnWarningAndOffline(engineVersion)) {
+    if (inputs.failOnWarning) {
+      args.push("--fail-on-warning");
+    }
+    if (inputs.offline) {
+      args.push("--offline");
+    }
   }
   // #458 scope/cache options. Single `--flag=value` elements, in a stable
   // order, so a value beginning with `-` (e.g. a fixture id `--weird`) can

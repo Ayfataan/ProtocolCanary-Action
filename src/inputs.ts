@@ -43,6 +43,10 @@ export interface ActionInputs {
   readonly timeoutMinutes: number;
   /** Pass `--allow-empty` to engines that support it (0.2.0 and newer). */
   readonly allowEmpty: boolean;
+  /** Fail the check when supported engines report warnings. */
+  readonly failOnWarning: boolean;
+  /** Skip network-dependent fixtures when supported by the engine. */
+  readonly offline: boolean;
   /** Release tag of the fixture pack to run against, e.g. `v1.2.0`, kept as
    * written (leading `v` optional). Validated for format only — see
    * {@link parseFixturesPackVersion} for why it is not forwarded yet. */
@@ -201,6 +205,11 @@ export function getInputs(): ActionInputs {
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
+  const failOnWarning = parseBoolean(
+    "fail-on-warning",
+    core.getInput("fail-on-warning") || "false",
+  );
+  const offline = parseBoolean("offline", core.getInput("offline") || "false");
   const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
   const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
   const baselineReport = parseBaselineReport(core.getInput("baseline-report"));
@@ -228,6 +237,21 @@ export function getInputs(): ActionInputs {
   const junitReport = parseBoolean("junit-report", core.getInput("junit-report") || "false");
 
   const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
+
+  if (!engineSupportsFailOnWarningAndOffline(version)) {
+    if (failOnWarning) {
+      core.warning(
+        `"fail-on-warning" is enabled, but Protocol Canary ${version} does not support it yet; ` +
+          "the option will be ignored.",
+      );
+    }
+    if (offline) {
+      core.warning(
+        `"offline" is enabled, but Protocol Canary ${version} does not support it yet; ` +
+          "the option will be ignored.",
+      );
+    }
+  }
 
   // A validated input that silently does nothing is worse than a missing one:
   // it reads as "my pack is pinned" when the run used whatever
@@ -260,6 +284,8 @@ export function getInputs(): ActionInputs {
     annotations,
     timeoutMinutes,
     allowEmpty,
+    failOnWarning,
+    offline,
     fixturesPackVersion,
     fixturesPackProtocol,
     baselineReport,
@@ -268,6 +294,31 @@ export function getInputs(): ActionInputs {
     junitReport,
     strictIntegrity,
   };
+}
+
+// TODO(#421): Replace this placeholder when Protocol-Canary publishes the
+// release containing PRs #567 and #527.
+const FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION: readonly [number, number, number] = [
+  999_999_999,
+  0,
+  0,
+];
+
+/** Returns whether the pinned engine supports `--fail-on-warning` and `--offline`. */
+export function engineSupportsFailOnWarningAndOffline(version: string | undefined): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
+  if (match === null) {
+    return false;
+  }
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let i = 0; i < FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION.length; i++) {
+    const minimum = FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION[i] as number;
+    const part = parts[i] as number;
+    if (part !== minimum) {
+      return part > minimum;
+    }
+  }
+  return true;
 }
 
 /** Validates an explicitly supplied passphrase without trimming it: spaces
