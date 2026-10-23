@@ -35,6 +35,17 @@ describe("uploadReport", () => {
     expect(uploadArtifactMock).toHaveBeenCalledWith(ARTIFACT_NAME, [REPORT_PATH], REPORT_DIR);
   });
 
+  it("uploads additional files (e.g. the JUnit rendering) alongside the report (#423)", async () => {
+    uploadArtifactMock.mockResolvedValue({ id: 1, size: 100 });
+    const outcome = await uploadReport(REPORT_PATH, undefined, ["/tmp/stellar-canary-report.junit.xml"]);
+    expect(outcome).toEqual({ uploaded: true });
+    expect(uploadArtifactMock).toHaveBeenCalledWith(
+      ARTIFACT_NAME,
+      [REPORT_PATH, "/tmp/stellar-canary-report.junit.xml"],
+      REPORT_DIR,
+    );
+  });
+
   it("keeps the stable name even when a differentiator is supplied but the name is free", async () => {
     uploadArtifactMock.mockResolvedValue({ id: 1, size: 100 });
     const outcome = await uploadReport(REPORT_PATH, "protocol-28");
