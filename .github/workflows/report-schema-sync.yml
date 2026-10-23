@@ -1,0 +1,85 @@
+name: Report schema sync (#447)
+
+# Scheduled drift check between the pinned report schema copy in
+# tests/fixtures/report-v1.schema.json and the schema published on
+# Protocol-Canary main (docs/schemas/report-v1.schema.json). The schema is
+# not in any engine release tag, so released engines are not evidence of
+# conformance to it; this workflow only tells maintainers when the engine
+# changed the contract so the pin and the Action are updated deliberately.
+#
+# Three outcomes, printed and never conflated:
+#   in-sync        the pinned copy and main are byte-identical.
+#   drift          the contents differ: the job FAILS, names the changed
+#                  paths, and links the re-pinning instructions (#447).
+#   infrastructure the download failed (network error or non-200): the job
+#                  FAILS with a distinct message, never reported as drift.
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  schema-sync:
+    name: Compare pinned report schema with Protocol-Canary main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Fetch schema from Protocol-Canary main
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/StellarCanary/Protocol-Canary/main/docs/schemas/report-v1.schema.json"
+          if curl --fail --silent --show-error --location --output upstream-report-v1.schema.json "$url"; then
+            echo "fetched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fetched=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Report schema sync: infrastructure problem"
+              echo ""
+              echo "Downloading the schema from Protocol-Canary \`main\` failed"
+              echo "(network error or non-200 response). This is **not** a drift"
+              echo "verdict: the comparison was not performed."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Report schema sync: infrastructure problem::could not download docs/schemas/report-v1.schema.json from Protocol-Canary main (network error or non-200). This is an infrastructure problem, not drift."
+          fi
+
+      - name: Compare with the pinned copy
+        if: steps.fetch.outputs.fetched == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pinned="tests/fixtures/report-v1.schema.json"
+          upstream="upstream-report-v1.schema.json"
+          if cmp -s "$pinned" "$upstream"; then
+            {
+              echo "### Report schema sync: in sync"
+              echo ""
+              echo "\`$pinned\` is byte-identical to Protocol-Canary \`main\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Report schema sync::in sync"
+            exit 0
+          fi
+          {
+            echo "### Report schema sync: drift"
+            echo ""
+            echo "Changed paths:"
+            echo ""
+            echo "- \`docs/schemas/report-v1.schema.json\` (Protocol-Canary \`main\`)"
+            echo "- \`tests/fixtures/report-v1.schema.json\` (pinned copy)"
+            echo ""
+            echo "Re-pin instructions: https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Report schema sync: drift::the pinned copy differs from Protocol-Canary main (changed paths: docs/schemas/report-v1.schema.json upstream, tests/fixtures/report-v1.schema.json pinned). Re-pin per https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+          diff -u "$pinned" "$upstream" || true
+          exit 1

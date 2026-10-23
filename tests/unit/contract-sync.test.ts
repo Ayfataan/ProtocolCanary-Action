@@ -33,7 +33,7 @@ import { report, result } from "./helpers";
  * deterministic and offline, as every unit test must be.
  */
 
-const { getInputSpy, setOutputSpy, setFailedMock, setSecretMock, errorMock, warningMock, infoMock, debugMock, startGroupMock, endGroupMock, ensureCanaryInstalledMock, runCheckMock, writeSummaryMock, renderSummaryMarkdownMock, renderExecutionFailureMarkdownMock, uploadReceiptMock, resolveVersionMock } =
+const { getInputSpy, setOutputSpy, setFailedMock, setSecretMock, errorMock, warningMock, infoMock, debugMock, startGroupMock, endGroupMock, ensureCanaryInstalledMock, runCheckMock, renderJUnitReportMock, writeSummaryMock, renderSummaryMarkdownMock, renderExecutionFailureMarkdownMock, uploadReceiptMock, resolveVersionMock } =
   vi.hoisted(() => ({
     getInputSpy: vi.fn<(name: string, options?: actionsCore.InputOptions) => string>(),
     setOutputSpy: vi.fn<(name: string, value: string) => void>(),
@@ -47,6 +47,7 @@ const { getInputSpy, setOutputSpy, setFailedMock, setSecretMock, errorMock, warn
     endGroupMock: vi.fn(),
     ensureCanaryInstalledMock: vi.fn(),
     runCheckMock: vi.fn(),
+    renderJUnitReportMock: vi.fn(),
     writeSummaryMock: vi.fn(),
     renderSummaryMarkdownMock: vi.fn(),
     renderExecutionFailureMarkdownMock: vi.fn(),
@@ -87,7 +88,7 @@ vi.mock("../../src/canary", async (importOriginal) => {
 // buildCheckArgs stays real: it is pure.
 vi.mock("../../src/runner", async (importOriginal) => {
   const actual = await importOriginal<typeof runnerModule>();
-  return { ...actual, runCheck: runCheckMock };
+  return { ...actual, runCheck: runCheckMock, renderJUnitReport: renderJUnitReportMock };
 });
 
 vi.mock("../../src/summary", async (importOriginal) => {
@@ -175,6 +176,10 @@ function valueForInput(name: string, configPath: string): string {
       return "ghs_contractsyncfakegittoken0000000000";
     case "generate-receipt":
       return "false";
+    case "network-passphrase":
+      // action.yml's sentinel default for "unset": an empty passphrase is
+      // rejected, so the real runner hands getInputs() this value instead.
+      return "\u0001";
     default:
       return "";
   }
@@ -342,6 +347,9 @@ describe("action.yml outputs and run() stay in sync (#412)", () => {
       annotations: "true",
       "upload-report": "false",
       "generate-receipt": "true",
+      // junit-report-path, like receipt-path, is set on one branch only.
+      "junit-report": "true",
+      "network-passphrase": "\u0001",
     };
 
     resolveVersionMock.mockResolvedValue({ version: "0.1.1", tag: "v0.1.1", commitSha: undefined });
@@ -351,6 +359,7 @@ describe("action.yml outputs and run() stay in sync (#412)", () => {
     renderExecutionFailureMarkdownMock.mockReturnValue("## Stellar Protocol Canary (execution failure)");
     uploadReceiptMock.mockResolvedValue({ uploaded: true });
     runCheckMock.mockReset();
+    renderJUnitReportMock.mockResolvedValue({ path: path.join(runnerTemp, "stellar-canary-report.junit.xml") });
   });
 
   afterEach(() => {
@@ -409,8 +418,8 @@ describe("README tables match action.yml (#412)", () => {
     const manifest = actionManifest();
     const rows = readmeTable("Inputs");
     for (const [name, meta] of Object.entries(manifest.inputs ?? {})) {
-      if (meta.default === undefined) {
-        // No default in action.yml: README follows its own convention for
+      if (meta.default === undefined || meta.default === "\u0001") {
+        // No default (or the "\u0001" sentinel meaning "unset") in action.yml: README follows its own convention for
         // "the CLI decides" / "(none)" — presence is asserted above.
         continue;
       }
