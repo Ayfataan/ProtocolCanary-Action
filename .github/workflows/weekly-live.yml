@@ -31,6 +31,15 @@ name: Weekly live integration (Protocol 29)
 # with `network:`; `rpc-url:` pins the Protocol 29 endpoint explicitly. The
 # passphrase is repeated in `env`/`NETWORK_PASSPHRASE` below so every job
 # log records exactly which network the canary ran against.
+#
+# A failed scheduled run also opens or updates a SINGLE tracking issue
+# labelled `weekly-live` (#420) so the failure has an owner and a timeline
+# instead of only a line in the Actions tab: the `track-failure` job
+# creates the issue on the first failure, comments on it while it stays
+# open, and comments on and closes it when a run goes fully green. The
+# `weekly-live` label must exist in the repository (see CONTRIBUTING.md,
+# "Tracking weekly live failures"); `gh issue create` fails loudly if it
+# does not.
 
 on:
   workflow_dispatch:
@@ -42,11 +51,17 @@ on:
   schedule:
     - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
 
+# The default token is read-only; the `track-failure` job widens its own
+# scope to `issues: write` (job-level), and no other job gains any write
+# permission. Keeping this here means every job is read-only unless it
+# explicitly opts in.
 permissions:
   contents: read
 
 env:
   TARGET_PROTOCOL: "29"
+  # The label that identifies the single open tracking issue (#420).
+  TRACKING_LABEL: weekly-live
 
 jobs:
   live-check:
@@ -111,6 +126,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run Stellar Protocol Canary (this Action, from source)
+        id: run
         uses: ./ # zizmor: ignore[self-repository] root composite action executed from source within this repository
         with:
           protocol: "29"
@@ -149,4 +165,98 @@ jobs:
             echo "carries the engine's diagnostic; the workflow fails safely instead"
             echo "of reporting a compatibility result."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::error title=Weekly live Protocol 29 canary failed::The weekly live canary failed against Protocol 29 ${{ matrix.network }} (${{ matrix.rpc-url }}). See the job summary for the engine's diagnostic."
+      # Record this leg's outcome in the summary so the tracking job (which
+      # treats a non-success `live-check` result as "at least one leg
+      # failed") and a human reading the run can both see which leg it was.
+      - name: Record this leg's outcome
+        if: always()
+        shell: bash
+        env:
+          LEG_NETWORK: ${{ matrix.network }}
+          LEG_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${LEG_OUTCOME:-}" = "success" ]; then
+            mark="✅ passed"
+          else
+            mark="❌ failed (${LEG_OUTCOME:-no outcome})"
+          fi
+          {
+            echo ""
+            echo "- \`${LEG_NETWORK}\`: ${mark}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # One tracking issue for the weekly check (#420): a single failure that
+  # repeats every Monday should not open a new issue each week. This job
+  # runs once, after every matrix leg, and:
+  #   * on failure — creates the `weekly-live` issue if none is open, else
+  #     comments on the existing one;
+  #   * on a fully green run — comments on and closes the open issue.
+  # It is the only job with a write scope (`issues: write`); the workflow
+  # default stays read-only.
+  track-failure:
+    name: Track weekly live failure
+    needs: live-check
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Open, update, or close the tracking issue
+        shell: bash
+        env:
+          RUN_OUTCOME: ${{ needs.live-check.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label="${TRACKING_LABEL:?TRACKING_LABEL must name the tracking label}"
+
+          # The `gh` CLI refuses to create an issue with an unknown label and
+          # exits non-zero, so a missing label fails this job loudly instead
+          # of silently skipping the notification.
+          if ! gh label list --json name --jq '.[].name' | grep -Fxq "$label"; then
+            echo "::error::the '$label' label does not exist; create it so the weekly-live tracking issue can be opened (see CONTRIBUTING.md)"
+            exit 1
+          fi
+
+          issue=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ "${RUN_OUTCOME}" = "success" ]; then
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --body "The weekly live canary is green again. Run: ${RUN_URL}$(printf '\n\n')Closing this tracking issue; it is reopened automatically should the canary fail again."
+              gh issue close "$issue" --reason completed
+              echo "Weekly live canary passed; closed tracking issue #${issue}"
+            else
+              echo "Weekly live canary passed and no tracking issue is open; nothing to do."
+            fi
+            exit 0
+          fi
+
+          # A run that did not succeed.
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "The weekly live canary is still failing. Run: ${RUN_URL}"
+            echo "Commented on existing tracking issue #${issue}"
+          else
+            gh issue create \
+              --title "Weekly live canary is failing (Protocol 29)" \
+              --label "$label" \
+              --body "The scheduled weekly live canary has failed. Run: ${RUN_URL}"
+            echo "Created a new tracking issue for the weekly live failure"
+          fi
+
+      - name: Record the notification outcome
+        if: always()
+        shell: bash
+        env:
+          RUN_OUTCOME: ${{ needs.live-check.result }}
+        run: |
+          {
+            echo ""
+            echo "### Weekly live tracking issue"
+            echo ""
+            echo "- Live-check result: \`${RUN_OUTCOME}\`"
+            echo "- The \`${TRACKING_LABEL}\` issue was opened, updated, or closed above; see this job's log."
+          } >> "$GITHUB_STEP_SUMMARY"

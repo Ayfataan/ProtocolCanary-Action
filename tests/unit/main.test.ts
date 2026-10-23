@@ -11,11 +11,13 @@ import type { ActionInputs } from "../../src/inputs";
 import type * as inputsModule from "../../src/inputs";
 import type * as runnerModule from "../../src/runner";
 import type * as summaryModule from "../../src/summary";
+import type * as versionModule from "../../src/version";
 import { report, result } from "./helpers";
 
 const {
   getInputsMock,
   ensureCanaryInstalledMock,
+  resolveVersionMock,
   runCheckMock,
   writeSummaryMock,
   renderSummaryMarkdownMock,
@@ -29,10 +31,12 @@ const {
   startGroupMock,
   endGroupMock,
   uploadReceiptMock,
+  uploadReportMock,
   renderJUnitReportMock,
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
   ensureCanaryInstalledMock: vi.fn(),
+  resolveVersionMock: vi.fn(),
   runCheckMock: vi.fn(),
   writeSummaryMock: vi.fn(),
   renderSummaryMarkdownMock: vi.fn(),
@@ -46,6 +50,7 @@ const {
   startGroupMock: vi.fn(),
   endGroupMock: vi.fn(),
   uploadReceiptMock: vi.fn(),
+  uploadReportMock: vi.fn(),
   renderJUnitReportMock: vi.fn(),
 }));
 
@@ -90,6 +95,17 @@ vi.mock("../../src/runner", async (importOriginal) => {
   return { ...actual, runCheck: runCheckMock, renderJUnitReport: renderJUnitReportMock };
 });
 
+// Only `resolveVersion` is replaced (#400): the tests that spy on the
+// execution order need "was version resolution reached?" to be observable,
+// and a mocked resolver must not reach the GitHub API either. Its default
+// implementation mirrors the real one's offline fallback shape
+// (version + `v`-prefixed tag, no commit SHA), so every downstream
+// assertion behaves as before.
+vi.mock("../../src/version", async (importOriginal) => {
+  const actual = await importOriginal<typeof versionModule>();
+  return { ...actual, resolveVersion: resolveVersionMock };
+});
+
 vi.mock("../../src/summary", async (importOriginal) => {
   const actual = await importOriginal<typeof summaryModule>();
   return {
@@ -102,10 +118,13 @@ vi.mock("../../src/summary", async (importOriginal) => {
 
 // #362: only `uploadReceipt` is replaced — receipt tests assert the gate
 // (upload when generate-receipt is true, skip when false) without ever
-// touching the artifact service.
+// touching the artifact service. `uploadReport` is mocked for the same
+// reason (#399): the report-path tests assert which file the upload
+// receives without contacting the artifact service; artifact *naming*
+// itself is covered by tests/unit/artifact.test.ts.
 vi.mock("../../src/artifact", async (importOriginal) => {
   const actual = await importOriginal<typeof artifactModule>();
-  return { ...actual, uploadReceipt: uploadReceiptMock };
+  return { ...actual, uploadReceipt: uploadReceiptMock, uploadReport: uploadReportMock };
 });
 
 import { run } from "../../src/main";
@@ -120,13 +139,17 @@ const INPUTS: ActionInputs = {
   rpcUrl: undefined,
   rpcMaxRetries: undefined,
   rpcRetryDelayMs: undefined,
-  fixturesDir: "fixtures",
+  // #400: run() validates this directory on disk before version resolution
+  // and installation, so the shared fixture must be an existing directory —
+  // the repository's own tests/fixtures is stable from every CI checkout.
+  fixturesDir: path.join(__dirname, "..", "fixtures"),
   fixture: undefined,
   surface: undefined,
   cacheDir: undefined,
   version: "0.1.0",
   uploadReport: false,
   annotations: true,
+  diagnostics: false,
   timeoutMinutes: 1,
   allowEmpty: false,
   failOnWarning: false,
@@ -156,12 +179,24 @@ const PASS_REPORT = report({
   ],
 });
 
+/** The path the last run() advertised through its "report" output
+ * (#399: unique per invocation, so tests read it from the output instead
+ * of reconstructing a fixed filename). */
+function reportOutputPath(): string {
+  const call = setOutputMock.mock.calls.find((c) => c[0] === "report");
+  expect(call, "expected the run to set a \"report\" output").toBeDefined();
+  return String(call?.[1]);
+}
+
 describe("run", () => {
   let runnerTemp: string;
 
   beforeEach(() => {
     getInputsMock.mockReset().mockReturnValue(INPUTS);
     ensureCanaryInstalledMock.mockReset().mockResolvedValue({ binaryPath: BINARY_PATH, version: "0.1.0" });
+    resolveVersionMock
+      .mockReset()
+      .mockImplementation(async (version: string) => ({ version, tag: `v${version}`, commitSha: undefined }));
     runCheckMock.mockReset();
     renderJUnitReportMock.mockReset();
     writeSummaryMock.mockReset().mockResolvedValue(undefined);
@@ -176,6 +211,8 @@ describe("run", () => {
     startGroupMock.mockReset();
     endGroupMock.mockReset();
     uploadReceiptMock.mockReset();
+    uploadReportMock.mockReset();
+    delete process.env.GITHUB_ACTION;
 
     // The success path writes the report under RUNNER_TEMP; give each test a
     // private directory (as the integration suite does) so it neither leaks
@@ -404,9 +441,9 @@ describe("run", () => {
 
     // The report was still written next to the (failed) summary, and its
     // path is what the "report" output advertises.
-    const reportPath = path.join(runnerTemp, "stellar-canary-report.json");
+    const reportPath = reportOutputPath();
+    expect(path.isAbsolute(reportPath)).toBe(true);
     expect(fs.existsSync(reportPath)).toBe(true);
-    expect(setOutputMock).toHaveBeenCalledWith("report", reportPath);
 
     // The success-path summary rendering was attempted exactly once, and a
     // passing report emits no annotations. The second argument is the
@@ -415,7 +452,20 @@ describe("run", () => {
     // command's argument array are reported (#373, #416).
     expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, {
       engineVersion: "0.1.0",
-      engineArgs: ["check", "--format", "json", "--protocol", "28", "--network", "testnet", "--fixtures-dir", "fixtures"],
+      engineArgs: [
+        "check",
+        "--format",
+        "json",
+        "--protocol",
+        "28",
+        "--network",
+        "testnet",
+        "--fixtures-dir",
+        // #400: `INPUTS.fixturesDir` is an absolute path (the shared
+        // fixture must be an existing directory), and the engine arguments
+        // forward it verbatim.
+        INPUTS.fixturesDir,
+      ],
     });
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
@@ -696,6 +746,293 @@ describe("run", () => {
     });
   });
 
+  // #400: fixtures-dir is validated after input parsing and before version
+  // resolution or installation. The regression test is the execution-order
+  // one: under the original behavior, a missing fixtures directory went
+  // straight into resolveVersion and ensureCanaryInstalled and failed only
+  // when the engine ran — those spies must now stay untouched.
+  describe("issue #400: fixtures-dir fails fast before installation", () => {
+    it("a missing fixtures directory fails before resolveVersion, installation, and execution", async () => {
+      const missing = path.join(runnerTemp, "no-such-fixtures");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: missing });
+
+      await run();
+
+      // The validation error reaches the failure path verbatim: the input
+      // name, the resolved absolute path, and the reason.
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failed = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failed).toContain("Protocol Canary could not be executed.");
+      expect(failed).toContain('"fixtures-dir"');
+      expect(failed).toContain(path.resolve(missing));
+      expect(failed).toContain("does not exist");
+
+      // Nothing downstream of input validation ran.
+      expect(resolveVersionMock).not.toHaveBeenCalled();
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+
+      // The existing execution-failure reporting receives the error: the
+      // annotation (annotations: true), the summary, and the outputs.
+      expect(errorMock).toHaveBeenCalledTimes(1);
+      expect(String(errorMock.mock.calls[0]?.[0])).toContain('"fixtures-dir"');
+      expect(renderExecutionFailureMarkdownMock).toHaveBeenCalledWith(
+        expect.stringContaining('"fixtures-dir"'),
+        "",
+      );
+      expect(writeSummaryMock).toHaveBeenCalledWith("## Stellar Protocol Canary (execution failure)");
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+      expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+    });
+
+    it("allow-empty: true warns about the missing directory and proceeds to resolution and installation", async () => {
+      const missing = path.join(runnerTemp, "no-such-fixtures");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: missing, allowEmpty: true });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      // The warning names the input and the resolved path, and the run
+      // continues down the normal execution path.
+      expect(warningMock).toHaveBeenCalledTimes(1);
+      const warning = String(warningMock.mock.calls[0]?.[0]);
+      expect(warning).toContain('"fixtures-dir"');
+      expect(warning).toContain(path.resolve(missing));
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(resolveVersionMock).toHaveBeenCalledTimes(1);
+      expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
+      expect(runCheckMock).toHaveBeenCalledTimes(1);
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      // The missing directory is never created behind the user's back.
+      expect(fs.existsSync(missing)).toBe(false);
+    });
+
+    it("a fixtures path that is a regular file is rejected even with allow-empty", async () => {
+      const file = path.join(runnerTemp, "fixtures.toml");
+      fs.writeFileSync(file, "[tests]\n", "utf8");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: file, allowEmpty: true });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failed = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failed).toContain('"fixtures-dir"');
+      expect(failed).toContain(path.resolve(file));
+      expect(failed).toContain("is not a directory");
+
+      expect(resolveVersionMock).not.toHaveBeenCalled();
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+    });
+
+    it("an existing fixtures directory keeps the original execution path", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(warningMock).not.toHaveBeenCalled();
+      expect(resolveVersionMock).toHaveBeenCalledTimes(1);
+      expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
+      expect(runCheckMock).toHaveBeenCalledTimes(1);
+      expect(setFailedMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // #399: every invocation writes its report to a uniquely named file
+  // directly inside RUNNER_TEMP, so two Action steps in one job can never
+  // overwrite each other's report. The filename is always a single safe
+  // path component: `stellar-canary-report-<sanitized GITHUB_ACTION>-<hex>.json`.
+  describe("issue #399: unique report path per invocation", () => {
+    const SAFE_NAME = /^stellar-canary-report-[A-Za-z0-9_-]+-[0-9a-f]{16}\.json$/;
+
+    beforeEach(() => {
+      process.env.GITHUB_ACTION = "canary-check";
+      runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    });
+
+    it("generates a different path for every invocation with an identical environment", async () => {
+      await run();
+      const first = reportOutputPath();
+      setOutputMock.mockClear();
+      await run();
+      const second = reportOutputPath();
+
+      expect(first).not.toBe(second);
+      expect(fs.existsSync(first)).toBe(true);
+      expect(fs.existsSync(second)).toBe(true);
+      // The first report is untouched by the second invocation.
+      expect(JSON.parse(fs.readFileSync(first, "utf8"))).toEqual(PASS_REPORT);
+    });
+
+    it("generates only absolute paths", async () => {
+      await run();
+      expect(path.isAbsolute(reportOutputPath())).toBe(true);
+    });
+
+    it("places the report directly inside the configured RUNNER_TEMP", async () => {
+      await run();
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(runnerTemp);
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+    });
+
+    it("falls back to os.tmpdir() when RUNNER_TEMP is unset", async () => {
+      delete process.env.RUNNER_TEMP;
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(os.tmpdir());
+      expect(path.isAbsolute(reportPath)).toBe(true);
+      expect(fs.existsSync(reportPath)).toBe(true);
+      fs.rmSync(reportPath, { force: true });
+    });
+
+    it("embeds a normal GITHUB_ACTION identifier safely in the filename", async () => {
+      process.env.GITHUB_ACTION = "StellarCanary-ProtocolCanary-Action__check";
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(runnerTemp);
+      expect(path.basename(reportPath)).toContain("StellarCanary-ProtocolCanary-Action__check");
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+    });
+
+    it("produces different filenames for two invocations with the same GITHUB_ACTION", async () => {
+      await run();
+      const first = reportOutputPath();
+      setOutputMock.mockClear();
+      await run();
+      const second = reportOutputPath();
+
+      expect(path.basename(first)).toContain("canary-check");
+      expect(path.basename(second)).toContain("canary-check");
+      expect(path.basename(first)).not.toBe(path.basename(second));
+    });
+
+    it("cannot escape RUNNER_TEMP via traversal or separator GITHUB_ACTION values", async () => {
+      const malicious = ["../", "../../other", "foo/bar", "foo\\bar", "..\\..\\windows", "a/../../b"];
+
+      for (const value of malicious) {
+        process.env.GITHUB_ACTION = value;
+        setOutputMock.mockReset();
+
+        await run();
+
+        const reportPath = reportOutputPath();
+        expect(path.isAbsolute(reportPath)).toBe(true);
+        // No traversal component survives: the file lands directly in RUNNER_TEMP.
+        expect(path.dirname(reportPath)).toBe(runnerTemp);
+        // The filename is a single path component of safe characters only.
+        expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+        expect(path.basename(reportPath)).not.toContain("/");
+        expect(path.basename(reportPath)).not.toContain("\\");
+      }
+    });
+
+    it("removes spaces and Unicode from the identifier", async () => {
+      process.env.GITHUB_ACTION = "my step \u{1F680} name";
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+      expect(path.basename(reportPath)).toContain("my-step-name");
+    });
+
+    it("produces a valid filename when GITHUB_ACTION is unset, empty, or separator-only", async () => {
+      delete process.env.GITHUB_ACTION;
+      await run();
+      const unset = reportOutputPath();
+      expect(path.basename(unset)).toMatch(SAFE_NAME);
+      expect(path.dirname(unset)).toBe(runnerTemp);
+
+      for (const unusable of ["", "/", "../.."]) {
+        process.env.GITHUB_ACTION = unusable;
+        setOutputMock.mockClear();
+        await run();
+        const reportPath = reportOutputPath();
+        expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+        expect(path.dirname(reportPath)).toBe(runnerTemp);
+      }
+    });
+
+    it("uses the one generated path for the file, the report output, and the artifact upload", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+      uploadReportMock.mockResolvedValue({ uploaded: true });
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.isAbsolute(reportPath)).toBe(true);
+      // The file at the advertised path holds exactly this invocation's report.
+      expect(JSON.parse(fs.readFileSync(reportPath, "utf8"))).toEqual(PASS_REPORT);
+      // The artifact upload received the same single path — the generator
+      // was not called again for the upload.
+      expect(uploadReportMock).toHaveBeenCalledTimes(1);
+      expect(uploadReportMock).toHaveBeenCalledWith(reportPath, expect.any(String), []);
+    });
+  });
+
+  describe("issue #508: report write failure handling", () => {
+    it("handles EACCES/ENOENT/ENOSPC report file write failure without failing execution", async () => {
+      // Set RUNNER_TEMP to a non-existent or read-only directory
+      process.env.RUNNER_TEMP = path.join(runnerTemp, "nonexistent-dir", "sub");
+
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify(PASS_REPORT),
+        stderr: "",
+      });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to write JSON report to"),
+      );
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("ENOENT"),
+      );
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(setOutputMock).toHaveBeenCalledWith("passed", "1");
+      expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+      expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+        PASS_REPORT,
+        expect.objectContaining({ reportWriteError: "ENOENT" }),
+      );
+    });
+
+    it("safe cleanup failures do not abort execution", async () => {
+      // The report path is unique per invocation (#399), so a directory cannot
+      // be planted at it in advance. Point RUNNER_TEMP at a regular file
+      // instead: the write fails with ENOTDIR, a different errno from the
+      // missing-directory case above (Windows reports it as ENOENT).
+      const notADirectory = path.join(runnerTemp, "not-a-directory");
+      fs.writeFileSync(notADirectory, "", "utf8");
+      process.env.RUNNER_TEMP = notADirectory;
+
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify(PASS_REPORT),
+        stderr: "",
+      });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringMatching(/ENOTDIR|ENOENT/),
+      );
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    });
+  });
+
   describe("issue #340: fixture-pack identity outputs", () => {
     it("sets pack-protocol, pack-version and pack-digest from the report and inputs", async () => {
       const digest = `sha256:${"b".repeat(64)}`;
@@ -858,7 +1195,7 @@ describe("run", () => {
     expect(runCheckMock).toHaveBeenCalledTimes(1);
     expect(renderJUnitReportMock).toHaveBeenCalledWith(
       BINARY_PATH,
-      path.join(runnerTemp, "stellar-canary-report.json"),
+      reportOutputPath(),
       60_000,
     );
     expect(setOutputMock).toHaveBeenCalledWith("junit-report-path", junitPath);
