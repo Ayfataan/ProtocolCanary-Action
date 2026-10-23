@@ -1,3 +1,4 @@
+import { MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES, MAX_RELEASE_ASSET_BYTES } from "../../src/http-response";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as crypto from "node:crypto";
@@ -7,6 +8,11 @@ import type * as osModule from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+});
 
 const cacheMocks = vi.hoisted(() => ({
   isFeatureAvailableMock: vi.fn(),
@@ -78,6 +84,9 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import {
+  httpsGetText,
+  httpsGetFile,
+  installPrebuiltRelease,
   cargoInstallTimeoutMs,
   ensureCanaryInstalled,
   ensureVerifiedPack,
@@ -202,6 +211,8 @@ async function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T> 
 }
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string> = {};
   constructor(statusCode: number) {
@@ -584,6 +595,14 @@ describe("ensureCanaryInstalled", () => {
 
     expect(installed.binaryPath).toBe(binaryPath());
     expect(httpsGetMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores an oversized checksum manifest rather than verifying its partial prefix (#500)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n${" ".repeat(MAX_CHECKSUM_MANIFEST_BYTES)}`);
+    const installed = await ensureCanaryInstalled(RESOLVED);
+    expect(installed.binaryPath).toBe(binaryPath());
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("1048576-byte limit"));
   });
 
   it("throws InstallationFailedError when the installed binary does not match the published checksum", async () => {
@@ -1765,5 +1784,125 @@ describe("verified fixture-pack caching (#345)", () => {
       ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download }),
     ).rejects.toThrow("checksum mismatch");
     expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("bounded HTTP downloads (#500)", () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-http-limit-")); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); httpsGetMock.mockReset(); });
+
+  function stream(chunks: Buffer[], headers: Record<string, string> = {}, ending = "end") {
+    const response = new FakeResponse(200);
+    response.headers = headers;
+    const request = new FakeRequest();
+    const destroyResponse = vi.spyOn(response, "destroy");
+    const destroyRequest = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      callback(response);
+      queueMicrotask(() => {
+        for (const chunk of chunks) {
+          if (destroyResponse.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        if (destroyResponse.mock.calls.length === 0) response.emit(ending);
+      });
+      return request;
+    });
+    return { response, destroyResponse, destroyRequest, delivered: () => delivered };
+  }
+
+  it.each([MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES])("accepts exactly %i bytes and preserves split UTF-8", async (limit) => {
+    const bytes = Buffer.from("é" + "x".repeat(limit - 2));
+    stream([bytes.subarray(0, 1), bytes.subarray(1)], { "content-length": String(limit) });
+    const text = await httpsGetText("https://example.test/body", undefined, limit);
+    expect(Buffer.byteLength(text)).toBe(limit);
+    expect(text.startsWith("é")).toBe(true);
+  });
+
+  it.each(["header", "stream", "lying header"])("rejects oversized text via %s and destroys both streams", async (kind) => {
+    const limit = MAX_CHECKSUM_MANIFEST_BYTES;
+    const state = stream([Buffer.alloc(limit), Buffer.from("x"), Buffer.from("unused")],
+      kind === "header" ? { "content-length": String(limit + 1) } : kind === "lying header" ? { "content-length": "1" } : {});
+    await expect(httpsGetText("https://example.test/body", undefined, limit)).rejects.toThrow(`example.test exceeds the ${limit}-byte limit`);
+    expect(state.delivered()).toBe(kind === "header" ? 0 : 2);
+    expect(state.destroyResponse).toHaveBeenCalled();
+    expect(state.destroyRequest).toHaveBeenCalled();
+  });
+
+  it.each(["aborted", "close", "end"])("rejects incomplete text on %s", async (ending) => {
+    stream([Buffer.from("partial")], { "content-length": "100" }, ending);
+    await expect(httpsGetText("https://example.test/body", undefined)).rejects.toThrow();
+  });
+
+  it("writes exactly the asset byte limit", async () => {
+    stream([Buffer.alloc(MAX_RELEASE_ASSET_BYTES)], { "content-length": String(MAX_RELEASE_ASSET_BYTES) });
+    const dest = path.join(dir, "asset");
+    await httpsGetFile("https://example.test/asset", dest, 5);
+    expect(fs.statSync(dest).size).toBe(MAX_RELEASE_ASSET_BYTES);
+  });
+
+  it.each(["header", "stream", "lying header", "aborted", "close", "short"])("removes the partial file on %s rejection", async (kind) => {
+    const over = kind === "stream" || kind === "lying header";
+    const state = stream(over ? [Buffer.alloc(MAX_RELEASE_ASSET_BYTES), Buffer.from("x"), Buffer.from("unused")] : [Buffer.from("partial")],
+      kind === "header" ? { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) } : kind === "short" || kind === "lying header" ? { "content-length": "100" } : {},
+      kind === "aborted" || kind === "close" ? kind : "end");
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow();
+    expect(fs.existsSync(dest)).toBe(false);
+    expect(state.destroyRequest).toHaveBeenCalled();
+    if (kind === "header") expect(state.delivered()).toBe(0);
+    if (over) expect(state.delivered()).toBe(2);
+  });
+
+  it("removes the destination after a write error", async () => {
+    stream([Buffer.from("partial")]);
+    const dest = path.join(dir, "asset");
+    const actual = (await vi.importActual<typeof fs>("node:fs")).createWriteStream;
+    const spy = vi.mocked(fs.createWriteStream).mockImplementationOnce((...args) => {
+      const file = actual(...args);
+      file.once("open", () => file.destroy(new Error("disk full")));
+      return file;
+    });
+    try {
+      await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("disk full");
+      expect(fs.existsSync(dest)).toBe(false);
+    } finally { spy.mockImplementation(actual); }
+  });
+
+  it.each(["release", "manifest", "asset"])("keeps the existing prebuilt fallback for an oversized %s", async (stage) => {
+    const assetName = `stellar-canary-${RESOLVED.version}-${prebuiltTargetTriple(process.platform, process.arch)}.tar.gz`;
+    if (stage === "release") {
+      stream([], { "content-length": String(MAX_API_RESPONSE_BYTES + 1) });
+    } else {
+      stream([Buffer.from(JSON.stringify({ assets: [
+        { name: assetName, browser_download_url: "https://example.test/asset" },
+        { name: "SHA256SUMS", browser_download_url: "https://example.test/manifest" },
+      ] }))]);
+      if (stage === "manifest") {
+        stream([], { "content-length": String(MAX_CHECKSUM_MANIFEST_BYTES + 1) });
+      } else {
+        stream([Buffer.from(`${"0".repeat(64)}  ${assetName}`)]);
+        stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+      }
+    }
+    execMock.mockClear();
+    await expect(installPrebuiltRelease(RESOLVED)).resolves.toBeUndefined();
+    expect(execMock).not.toHaveBeenCalled();
+  });
+
+  it("applies the asset limit after a redirect", async () => {
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      const response = new FakeResponse(302);
+      response.headers.location = "https://cdn.test/asset";
+      queueMicrotask(() => callback(response));
+      return new FakeRequest();
+    });
+    stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("cdn.test");
+    expect(fs.existsSync(dest)).toBe(false);
   });
 });

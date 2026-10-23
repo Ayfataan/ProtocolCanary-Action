@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { uploadReceipt, uploadReport } from "./artifact";
+import { postPullRequestComment } from "./comment";
 import {
   emitAnnotations,
   emitBaselineFailureAnnotation,
@@ -14,7 +15,7 @@ import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./cana
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs } from "./inputs";
-import { printLogBlock } from "./log-block";
+import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import { countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
 import type { CanaryReport } from "./output";
 import { buildReceipt, serializeReceipt } from "./receipt";
@@ -74,7 +75,7 @@ async function handleExecutionFailure(
   annotate: boolean,
   engineVersion: string = "",
 ): Promise<void> {
-  core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${reason}`);
+  core.setFailed(`Protocol Canary could not be executed.\n\nReason:\n${formatSafeDiagnosticTail(reason)}`);
   if (annotate) {
     emitExecutionFailureAnnotation(reason, diagnostic);
   }
@@ -320,16 +321,33 @@ export async function run(): Promise<void> {
       // diagnostic; the summary says "unverified" instead of guessing.
       core.debug("Provenance: could not hash the executed binary for the summary.");
     }
-    await writeSummary(
-      renderSummaryMarkdown(report, {
+    const summaryMarkdown = renderSummaryMarkdown(report, {
         ...(binarySha256 !== undefined ? { binarySha256 } : {}),
         engineVersion: installed.version,
         // Reproduction command (issue #416): the exact argument array the
         // engine was invoked with, so a reader can rerun the same check.
         engineArgs,
         reportWriteError,
-      }),
-    );
+      });
+    await writeSummary(summaryMarkdown);
+    if (inputs.prComment) {
+      let event: { pull_request?: { number?: number; head?: { repo?: { fork?: boolean } } } } = {};
+      try {
+        if (process.env.GITHUB_EVENT_PATH) {
+          event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8")) as typeof event;
+        }
+      } catch {
+        core.warning("PR comment skipped: event payload could not be read.");
+      }
+      await postPullRequestComment(summaryMarkdown, inputs.githubToken, {
+        eventName: process.env.GITHUB_EVENT_NAME ?? "",
+        repository: process.env.GITHUB_REPOSITORY ?? "",
+        pullRequest: event.pull_request?.number,
+        fork: event.pull_request?.head?.repo?.fork === true,
+        workflow: process.env.GITHUB_WORKFLOW ?? "workflow",
+        job: process.env.GITHUB_JOB ?? "job",
+      });
+    }
   } catch (error) {
     core.setFailed(describeError(error));
   }

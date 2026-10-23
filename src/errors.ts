@@ -41,6 +41,25 @@ export class InstallationFailedError extends CanaryActionError {
   }
 }
 
+/**
+ * A downloaded artifact (the fixture pack archive, or a release asset) was
+ * found to diverge from its published SHA-256 checksum, or a computed pack
+ * digest did not match the canonical registry digest. Verification aborts
+ * before the artifact is used or handed to the extractor any further, so a
+ * corrupted or tampered download can never reach the checks.
+ */
+export class ChecksumMismatchError extends CanaryActionError {
+  readonly code = "ChecksumMismatch";
+
+  constructor(
+    message: string,
+    readonly expected?: string,
+    readonly actual?: string,
+  ) {
+    super(message);
+  }
+}
+
 /** The Canary process could not be started or was killed abnormally. */
 export class CanaryExecutionFailedError extends CanaryActionError {
   readonly code = "CanaryExecutionFailed";
