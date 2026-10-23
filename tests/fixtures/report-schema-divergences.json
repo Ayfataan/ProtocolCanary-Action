@@ -1,0 +1,141 @@
+{
+  "$comment": [
+    "Observed disagreements between the pinned report schema (#447) and the",
+    "Action's parseReport verdicts, one entry per disagreement, written from",
+    "actual observations of tests/unit/report-schema-differential.test.ts",
+    "(not predictions). direction names which side accepts the report:",
+    "'schema-rejects/action-accepts' means the schema rejects the report but",
+    "parseReport accepts it; 'schema-accepts/action-rejects' is the reverse.",
+    "The differential test requires this list to match the observed set of",
+    "disagreements exactly, so a stale or missing entry fails the test.",
+    "See issue #447: https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+  ],
+  "divergences": [
+    {
+      "rule": "del:counts",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema marks counts as required, but parseReport re-derives counts from results/skipped instead of rejecting the report (CF-01 section 3 requires counts; the Action tolerates engines that predate it rather than discarding an otherwise complete compatibility report).",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "del:counts.member",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "A counts object missing any member fails the schema's required list, but the Action's shape check tolerates a missing 'skipped' member and re-derives all counts from results/skipped anyway.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "type:counts",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "A non-object counts value fails the schema's type keyword; the Action treats any counts value it cannot read as 'not recorded' and re-derives counts instead of rejecting.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "type:counts.member",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "A non-numeric counts member fails the schema's integer type; the Action's counts shape check fails closed into derivation (counts re-derived from results/skipped) rather than rejecting the report.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "type:network-null",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "JSON Schema 'type: object' does not admit null, but the Action deliberately treats an explicit network: null the same as an absent network field — an offline run, never an error.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "enum:project.type",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema constrains project.type to a controlled vocabulary, but the Action only requires it to be a non-empty string: CF-01 says consumers must treat unknown project types as opaque text, not as a reason to discard the report.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "noninteger:results[i].protocol",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema requires results[].protocol to be an integer, but the Action's result shape check only requires a number — the value is informational (equals targetProtocol) and is never rendered or compared as an integer by the Action.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "min:results[i].protocol",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema floors results[].protocol at 1; the Action only checks it is a number and does not enforce the minimum, for the same reason as the non-integer case.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "noninteger:results[i].durationMs",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema requires results[].durationMs to be an integer; the Action only requires a number. CF-01 marks durationMs as unstable data that must never be compared, so a fractional value cannot change a compatibility verdict.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "min:results[i].durationMs",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema floors results[].durationMs at 0; the Action does not enforce the minimum — a negative duration is bad engine data but not a reason to discard an otherwise valid report.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "type:results[i].source",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema types results[].source as a string, but the Action's result shape check does not validate source at all — the field is read defensively and unknown values are treated as 'not live', so a wrong-typed value cannot fake compatibility evidence.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "type:git",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema types git as an object; the Action does not validate git at all — it is provenance context rendered defensively, so a malformed value is never a reason to discard a compatibility result.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "type:verbose",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema types verbose as a boolean; the Action does not validate the field — it is informational metadata the Action never reads.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "del:run.toolBuildCommit",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema requires run.toolBuildCommit when run is present; the Action does not validate the run object — engine build provenance is copied through to the Execution Receipt defensively, never used for a verdict.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "enum:skipped[i].surface",
+      "direction": "schema-rejects/action-accepts",
+      "reason": "The schema constrains skipped[].surface to the three-surface enum, but the Action's skip shape check accepts any non-empty string: skipped entries are planner output, and CF-01 treats their surface as free-form provenance text rather than a controlled vocabulary.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/447"
+    },
+    {
+      "rule": "probe:absent-fixture-id",
+      "direction": "schema-accepts/action-rejects",
+      "reason": "The schema makes results[].fixtureId optional, but the Action requires every result to carry fixtureId as a string or explicit null (results are keyed by (surface, fixtureId) for the duplicate-identity check, so an absent fixtureId would silently change a result's identity).",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "probe:counts-disagree",
+      "direction": "schema-accepts/action-rejects",
+      "reason": "The schema cannot express cross-field consistency; the Action rejects a report whose counts disagree with what results/skipped actually contain, because doctored or truncated counts could mask a failure.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "probe:duplicate-identity",
+      "direction": "schema-accepts/action-rejects",
+      "reason": "The schema has no uniqueness constraint over results; the Action rejects a report where two results share a (surface, identity) pair, per CF-01 section 4 — a duplicated passing result could otherwise mask a failure.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "probe:empty-tool-version",
+      "direction": "schema-accepts/action-rejects",
+      "reason": "The schema admits an empty toolVersion string; the Action requires it to be non-empty — an empty version is a broken engine build marker, and the field is displayed in annotations and receipts.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "probe:empty-project-name",
+      "direction": "schema-accepts/action-rejects",
+      "reason": "The schema admits an empty project.name; the Action requires it non-empty — the name is rendered in the job summary and annotation text, where an empty value would silently produce misleading output.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    },
+    {
+      "rule": "probe:empty-network-name",
+      "direction": "schema-accepts/action-rejects",
+      "reason": "The schema admits an empty network.name string; the Action requires it non-empty — an empty network name would render as a blank identity in annotations while implying a live run was performed.",
+      "reference": "https://github.com/StellarCanary/ProtocolCanary-Action/issues/431"
+    }
+  ]
+}

@@ -353,12 +353,25 @@ export function parseReport(stdout: string): CanaryReport {
         `A newer Protocol-Canary release may require a newer ProtocolCanary-Action version.`,
     );
   }
-  if (
-    typeof report.status !== "string" ||
-    !["pass", "warning", "fail", "error"].includes(report.status) ||
-    !Array.isArray(report.results)
-  ) {
-    throw new InvalidReportError("Canary's JSON output does not match the documented report shape.");
+  // Split into field-specific errors (rather than one combined shape check)
+  // so a rejected report always names the offending field — the differential
+  // test for #447 asserts that every schema-required-field/type violation is
+  // rejected with an error that identifies the field it violates.
+  if (typeof report.status !== "string") {
+    throw new InvalidReportError(
+      'Canary\'s JSON output is missing or has an invalid "status" field: expected a string.',
+    );
+  }
+  if (!["pass", "warning", "fail", "error"].includes(report.status)) {
+    throw new InvalidReportError(
+      `Canary's JSON output has an invalid "status" field: expected one of ` +
+        `"pass", "warning", "fail", "error" (got ${JSON.stringify(report.status)}).`,
+    );
+  }
+  if (!Array.isArray(report.results)) {
+    throw new InvalidReportError(
+      'Canary\'s JSON output is missing or has an invalid "results" field: expected an array.',
+    );
   }
 
   // Validate required fields that the renderer and annotation code depend on

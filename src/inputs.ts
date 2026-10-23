@@ -3,13 +3,40 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { ConfigNotFoundError, InvalidInputError } from "./errors";
+import type { Surface } from "./output";
+
+/** The `surface` input accepts exactly the engine's three surface names. */
+export type SurfaceFilter = Surface;
 
 export interface ActionInputs {
   readonly protocol: number | undefined;
   readonly config: string | undefined;
+  /** Directory treated as Canary's project root (#348), resolved to an
+   * absolute path against the working directory; defaults to `.` (the
+   * workspace itself). Forwarded as `--project-root` only when it differs
+   * from the working directory — see {@link parseWorkingDirectory} and
+   * `buildCheckArgs` for why the default is deliberately not forwarded. */
+  readonly workingDirectory: string;
   readonly network: string | undefined;
+  readonly networkPassphrase: string | undefined;
   readonly rpcUrl: string | undefined;
+  readonly rpcMaxRetries: number | undefined;
+  readonly rpcRetryDelayMs: number | undefined;
   readonly fixturesDir: string;
+  /** Run only the fixture with this exact id (`--fixture=<id>`, #458).
+   * `undefined` when unset. Requires an engine release whose `check` accepts
+   * `--fixture`; see `engineSupportsFixtureSurfaceCacheDir` in runner.ts. */
+  readonly fixture: string | undefined;
+  /** Run only fixtures of this surface (`--surface=<surface>`, #458):
+   * exactly one of the engine's three lower-case surface names. `undefined`
+   * when unset. Same engine gate as {@link fixture}. */
+  readonly surface: SurfaceFilter | undefined;
+  /** Directory for cached fixture results (`--cache-dir=<path>`, #458),
+   * forwarded unchanged — the engine resolves a relative path against
+   * `--project-root` when one is given, so the Action never resolves it
+   * against the workspace. `undefined` when unset. Same engine gate as
+   * {@link fixture}. */
+  readonly cacheDir: string | undefined;
   readonly version: string;
   readonly uploadReport: boolean;
   readonly annotations: boolean;
@@ -34,6 +61,13 @@ export interface ActionInputs {
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
   readonly generateReceipt: boolean;
+  /** Render the parsed JSON report to JUnit XML through the engine's own
+   * `report <file> --format junit` command (#423) and expose the file as the
+   * `junit-report-path` output (also included in the artifact upload).
+   * Auxiliary: any failure — an engine without the command, a non-zero exit,
+   * empty output, a missing report file — is a warning only and can never
+   * change the compatibility result. */
+  readonly junitReport: boolean;
   /** Fail closed whenever binary integrity cannot be proven (issue #372).
    * Default `false` preserves the historical degrade-to-pinning behaviour. */
   readonly strictIntegrity: boolean;
@@ -55,6 +89,10 @@ const DECIMAL_INTEGER = /^[0-9]+$/;
  * rejected up front with a clear, input-naming message. */
 const PROTOCOL_MIN = 1;
 const PROTOCOL_MAX = 4294967295;
+const RPC_MAX_RETRIES_MAX = 4294967295;
+const RPC_RETRY_DELAY_MS_MAX = Number.MAX_SAFE_INTEGER;
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
+const NETWORK_PASSPHRASE_UNSET = "\u0001";
 
 /**
  * Largest whole number of minutes whose millisecond value is at most Node's
@@ -136,10 +174,27 @@ const PACK_VERSION_LIKE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-
 export function getInputs(): ActionInputs {
   const protocol = parseProtocol(core.getInput("protocol"));
   const config = parseConfig(core.getInput("config"));
+  const workingDirectory = parseWorkingDirectory(core.getInput("working-directory"));
   const network = optional(core.getInput("network"));
+  const networkPassphrase = parseNetworkPassphrase(core.getInput("network-passphrase", { trimWhitespace: false }));
   const rpcUrl = parseRpcUrl(core.getInput("rpc-url"));
+  const rpcMaxRetries = parseDecimalInteger(
+    core.getInput("rpc-max-retries"),
+    "rpc-max-retries",
+    0,
+    RPC_MAX_RETRIES_MAX,
+  );
+  const rpcRetryDelayMs = parseDecimalInteger(
+    core.getInput("rpc-retry-delay-ms"),
+    "rpc-retry-delay-ms",
+    0,
+    RPC_RETRY_DELAY_MS_MAX,
+  );
   const fixturesDir = core.getInput("fixtures-dir") || "fixtures";
-  const version = parseVersion(core.getInput("version") || "0.1.1");
+  const fixture = parseScopedFilter(core.getInput("fixture"), "fixture");
+  const surface = parseSurface(core.getInput("surface"));
+  const cacheDir = parseScopedFilter(core.getInput("cache-dir"), "cache-dir");
+  const version = parseVersion(core.getInput("version") || "0.2.0");
   const uploadReport = parseBoolean("upload-report", core.getInput("upload-report") || "true");
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
@@ -152,7 +207,23 @@ export function getInputs(): ActionInputs {
   if (githubToken !== undefined) {
     core.setSecret(githubToken);
   }
+  // A `working-directory` that resolves to the workspace itself is exactly
+  // what the engine already uses as its project root, so the default run is
+  // not forwarded anything and needs no explanation. Any other value changes
+  // what the engine treats as the project root and requires an engine that
+  // accepts `--project-root`; say so up front instead of leaving the user to
+  // infer it from a version-dependent CLI usage error.
+  if (workingDirectory !== path.resolve(".")) {
+    core.info(
+      `"working-directory" will be forwarded to Canary as --project-root (${JSON.stringify(workingDirectory)}). ` +
+        "This requires a Protocol-Canary release whose CLI supports --project-root; older releases reject the argument.",
+    );
+  }
+  if (networkPassphrase !== undefined) {
+    core.setSecret(networkPassphrase);
+  }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+  const junitReport = parseBoolean("junit-report", core.getInput("junit-report") || "false");
 
   const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
 
@@ -172,9 +243,16 @@ export function getInputs(): ActionInputs {
   return {
     protocol,
     config,
+    workingDirectory,
     network,
+    networkPassphrase,
     rpcUrl,
+    rpcMaxRetries,
+    rpcRetryDelayMs,
     fixturesDir,
+    fixture,
+    surface,
+    cacheDir,
     version,
     uploadReport,
     annotations,
@@ -185,9 +263,31 @@ export function getInputs(): ActionInputs {
     baselineReport,
     githubToken,
     generateReceipt,
+    junitReport,
     strictIntegrity,
     prComment: parseBoolean("pr-comment", core.getInput("pr-comment") || "false"),
   };
+}
+
+/** Validates an explicitly supplied passphrase without trimming it: spaces
+ * can be part of a network identity, while control characters are never safe
+ * in an Action input or CLI argument. An omitted input remains undefined. */
+function parseNetworkPassphrase(raw: string): string | undefined {
+  if (raw === NETWORK_PASSPHRASE_UNSET) {
+    return undefined;
+  }
+  if (raw === "") {
+    throw new InvalidInputError(
+      'Invalid "network-passphrase" input: "". Expected a non-empty passphrase without control characters.',
+    );
+  }
+  if (CONTROL_CHARACTERS.test(raw)) {
+    throw new InvalidInputError(
+      `Invalid "network-passphrase" input: ${JSON.stringify(raw)}. ` +
+        "Control characters are not allowed in a network passphrase.",
+    );
+  }
+  return raw;
 }
 
 /**
@@ -303,6 +403,59 @@ function optional(value: string): string | undefined {
   return value.trim() === "" ? undefined : value.trim();
 }
 
+/**
+ * Validates a scope-affecting string input (#458 `fixture`, `cache-dir`):
+ * trimmed, with empty/whitespace-only meaning *unset* (the same normalization
+ * as every optional string input), and free of control characters once
+ * trimmed — C0 (`U+0000`-`U+001F`), `U+007F`, and C1 (`U+0080`-`U+009F`).
+ *
+ * Nothing beyond control characters is restricted: the engine decides what a
+ * fixture id is, and a cache path legitimately contains spaces, dots, slashes,
+ * and can begin with `-` (forwarded as `--flag=value`, so it can never be
+ * mistaken for another option). A silently ignored value here would run a
+ * different scope than the caller asked for (#458), so a bad value is an
+ * input error, never a downgraded warning.
+ *
+ * Exported for tests: a NUL byte cannot be carried through `process.env`
+ * (the platform rejects it), so the NUL case of this check is only
+ * reachable through the function directly.
+ */
+export function parseScopedFilter(raw: string, inputName: string): string | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (CONTROL_CHARACTERS.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "${inputName}" input: ${JSON.stringify(value)}. ` +
+        "Control characters (C0, DEL, and C1) are not allowed.",
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the `surface` input (#458) as exactly one of the engine's three
+ * lower-case surface names; empty/whitespace-only means unset. The engine
+ * rejects any other value (`invalid value ... [possible values: xdr, rpc,
+ * soroban]`), and a case or spelling mismatch must fail here with an
+ * input-naming message instead of surfacing as an engine failure — or, worse,
+ * as a differently scoped run.
+ */
+function parseSurface(raw: string): SurfaceFilter | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== "xdr" && value !== "rpc" && value !== "soroban") {
+    throw new InvalidInputError(
+      `Invalid "surface" input: ${JSON.stringify(value)}. Expected exactly ` +
+        'one of "xdr", "rpc" or "soroban" (lower case).',
+    );
+  }
+  return value;
+}
+
 /** Validates the "protocol" input as an unsigned decimal integer from 1 to
  * 4294967295 inclusive (the engine's `--protocol` is a u32 and rejects 0);
  * undefined when unset. Throws {@link InvalidInputError} for anything else. */
@@ -337,6 +490,45 @@ function parseConfig(raw: string): string | undefined {
     throw new InvalidInputError(
       `Invalid "config" input: ${JSON.stringify(value)}. Expected a path to a configuration ` +
         "file, but the path is a directory.",
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Validates the "working-directory" input (#348) as a path to an existing
+ * directory, resolved against the current working directory; defaults to
+ * `.` (the workspace itself) when unset or whitespace-only, matching the
+ * declared default in `action.yml`.
+ *
+ * Throws {@link InvalidInputError} — naming the input, quoting the value as
+ * written, and including the resolved path — when nothing exists at that
+ * path or when it exists but is not a directory (e.g. a regular file), so
+ * the mistake is caught here rather than surfacing later as an engine exit
+ * code 2 with no actionable path context.
+ *
+ * Returns the *resolved* path rather than the raw input, for the same
+ * reason {@link parseConfig} does: the directory this function validated is
+ * then forwarded to the CLI as `--project-root`, and the two must be the
+ * same path by construction regardless of the working directory the engine
+ * happens to inherit.
+ */
+function parseWorkingDirectory(raw: string): string {
+  const value = optional(raw) ?? ".";
+  const resolved = path.resolve(value);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    throw new InvalidInputError(
+      `Invalid "working-directory" input: ${JSON.stringify(value)}. Expected a path to an existing ` +
+        `directory, but no such path exists (resolved to ${JSON.stringify(resolved)}).`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new InvalidInputError(
+      `Invalid "working-directory" input: ${JSON.stringify(value)}. Expected a path to a directory, ` +
+        `but the path is not a directory (resolved to ${JSON.stringify(resolved)}).`,
     );
   }
   return resolved;
