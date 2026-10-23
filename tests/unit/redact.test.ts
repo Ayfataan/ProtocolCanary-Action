@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { REDACTED, escapeWorkflowCommands, redact, redactSecrets } from "../../src/redact";
+import { REDACTED, describeUrlSafely, escapeWorkflowCommands, redact, redactSecrets } from "../../src/redact";
 
 /**
  * Synthetic secret vectors. They are assembled at runtime rather than written
@@ -150,5 +150,36 @@ describe("redact", () => {
   it("leaves ordinary log lines unchanged", () => {
     const text = "Running compatibility checks...\n0.1.1: 12/12 applicable checks passed.";
     expect(redact(text)).toBe(text);
+  });
+});
+
+describe("describeUrlSafely (#510)", () => {
+  it("keeps scheme, host, port and path and drops userinfo, query and fragment", () => {
+    expect(describeUrlSafely(new URL("http://user:pw@rpc.example.org:8545/v1/x?token=abc#frag"))).toBe(
+      "http://[REDACTED]@rpc.example.org:8545/v1/x?[REDACTED]",
+    );
+  });
+
+  it("returns a plain URL unchanged", () => {
+    expect(describeUrlSafely(new URL("http://example.com/rpc"))).toBe("http://example.com/rpc");
+  });
+
+  it("marks a user-only or password-only URL as carrying userinfo", () => {
+    expect(describeUrlSafely(new URL("ftp://user@example.org/x"))).toBe("ftp://[REDACTED]@example.org/x");
+    expect(describeUrlSafely(new URL("ftp://:pw@example.org/x"))).toBe("ftp://[REDACTED]@example.org/x");
+  });
+
+  it("marks a fragment-only URL with the redaction marker", () => {
+    expect(describeUrlSafely(new URL("ftp://example.org/x#frag"))).toBe("ftp://example.org/x?[REDACTED]");
+  });
+
+  it("masks a recognised token shape in the path", () => {
+    const token = `ghp_${"a1B2".repeat(9)}`;
+    expect(describeUrlSafely(new URL(`http://example.org/${token}/v1`))).toBe("http://example.org/[REDACTED]/v1");
+  });
+
+  it("describes a URL with no host without echoing any of it", () => {
+    expect(describeUrlSafely(new URL("mailto:someone@example.org"))).toBe("a URL with no host");
+    expect(describeUrlSafely(new URL("tok3n:rest"))).toBe("a URL with no host");
   });
 });

@@ -148,3 +148,25 @@ export function redactSecrets(text: string): string {
 export function redact(text: string): string {
   return escapeWorkflowCommands(redactSecrets(text));
 }
+
+/**
+ * Describes a parsed URL for an error message without echoing any credential
+ * it carries: the scheme, host (with port) and path are kept, userinfo is
+ * replaced by {@link REDACTED}, and a query string or fragment is dropped and
+ * replaced by a single {@link REDACTED} marker. The result is then passed
+ * through {@link redactSecrets}, so a recognised token shape in the path is
+ * masked as well.
+ *
+ * A URL with no authority (`mailto:`, `data:` and similar) is described only
+ * as having no host: for those forms the whole value is opaque, and even the
+ * "scheme" can be the leading part of a secret (`token123:rest` parses as the
+ * scheme `token123:`).
+ */
+export function describeUrlSafely(parsed: URL): string {
+  if (parsed.host === "") {
+    return "a URL with no host";
+  }
+  const userinfo = parsed.username !== "" || parsed.password !== "" ? `${REDACTED}@` : "";
+  const suffix = parsed.search !== "" || parsed.hash !== "" ? `?${REDACTED}` : "";
+  return redactSecrets(`${parsed.protocol}//${userinfo}${parsed.host}${parsed.pathname}${suffix}`);
+}

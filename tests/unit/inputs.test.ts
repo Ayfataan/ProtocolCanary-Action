@@ -1103,3 +1103,151 @@ describe("validateFixturesDir (#400)", () => {
       process.env["INPUT_RPC-URL"] = "not a url";
       expect(() => getInputs()).toThrow(InvalidInputError);
     });
+
+describe("rejected rpc-url values never echo credentials (#510)", () => {
+  beforeEach(clearInputs);
+  afterEach(clearInputs);
+
+  /** The message getInputs() throws for this rpc-url value. Secrets are built
+   * from fragments inside each test so no literal credential-looking string
+   * appears in a log if an assertion fails. */
+  function rejectionMessage(rpcUrl: string): string {
+    process.env["INPUT_RPC-URL"] = rpcUrl;
+    try {
+      getInputs();
+    } catch (error) {
+      expect(error).toBeInstanceOf(InvalidInputError);
+      return (error as Error).message;
+    }
+    throw new Error("expected getInputs() to reject this rpc-url");
+  }
+
+  it("redacts userinfo and query credentials of a rejected http:// URL but keeps the host and the https rule", () => {
+    const userSecret = ["KEY", "SECRET", "123"].join("");
+    const querySecret = ["SECRET", "456"].join("");
+    const message = rejectionMessage(`http://user:${userSecret}@rpc.example.org/v1?api_key=${querySecret}`);
+
+    expect(message).not.toContain(userSecret);
+    expect(message).not.toContain(querySecret);
+    expect(message).not.toContain("user:");
+    expect(message).not.toContain("api_key");
+    expect(message).toContain("rpc.example.org");
+    expect(message).toContain("/v1");
+    expect(message).toContain("[REDACTED]");
+    expect(message).toContain("Must be an https:// URL (plain http:// is only accepted for localhost/127.0.0.1).");
+  });
+
+  it("keeps the exact message shape for a rejected URL that carries no credentials", () => {
+    expect(rejectionMessage("http://example.com/rpc")).toBe(
+      'Invalid "rpc-url" input: http://example.com/rpc. Must be an https:// URL ' +
+        "(plain http:// is only accepted for localhost/127.0.0.1).",
+    );
+  });
+
+  it("redacts userinfo, query and fragment of a rejected non-http scheme", () => {
+    const message = rejectionMessage("ftp://user:pw@example.org/x?token=abc#frag");
+
+    for (const secret of ["pw", "abc", "frag", "token", "user"]) {
+      expect(message).not.toContain(secret);
+    }
+    expect(message).toContain("example.org");
+    expect(message).toContain("/x");
+  });
+
+  it("redacts a fragment on its own", () => {
+    const fragment = ["frag", "secret"].join("-");
+    const message = rejectionMessage(`ftp://example.org/x#${fragment}`);
+
+    expect(message).not.toContain(fragment);
+    expect(message).toContain("example.org");
+  });
+
+  it("keeps a non-default port visible", () => {
+    const message = rejectionMessage("http://user:pw@rpc.example.org:8545/v1");
+
+    expect(message).toContain("rpc.example.org:8545");
+    expect(message).not.toContain("pw");
+  });
+
+  it("masks a GitHub token that sits in the path of a rejected URL", () => {
+    const token = `ghp_${"a1B2".repeat(9)}`;
+    const message = rejectionMessage(`http://rpc.example.org/${token}/v1`);
+
+    expect(message).not.toContain(token);
+    expect(message).toContain("rpc.example.org");
+    expect(message).toContain("[REDACTED]");
+  });
+
+  it("describes a URL without an authority as having no host, without echoing its scheme or remainder", () => {
+    const secret = ["mail", "secret"].join("-");
+    const message = rejectionMessage(`mailto:${secret}@example.org?subject=${secret}`);
+
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain("example.org");
+    expect(message).not.toContain("mailto");
+    expect(message).toContain("a URL with no host");
+    expect(message).toContain("Must be an https:// URL");
+  });
+
+  it("does not echo any part of an unparseable value with whitespace in the host", () => {
+    const secret = ["SECRET"].join("");
+    const message = rejectionMessage(`https://user:KEY@exa mple.org/?key=${secret}`);
+
+    for (const fragment of ["user", "KEY", secret, "exa", "mple", "key="]) {
+      expect(message).not.toContain(fragment);
+    }
+    expect(message).toContain("contains whitespace");
+    expect(message).toContain("Expected a valid URL.");
+  });
+
+  it("does not echo an unparseable value that is not a URL at all", () => {
+    const message = rejectionMessage("not a url KEY");
+
+    expect(message).not.toContain("not a url");
+    expect(message).not.toContain("KEY");
+    expect(message).toContain("13 characters");
+    expect(message).toContain("contains whitespace");
+  });
+
+  it("does not echo the leading part of a value that merely parses as an opaque scheme", () => {
+    const message = rejectionMessage("tok3n:rest:KEY");
+
+    for (const fragment of ["tok3n", "rest", "KEY"]) {
+      expect(message).not.toContain(fragment);
+    }
+    expect(message).toContain("a URL with no host");
+  });
+
+  it("reports only the length for an unparseable value without whitespace", () => {
+    const message = rejectionMessage("//KEY-only");
+
+    expect(message).not.toContain("KEY");
+    expect(message).toContain("10 characters");
+    expect(message).not.toContain("contains whitespace");
+  });
+
+  it("writes nothing that contains the original value to the log while rejecting", () => {
+    const secret = ["LOG", "SECRET", "789"].join("");
+    rejectionMessage(`http://user:${secret}@rpc.example.org/v1?api_key=${secret}`);
+
+    for (const mock of [infoMock, warningMock, setSecretMock]) {
+      expect(JSON.stringify(mock.mock.calls)).not.toContain(secret);
+    }
+  });
+
+  it("leaves accepted values untouched: https with a query string, localhost and loopback http", () => {
+    process.env["INPUT_RPC-URL"] = "https://rpc.example.org/v1?api_key=kept-as-is";
+    expect(getInputs().rpcUrl).toBe("https://rpc.example.org/v1?api_key=kept-as-is");
+
+    process.env["INPUT_RPC-URL"] = "http://localhost:8000/soroban/rpc";
+    expect(getInputs().rpcUrl).toBe("http://localhost:8000/soroban/rpc");
+
+    process.env["INPUT_RPC-URL"] = "http://127.0.0.1:8000/soroban/rpc";
+    expect(getInputs().rpcUrl).toBe("http://127.0.0.1:8000/soroban/rpc");
+  });
+
+  it("treats an empty or whitespace-only rpc-url as unset", () => {
+    process.env["INPUT_RPC-URL"] = "   ";
+    expect(getInputs().rpcUrl).toBeUndefined();
+  });
+});
