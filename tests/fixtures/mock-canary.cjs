@@ -9,6 +9,10 @@
  * Supported scenarios: pass, pass-network, pass-no-counts, pass-with-result-source, warning,
  * fail, config-error, empty-run, rpc-error, fixture-error, internal-error,
  * malformed-json, timeout.
+ *
+ * The `report` subcommand (#423) renders JUnit XML; its scenarios are
+ * junit-fail (non-zero exit), junit-empty (no output), and junit-unknown
+ * (an engine that predates the command and rejects the subcommand).
  */
 "use strict";
 
@@ -101,6 +105,39 @@ function fail(exitCode, message) {
 
 if (args[0] === "version") {
   process.stdout.write(`stellar-canary ${version}\n`);
+  process.exit(0);
+}
+
+if (args[0] === "report") {
+  // #423: `stellar-canary report <file> --format junit`. A report file that
+  // does not exist exits 2, like the real engine; every junit-* scenario
+  // overrides the success path.
+  if (scenario === "junit-unknown") {
+    fail(2, `unknown subcommand ${JSON.stringify("report")}`);
+  }
+  const formatIndex = args.indexOf("--format");
+  const format = formatIndex === -1 ? "json" : args[formatIndex + 1];
+  if (format !== "junit") {
+    fail(2, `unsupported --format ${JSON.stringify(String(format))}`);
+  }
+  const reportFile = args[1];
+  if (typeof reportFile !== "string" || !require("node:fs").existsSync(reportFile)) {
+    fail(2, `report file not found: ${JSON.stringify(String(reportFile))}`);
+  }
+  if (scenario === "junit-fail") {
+    fail(5, "internal error while rendering JUnit XML");
+  }
+  if (scenario === "junit-empty") {
+    process.exit(0);
+  }
+  process.stdout.write(
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<testsuites name="stellar-canary" tests="1" failures="0" errors="0">\n' +
+      '  <testsuite name="stellar-canary" tests="1" failures="0" errors="0" time="0">\n' +
+      '    <testcase classname="xdr" name="p28-xdr-cap83-empty-tx-set" time="0.001"/>\n' +
+      "  </testsuite>\n" +
+      "</testsuites>\n",
+  );
   process.exit(0);
 }
 

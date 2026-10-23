@@ -20,7 +20,7 @@ before the exit-code suite existed) is recorded at
 <https://github.com/nemeregiftbrown-byte/ProtocolCanary-Action/actions/runs/39406571511>,
 which also contains the first observations of the consumer failure below.
 
-## The consumer failure (reported, not fixed here)
+## The consumer failure (historical run; follow-up fix pending verification)
 
 Both consumer runs (the rows above marked FAIL) end at a failure that is
 not about engine compatibility at all. The Action fails to load with:
@@ -31,25 +31,23 @@ Located at position 1 within expression: github.token
 ##[error]Failed to load ./action.yml
 ```
 
-The `github-token` input in `action.yml` declares
+At the tested commit, the `github-token` input declared
 `default: ${{ github.token }}`, but the `github` context is not available
-in action-metadata input defaults (only `inputs.*` is), so every
-`uses:`-based run of the Action fails before `cargo install` is ever
-reached — this is why the install-from-tag chapters of the table are FAIL
-rather than PASS. In line with issue #439's technical guidance ("If you
-find an Action bug while verifying, report it with the run URL rather than
-fixing it in this PR"), the bug is reported here unchanged; the README's
-supported-versions table therefore lists no 0.2.0 combination, because no
-run has ever demonstrated it end to end (see the negative-testing rule:
-"a table row without a run is not acceptable"). The one-line metadata fix
-should land in its own PR, after which the consumer rows above can be
-re-run and then promoted.
+in action-metadata input defaults. That caused every `uses:`-based run to
+fail before `cargo install` was reached. The historical 0.1.1 and 0.2.0
+consumer outcomes above remain **FAIL** and are not retroactively changed.
+
+The metadata default has since been removed in the v2 preparation changes;
+`github-token` is now optional and the Action falls back to `GITHUB_TOKEN`
+when the runner provides it, otherwise public API requests are unauthenticated.
+The consumer workflows must be rerun against this change before either engine
+version is recorded as passing or added to the supported-versions table.
 
 ## What was NOT run
 
-- No consumer run has ever reached `cargo install --git … --tag v0.2.0`
-  (blocked by the load failure above), and no consumer run has passed for
-  any engine version. The engine-compatibility evidence in rows 1–2 comes
+- The historical consumer runs did not reach `cargo install --git … --tag
+  v0.2.0` (blocked by the load failure above), and no consumer run has passed
+  for any engine version as of this record. The engine-compatibility evidence in rows 1–2 comes
   from engines built from source and the Action's own test suite, which is
   exactly what `engine-compat.yml` runs.
 - The Fixtures pack tag under test is `protocol-28` (commit `75ec2c2`).
