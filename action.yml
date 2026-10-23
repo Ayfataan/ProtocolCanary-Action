@@ -218,6 +218,22 @@ inputs:
     required: false
     default: "false"
 
+  fail-on-warning:
+    description: >-
+      Fail the check when Protocol Canary reports warnings. This input is
+      ignored with a warning until Protocol-Canary releases a version that
+      supports `--fail-on-warning`; it defaults to `false`.
+    required: false
+    default: "false"
+
+  offline:
+    description: >-
+      Run without network fixtures. This input is ignored with a warning
+      until Protocol-Canary releases a version that supports `--offline`;
+      it defaults to `false`.
+    required: false
+    default: "false"
+
   fixtures-pack-version:
     description: >-
       Release tag of the fixture pack to run against, for example `v1.2.0`
@@ -278,6 +294,14 @@ inputs:
       endorsement, and release signing is deferred; the download-redirect
       allowlist policy (D-11) remains blocked until verified against real
       release hosts, so no redirect is followed at all today.
+    required: false
+    default: "false"
+
+  pr-comment:
+    description: >-
+      Opt in to a bounded pull request summary comment. Requires pull-requests: write
+      on same-repository pull_request workflows. Fork PRs and other events are skipped.
+      Permission failures are warnings, not failed checks. Defaults to false.
     required: false
     default: "false"
 
