@@ -80,6 +80,8 @@ const BASE_INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 15,
   allowEmpty: false,
+  failOnWarning: false,
+  offline: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
   baselineReport: undefined,
@@ -87,6 +89,7 @@ const BASE_INPUTS: ActionInputs = {
   generateReceipt: false,
   junitReport: false,
   strictIntegrity: false,
+  prComment: false,
   workingDirectory: path.resolve("."),
 };
 
@@ -193,6 +196,33 @@ describe("buildCheckArgs", () => {
     // merged with adjacent flags or split by the shell.
     expect(args).toContain("testnet; rm -rf /");
     expect(args.some((a) => a.includes("--network testnet"))).toBe(false);
+  });
+
+  it("forwards fail-on-warning and offline only when enabled and supported", () => {
+    const supportedVersion = "999999999.0.0";
+    const baseArgs = buildCheckArgs(BASE_INPUTS);
+
+    expect(
+      buildCheckArgs({ ...BASE_INPUTS, failOnWarning: true }, supportedVersion),
+    ).toEqual([...baseArgs, "--fail-on-warning"]);
+    expect(buildCheckArgs({ ...BASE_INPUTS, offline: true }, supportedVersion)).toEqual([
+      ...baseArgs,
+      "--offline",
+    ]);
+    expect(
+      buildCheckArgs(
+        { ...BASE_INPUTS, failOnWarning: true, offline: true },
+        supportedVersion,
+      ),
+    ).toEqual([...baseArgs, "--fail-on-warning", "--offline"]);
+    for (const unsupportedVersion of [undefined, "0.2.0", "not-a-version"]) {
+      expect(
+        buildCheckArgs(
+          { ...BASE_INPUTS, failOnWarning: true, offline: true },
+          unsupportedVersion,
+        ),
+      ).toEqual(baseArgs);
+    }
   });
 
   describe("fixture, surface, and cache-dir forwarding (#458)", () => {

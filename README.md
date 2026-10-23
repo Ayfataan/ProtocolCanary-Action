@@ -142,6 +142,7 @@ jobs:
 |---|---|---|
 | `protocol` | Target Stellar protocol version (`--protocol`), a whole number from 1 to 4294967295 (the engine rejects 0). | (from `.stellar-canary.toml`, or 28) |
 | `config` | Path to `.stellar-canary.toml` (`--config`). Fails clearly if the given path does not exist, or is not a regular file (e.g. a directory). | (CLI default lookup) |
+| `working-directory` | Directory to treat as the project root, forwarded as `--project-root` so a monorepo can check one subdirectory or workspace member. Relative paths are resolved against the workspace; a path that does not exist or is not a directory fails the run before Canary is invoked. The default (`.`, the workspace itself) is validated but not forwarded. Requires a Protocol-Canary release whose CLI supports `--project-root`; older releases reject the argument. | `.` |
 | `network` | Network for live RPC/Soroban checks (`--network`). | `testnet` (CLI default) |
 | `network-passphrase` | Expected network identity for RPC verification (`--network-passphrase`). Preserved exactly, must be non-empty and contain no control characters. An explicit value overrides the passphrase associated with `network`. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | (none) |
 | `rpc-url` | Stellar RPC endpoint (`--rpc-url`). Must be `https://`, or `http://localhost`/`127.0.0.1` for local development. | (none) |
@@ -155,12 +156,17 @@ jobs:
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
+| `fail-on-warning` | Treat Protocol Canary warnings as failures (`--fail-on-warning`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
+| `offline` | Skip network-dependent fixtures (`--offline`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
 | `junit-report` | Render the JSON report to JUnit XML using the engine's own `stellar-canary report <file> --format junit` command and expose the file as the `junit-report-path` output. Written next to the JSON report and included in the artifact when `upload-report` is `true`. **Minimum engine version:** the release that adds `report --format junit` (Protocol-Canary #434; not in `0.2.0`) — with an older engine nothing is produced and a warning is logged. Any failure (unsupported engine, non-zero exit, empty output, missing report file) is a warning only: it never changes `status` and never fails the job. | `false` |
 | `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
 | `github-token` | Optional token for read-only requests to `api.github.com` for version resolution and checksum discovery. Set it to `${{ github.token }}` to authenticate (requires `contents: read`); otherwise requests are unauthenticated unless `GITHUB_TOKEN` is present in the environment. Pass an empty string (`""`) to disable authentication. | (none) |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
 | `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected, as with `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
 | `baseline-report` | Path to a previous Protocol Canary JSON report. The file must exist and be a schemaVersion 1 report for the same target protocol as this run. **Validated only**: the engine's `diff` command is not released yet (#335), so no regression verdict is produced. A missing, malformed, or protocol-incompatible baseline fails the run with an actionable annotation. | (none) |
+| `generate-receipt` | Generate a machine-readable Execution Receipt (provenance: engine version, engine build commit, fixture-pack digest, target protocol, observed protocol, timestamp) and upload it as the `stellar-canary-receipt-<run-id>` artifact; `receipt-path` carries the file location. | `false` |
+| `strict-integrity` | Fail-closed integrity policy. When `true`, the run aborts whenever binary integrity cannot be proven (no published checksum manifest, no entry for this platform, or a checksum lookup that could not be completed); when `false` it degrades to commit/tag pinning with a debug note. A checksum mismatch aborts the run in either mode. A checksum verifies data integrity, not the release author's identity. See [`docs/security-model.md`](docs/security-model.md). | `false` |
+| `pr-comment` | Opt in to a bounded pull request summary comment. Requires `pull-requests: write` on same-repository `pull_request` workflows; fork PRs and other events are skipped, and permission failures are warnings, not failed checks. | `false` |
 
 There is deliberately no `format` input: the Action always requests
 `--format json` from the CLI (the only way it can build the summary and
@@ -188,7 +194,8 @@ literals below.
 | `pack-protocol` | Protocol version of the resolved fixture pack, from `fixturePack.protocol` in the report or the `fixtures-pack-protocol` input. Empty when no pack identity is recorded. | `"28"` |
 | `pack-version` | Release tag/version of the resolved fixture pack, from `fixturePack.version`/`tag` or the `fixtures-pack-version` input. Empty when no pack identity is recorded. | `"v1.2.0"` |
 | `pack-digest` | Canonical content digest of the resolved fixture pack, formatted as `sha256:<64 lowercase hex>`, when the report records one. Empty when no digest is recorded or the recorded value is malformed; the Action never fabricates a digest. | `"sha256:…"` |
-| `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse and the report file was written successfully; empty/unset on report write failure or execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `receipt-path` | Absolute path to the generated Execution Receipt JSON. Set only when `generate-receipt` is `true` and Canary produced a parseable report; unset otherwise, including on an execution failure. | `/home/runner/work/_temp/stellar-canary-receipt.json` |
 | `junit-report-path` | Absolute path to the generated JUnit XML file. Only set when `junit-report` is `true` **and** the engine's render succeeded; unset otherwise (input disabled, engine without the command, failed/empty render) and on an execution failure. A failed render is always a warning, never a status change. | `/home/runner/work/_temp/stellar-canary-report.junit.xml` |
 
 A concrete consumer, using the outputs to gate a follow-up step:
@@ -392,6 +399,15 @@ in GitHub Actions collapsed log groups:
   disabled via `::stop-commands::` using fresh random tokens to prevent command
   injection.
 
+- **Credential masking:** When an `rpc-url` input contains credentials in userinfo
+  (`user:password@host`), query parameter values, or a fragment, the Action registers
+  these sensitive values with the GitHub Actions runner via `core.setSecret()`. The
+  complete credential-bearing URL is also registered when sensitive components are
+  present. Plain RPC URLs without userinfo, query parameters, or a fragment are
+  unaffected. GitHub Actions runner masking is best effort — very short values may
+  not be masked due to runner limitations. Users should continue using GitHub Actions
+  secrets for RPC credentials and avoid intentionally printing sensitive values.
+
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
@@ -587,3 +603,8 @@ The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail
 ## License
 
 [Apache-2.0](LICENSE)
+
+
+### Optional pull request comment (experimental)
+
+Set `pr-comment: "true"` to request a bounded copy of the existing escaped job summary as a pull request comment. The default is `false`. Same-repository `pull_request` jobs require `pull-requests: write`; fork PRs and non-PR events do not post comments. Missing permissions cause a warning without failing the check. The comment is capped at 60,000 characters and updates an existing bot-authored comment for the workflow/job where found. This feature is pending maintainer security approval and is not ready for production use.

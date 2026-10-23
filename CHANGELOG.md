@@ -118,6 +118,10 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
+- README's tables now document the `generate-receipt` input and the
+  `receipt-path` output — both were declared in `action.yml` and wired
+  through the Action but missing from the Inputs/Outputs tables, so the
+  documented contract lagged the declared one ([#412]).
 - README gains a "Troubleshooting" section mapping the most common
   execution-failure messages (`cargo` not found, `cargo install` exit
   101, timeouts, unparsable reports, unsupported `schemaVersion`, missing
@@ -194,6 +198,16 @@ All notable changes to this project are documented in this file.
 
 ### Testing
 
+- Added `tests/unit/contract-sync.test.ts` (#412): a contract test that
+  keeps `action.yml`, the `getInputs()` parser, the `setOutput` calls in
+  `run()` (success and execution-failure paths), the README Inputs/Outputs
+  tables, every `examples/*.yml`, and the reusable workflow in sync —
+  asserting the declared inputs are exactly the read inputs, the declared
+  outputs exactly the set outputs, README defaults match `action.yml`, and
+  no example step passes an undeclared `with:` key. Every failure message
+  names the offending input/output/file. Adds `yaml` (pinned dev
+  dependency) for parsing the YAML files; the README tables are parsed with
+  plain line logic, no Markdown dependency.
 - Added a `resolveVersion` test pinning that an explicit whitespace-only
   `token` is treated as "no token" — the tag-lookup request carries no
   `Authorization` header at all, matching the documented empty-secret

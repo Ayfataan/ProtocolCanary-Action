@@ -129,6 +129,8 @@ const INPUTS: ActionInputs = {
   annotations: true,
   timeoutMinutes: 1,
   allowEmpty: false,
+  failOnWarning: false,
+  offline: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
   baselineReport: undefined,
@@ -136,6 +138,7 @@ const INPUTS: ActionInputs = {
   generateReceipt: false,
   junitReport: false,
   strictIntegrity: false,
+  prComment: false,
   workingDirectory: path.resolve("."),
 } as ActionInputs;
 
@@ -690,6 +693,58 @@ describe("run", () => {
       expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
       expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
       expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+    });
+  });
+
+  describe("issue #508: report write failure handling", () => {
+    it("handles EACCES/ENOENT/ENOSPC report file write failure without failing execution", async () => {
+      // Set RUNNER_TEMP to a non-existent or read-only directory
+      process.env.RUNNER_TEMP = path.join(runnerTemp, "nonexistent-dir", "sub");
+
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify(PASS_REPORT),
+        stderr: "",
+      });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to write JSON report to"),
+      );
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("ENOENT"),
+      );
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(setOutputMock).toHaveBeenCalledWith("passed", "1");
+      expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+      expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+        PASS_REPORT,
+        expect.objectContaining({ reportWriteError: "ENOENT" }),
+      );
+    });
+
+    it("safe cleanup failures do not abort execution", async () => {
+      // Create a directory at the report path so writeFileSync throws EISDIR
+      const unwriteableReportPath = path.join(runnerTemp, "stellar-canary-report.json");
+      fs.mkdirSync(unwriteableReportPath, { recursive: true });
+
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify(PASS_REPORT),
+        stderr: "",
+      });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("EISDIR"),
+      );
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
     });
   });
 

@@ -5,19 +5,20 @@ import * as path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// vi.mock is hoisted above the imports, so the spy must be too. Only `info` is
-// replaced: the whole suite reads inputs through the real `core.getInput`, and
-// CONTRIBUTING's partial-mock convention requires spreading the real module so
-// everything else keeps working. `vi.spyOn` cannot be used here because an ESM
-// namespace object is not configurable.
-const { infoMock, setSecretMock } = vi.hoisted(() => ({
+// vi.mock is hoisted above the imports, so the spies must be too. The suite
+// reads inputs through the real `core.getInput`, and CONTRIBUTING's
+// partial-mock convention requires spreading the real module so everything
+// else keeps working. `vi.spyOn` cannot be used here because an ESM namespace
+// object is not configurable.
+const { infoMock, warningMock, setSecretMock } = vi.hoisted(() => ({
   infoMock: vi.fn(),
+  warningMock: vi.fn(),
   setSecretMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof actionsCore>();
-  return { ...actual, info: infoMock, setSecret: setSecretMock };
+  return { ...actual, info: infoMock, warning: warningMock, setSecret: setSecretMock };
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
@@ -41,12 +42,15 @@ const INPUT_KEYS = [
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
+  "INPUT_FAIL-ON-WARNING",
+  "INPUT_OFFLINE",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_BASELINE-REPORT",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_PR-COMMENT",
   "INPUT_JUNIT-REPORT",
 ];
 
@@ -58,6 +62,7 @@ function clearInputs(): void {
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
+  warningMock.mockClear();
 }
 
 describe("getInputs", () => {
@@ -81,6 +86,8 @@ describe("getInputs", () => {
       annotations: true,
       timeoutMinutes: 15,
       allowEmpty: false,
+      failOnWarning: false,
+      offline: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       baselineReport: undefined,
@@ -88,6 +95,7 @@ describe("getInputs", () => {
       generateReceipt: false,
       junitReport: false,
       strictIntegrity: false,
+      prComment: false,
     });
   });
 
@@ -471,6 +479,20 @@ describe("getInputs", () => {
     expect(() => getInputs()).toThrow(/"allow-empty"/);
   });
 
+  it("warns when unsupported fail-on-warning or offline inputs are enabled", () => {
+    process.env["INPUT_FAIL-ON-WARNING"] = "true";
+    process.env.INPUT_OFFLINE = "true";
+
+    const inputs = getInputs();
+
+    expect(inputs.failOnWarning).toBe(true);
+    expect(inputs.offline).toBe(true);
+    expect(warningMock.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringContaining('"fail-on-warning"'),
+      expect.stringContaining('"offline"'),
+    ]);
+  });
+
   // #361: `generate-receipt` opts a run into producing an Execution Receipt.
   // It shares the documented boolean literals with the other toggles.
   it("defaults generate-receipt to false", () => {
@@ -808,3 +830,75 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
     });
   });
 });
+
+    // Masking tests for credential-bearing RPC URLs
+    it("masks username and password from userinfo", () => {
+      process.env["INPUT_RPC-URL"] = "https://alice:password123@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("alice");
+      expect(setSecretMock).toHaveBeenCalledWith("password123");
+      expect(setSecretMock).toHaveBeenCalledWith("https://alice:password123@example.com/soroban/rpc");
+    });
+
+    it("masks query parameter values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?apikey=secret123&token=abc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("secret123");
+      expect(setSecretMock).toHaveBeenCalledWith("abc");
+      expect(setSecretMock).toHaveBeenCalledWith("https://example.com/soroban/rpc?apikey=secret123&token=abc");
+    });
+
+    it("masks URL fragment", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc#fragment";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("fragment");
+      expect(setSecretMock).toHaveBeenCalledWith("https://example.com/soroban/rpc#fragment");
+    });
+
+    it("does not mask plain URL without sensitive components", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("does not mask empty username", () => {
+      process.env["INPUT_RPC-URL"] = "https://@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("masks password from userinfo even when username is empty", () => {
+      process.env["INPUT_RPC-URL"] = "https://:password@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("password"); expect(setSecretMock).toHaveBeenCalledWith("https://:password@example.com/soroban/rpc");
+    });
+
+    it("handles repeated query parameters", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=val1&key=val2";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("val1");
+      expect(setSecretMock).toHaveBeenCalledWith("val2");
+    });
+
+    it("does not mask empty query parameter values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("handles percent-encoded values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=%24secre7";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("$secre7");
+    });
+
+    it("handles plain http localhost URL without masking", () => {
+      process.env["INPUT_RPC-URL"] = "http://localhost:8000/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid URL still throws error", () => {
+      process.env["INPUT_RPC-URL"] = "not a url";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+    });
