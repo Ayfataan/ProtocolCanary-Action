@@ -394,6 +394,15 @@ in GitHub Actions collapsed log groups:
   disabled via `::stop-commands::` using fresh random tokens to prevent command
   injection.
 
+- **Credential masking:** When an `rpc-url` input contains credentials in userinfo
+  (`user:password@host`), query parameter values, or a fragment, the Action registers
+  these sensitive values with the GitHub Actions runner via `core.setSecret()`. The
+  complete credential-bearing URL is also registered when sensitive components are
+  present. Plain RPC URLs without userinfo, query parameters, or a fragment are
+  unaffected. GitHub Actions runner masking is best effort — very short values may
+  not be masked due to runner limitations. Users should continue using GitHub Actions
+  secrets for RPC credentials and avoid intentionally printing sensitive values.
+
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
