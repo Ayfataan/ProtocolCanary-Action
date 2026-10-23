@@ -350,6 +350,8 @@ describe("action.yml outputs and run() stay in sync (#412)", () => {
       // junit-report-path, like receipt-path, is set on one branch only.
       "junit-report": "true",
       "network-passphrase": "\u0001",
+      // #400: run() checks this directory on disk before doing anything else.
+      "fixtures-dir": "tests/fixtures",
     };
 
     resolveVersionMock.mockResolvedValue({ version: "0.1.1", tag: "v0.1.1", commitSha: undefined });

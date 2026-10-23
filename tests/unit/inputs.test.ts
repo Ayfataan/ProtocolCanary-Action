@@ -22,7 +22,7 @@ vi.mock("@actions/core", async (importOriginal) => {
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
-import { getInputs, parseScopedFilter } from "../../src/inputs";
+import { getInputs, parseScopedFilter, validateFixturesDir } from "../../src/inputs";
 
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
@@ -876,6 +876,162 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
   });
 });
 
+/**
+ * Issue #400: `fixtures-dir` is validated against the filesystem before the
+ * engine version is resolved or installed. The helper resolves the input
+ * against the working directory, distinguishes a missing path from one that
+ * is not a directory, treats a dangling symlink as a missing path (statSync
+ * follows links), and preserves the `allow-empty` exception for a missing
+ * directory via a `core.warning` — while never creating the directory.
+ */
+describe("validateFixturesDir (#400)", () => {
+  let root: string;
+
+  beforeEach(() => {
+    clearInputs();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "canary-fixtures-dir-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    clearInputs();
+  });
+
+  it("accepts an existing directory and returns the resolved absolute path", () => {
+    const dir = path.join(root, "fixtures");
+    fs.mkdirSync(dir);
+
+    const resolved = validateFixturesDir(dir, false);
+
+    expect(resolved).toBe(path.resolve(dir));
+    expect(path.isAbsolute(resolved)).toBe(true);
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing directory, naming the input, the resolved absolute path, and the reason", () => {
+    const missing = path.join(root, "no-such-fixtures");
+
+    expect(() => validateFixturesDir(missing, false)).toThrow(InvalidInputError);
+    expect(() => validateFixturesDir(missing, false)).toThrow(/"fixtures-dir"/);
+    expect(() => validateFixturesDir(missing, false)).toThrow(path.resolve(missing));
+    expect(() => validateFixturesDir(missing, false)).toThrow(/does not exist/);
+  });
+
+  it("rejects a nonexistent absolute path the same way", () => {
+    const missing = path.join(path.resolve(path.parse(root).root), "canary-absent", "fixtures");
+    expect(fs.existsSync(missing)).toBe(false);
+
+    expect(() => validateFixturesDir(missing, false)).toThrow(InvalidInputError);
+    expect(() => validateFixturesDir(missing, false)).toThrow(path.resolve(missing));
+  });
+
+  it("rejects a resolved path that is a regular file with a distinct not-a-directory message", () => {
+    const file = path.join(root, "fixtures.toml");
+    fs.writeFileSync(file, "[tests]\n", "utf8");
+
+    expect(() => validateFixturesDir(file, false)).toThrow(InvalidInputError);
+    expect(() => validateFixturesDir(file, false)).toThrow(/is not a directory/);
+    expect(() => validateFixturesDir(file, false)).toThrow(/"fixtures-dir"/);
+    expect(() => validateFixturesDir(file, false)).toThrow(path.resolve(file));
+
+    // allow-empty excuses an empty fixture set, not a mistyped path: a
+    // regular file is rejected even when the run may load no fixtures.
+    expect(() => validateFixturesDir(file, true)).toThrow(/is not a directory/);
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  // Symlink creation needs elevated privileges or Developer Mode on Windows,
+  // so the capability is probed once (with the same dangling shape the test
+  // uses) and the test is skipped where creation is impossible — it must
+  // never fail the suite on a platform that merely cannot make symlinks.
+  describe("dangling symlink", () => {
+    const supported = (() => {
+      const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "canary-symlink-probe-"));
+      try {
+        fs.symlinkSync(path.join(probeRoot, "absent-target"), path.join(probeRoot, "link"));
+        return true;
+      } catch {
+        return false;
+      } finally {
+        fs.rmSync(probeRoot, { recursive: true, force: true });
+      }
+    })();
+
+    it.skipIf(!supported)("follows the documented missing-path behavior", () => {
+      const link = path.join(root, "dangling");
+      fs.symlinkSync(path.join(root, "absent-target"), link);
+      expect(fs.existsSync(link)).toBe(false);
+
+      // statSync follows the link to a target that does not exist, so the
+      // result is exactly the missing-path behavior above...
+      expect(() => validateFixturesDir(link, false)).toThrow(InvalidInputError);
+      expect(() => validateFixturesDir(link, false)).toThrow(/does not exist/);
+      expect(() => validateFixturesDir(link, false)).toThrow(path.resolve(link));
+
+      // ...including the allow-empty warning branch.
+      expect(validateFixturesDir(link, true)).toBe(path.resolve(link));
+      expect(warningMock).toHaveBeenCalledTimes(1);
+      const warning = String(warningMock.mock.calls[0]?.[0]);
+      expect(warning).toContain('"fixtures-dir"');
+      expect(warning).toContain(path.resolve(link));
+    });
+  });
+
+  it("resolves a relative path against the current working directory", () => {
+    const dir = path.join(root, "relative-fixtures");
+    fs.mkdirSync(dir);
+    // Deliberately relative: this is what distinguishes the resolved value
+    // from the raw input. GitHub-hosted Windows runners can check the
+    // repository out on a different drive from the system temp directory;
+    // then path.relative returns an absolute path and this stops exercising
+    // a relative input, so the assertion below is written in terms of
+    // path.resolve rather than the raw string.
+    const relative = path.relative(process.cwd(), dir);
+
+    expect(validateFixturesDir(relative, false)).toBe(path.resolve(relative));
+  });
+
+  it("normalizes `..` segments and validates the normalized destination", () => {
+    const dir = path.join(root, "fx");
+    fs.mkdirSync(dir);
+
+    // An existing directory reached through `..` is accepted, and the
+    // returned path is the normalized one.
+    const viaParent = `${dir}${path.sep}..${path.sep}fx`;
+    expect(validateFixturesDir(viaParent, false)).toBe(path.resolve(dir));
+
+    // A missing destination is rejected at its normalized path — the
+    // lexically-passed string with `..` in it never reaches the message.
+    const missingViaParent = `${dir}${path.sep}..${path.sep}missing`;
+    expect(() => validateFixturesDir(missingViaParent, false)).toThrow(
+      path.join(root, "missing"),
+    );
+    expect(() => validateFixturesDir(missingViaParent, false)).not.toThrow(
+      `${path.sep}fx${path.sep}..${path.sep}missing`,
+    );
+  });
+
+  it("warns and continues for a missing directory when allow-empty is true", () => {
+    const missing = path.join(root, "missing-pack");
+
+    expect(validateFixturesDir(missing, true)).toBe(path.resolve(missing));
+
+    expect(warningMock).toHaveBeenCalledTimes(1);
+    const warning = String(warningMock.mock.calls[0]?.[0]);
+    expect(warning).toContain('"fixtures-dir"');
+    expect(warning).toContain(path.resolve(missing));
+    // The directory is never created behind the user's back.
+    expect(fs.existsSync(missing)).toBe(false);
+  });
+
+  it("emits no warning for an existing directory even when allow-empty is true", () => {
+    const dir = path.join(root, "fixtures");
+    fs.mkdirSync(dir);
+
+    expect(validateFixturesDir(dir, true)).toBe(path.resolve(dir));
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+});
     // Masking tests for credential-bearing RPC URLs
     it("masks username and password from userinfo", () => {
       process.env["INPUT_RPC-URL"] = "https://alice:password123@example.com/soroban/rpc";

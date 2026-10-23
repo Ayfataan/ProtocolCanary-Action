@@ -11,11 +11,13 @@ import type { ActionInputs } from "../../src/inputs";
 import type * as inputsModule from "../../src/inputs";
 import type * as runnerModule from "../../src/runner";
 import type * as summaryModule from "../../src/summary";
+import type * as versionModule from "../../src/version";
 import { report, result } from "./helpers";
 
 const {
   getInputsMock,
   ensureCanaryInstalledMock,
+  resolveVersionMock,
   runCheckMock,
   writeSummaryMock,
   renderSummaryMarkdownMock,
@@ -34,6 +36,7 @@ const {
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
   ensureCanaryInstalledMock: vi.fn(),
+  resolveVersionMock: vi.fn(),
   runCheckMock: vi.fn(),
   writeSummaryMock: vi.fn(),
   renderSummaryMarkdownMock: vi.fn(),
@@ -92,6 +95,17 @@ vi.mock("../../src/runner", async (importOriginal) => {
   return { ...actual, runCheck: runCheckMock, renderJUnitReport: renderJUnitReportMock };
 });
 
+// Only `resolveVersion` is replaced (#400): the tests that spy on the
+// execution order need "was version resolution reached?" to be observable,
+// and a mocked resolver must not reach the GitHub API either. Its default
+// implementation mirrors the real one's offline fallback shape
+// (version + `v`-prefixed tag, no commit SHA), so every downstream
+// assertion behaves as before.
+vi.mock("../../src/version", async (importOriginal) => {
+  const actual = await importOriginal<typeof versionModule>();
+  return { ...actual, resolveVersion: resolveVersionMock };
+});
+
 vi.mock("../../src/summary", async (importOriginal) => {
   const actual = await importOriginal<typeof summaryModule>();
   return {
@@ -125,7 +139,10 @@ const INPUTS: ActionInputs = {
   rpcUrl: undefined,
   rpcMaxRetries: undefined,
   rpcRetryDelayMs: undefined,
-  fixturesDir: "fixtures",
+  // #400: run() validates this directory on disk before version resolution
+  // and installation, so the shared fixture must be an existing directory —
+  // the repository's own tests/fixtures is stable from every CI checkout.
+  fixturesDir: path.join(__dirname, "..", "fixtures"),
   fixture: undefined,
   surface: undefined,
   cacheDir: undefined,
@@ -177,6 +194,9 @@ describe("run", () => {
   beforeEach(() => {
     getInputsMock.mockReset().mockReturnValue(INPUTS);
     ensureCanaryInstalledMock.mockReset().mockResolvedValue({ binaryPath: BINARY_PATH, version: "0.1.0" });
+    resolveVersionMock
+      .mockReset()
+      .mockImplementation(async (version: string) => ({ version, tag: `v${version}`, commitSha: undefined }));
     runCheckMock.mockReset();
     renderJUnitReportMock.mockReset();
     writeSummaryMock.mockReset().mockResolvedValue(undefined);
@@ -432,7 +452,20 @@ describe("run", () => {
     // command's argument array are reported (#373, #416).
     expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, {
       engineVersion: "0.1.0",
-      engineArgs: ["check", "--format", "json", "--protocol", "28", "--network", "testnet", "--fixtures-dir", "fixtures"],
+      engineArgs: [
+        "check",
+        "--format",
+        "json",
+        "--protocol",
+        "28",
+        "--network",
+        "testnet",
+        "--fixtures-dir",
+        // #400: `INPUTS.fixturesDir` is an absolute path (the shared
+        // fixture must be an existing directory), and the engine arguments
+        // forward it verbatim.
+        INPUTS.fixturesDir,
+      ],
     });
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
@@ -710,6 +743,100 @@ describe("run", () => {
       expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
       expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
       expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+    });
+  });
+
+  // #400: fixtures-dir is validated after input parsing and before version
+  // resolution or installation. The regression test is the execution-order
+  // one: under the original behavior, a missing fixtures directory went
+  // straight into resolveVersion and ensureCanaryInstalled and failed only
+  // when the engine ran — those spies must now stay untouched.
+  describe("issue #400: fixtures-dir fails fast before installation", () => {
+    it("a missing fixtures directory fails before resolveVersion, installation, and execution", async () => {
+      const missing = path.join(runnerTemp, "no-such-fixtures");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: missing });
+
+      await run();
+
+      // The validation error reaches the failure path verbatim: the input
+      // name, the resolved absolute path, and the reason.
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failed = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failed).toContain("Protocol Canary could not be executed.");
+      expect(failed).toContain('"fixtures-dir"');
+      expect(failed).toContain(path.resolve(missing));
+      expect(failed).toContain("does not exist");
+
+      // Nothing downstream of input validation ran.
+      expect(resolveVersionMock).not.toHaveBeenCalled();
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+
+      // The existing execution-failure reporting receives the error: the
+      // annotation (annotations: true), the summary, and the outputs.
+      expect(errorMock).toHaveBeenCalledTimes(1);
+      expect(String(errorMock.mock.calls[0]?.[0])).toContain('"fixtures-dir"');
+      expect(renderExecutionFailureMarkdownMock).toHaveBeenCalledWith(
+        expect.stringContaining('"fixtures-dir"'),
+        "",
+      );
+      expect(writeSummaryMock).toHaveBeenCalledWith("## Stellar Protocol Canary (execution failure)");
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+      expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+    });
+
+    it("allow-empty: true warns about the missing directory and proceeds to resolution and installation", async () => {
+      const missing = path.join(runnerTemp, "no-such-fixtures");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: missing, allowEmpty: true });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      // The warning names the input and the resolved path, and the run
+      // continues down the normal execution path.
+      expect(warningMock).toHaveBeenCalledTimes(1);
+      const warning = String(warningMock.mock.calls[0]?.[0]);
+      expect(warning).toContain('"fixtures-dir"');
+      expect(warning).toContain(path.resolve(missing));
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(resolveVersionMock).toHaveBeenCalledTimes(1);
+      expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
+      expect(runCheckMock).toHaveBeenCalledTimes(1);
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      // The missing directory is never created behind the user's back.
+      expect(fs.existsSync(missing)).toBe(false);
+    });
+
+    it("a fixtures path that is a regular file is rejected even with allow-empty", async () => {
+      const file = path.join(runnerTemp, "fixtures.toml");
+      fs.writeFileSync(file, "[tests]\n", "utf8");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: file, allowEmpty: true });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failed = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failed).toContain('"fixtures-dir"');
+      expect(failed).toContain(path.resolve(file));
+      expect(failed).toContain("is not a directory");
+
+      expect(resolveVersionMock).not.toHaveBeenCalled();
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+    });
+
+    it("an existing fixtures directory keeps the original execution path", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(warningMock).not.toHaveBeenCalled();
+      expect(resolveVersionMock).toHaveBeenCalledTimes(1);
+      expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
+      expect(runCheckMock).toHaveBeenCalledTimes(1);
+      expect(setFailedMock).not.toHaveBeenCalled();
     });
   });
 

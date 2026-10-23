@@ -15,7 +15,7 @@ import {
 import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./canary";
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
-import { getInputs } from "./inputs";
+import { getInputs, validateFixturesDir } from "./inputs";
 import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import { countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
 import type { CanaryReport } from "./output";
@@ -146,7 +146,8 @@ async function handleExecutionFailure(
 }
 
 /**
- * Orchestrates one Action run, in order: read and validate inputs, resolve
+ * Orchestrates one Action run, in order: read and validate inputs (including
+ * the `fixtures-dir` directory on disk, #400), resolve
  * the requested version to a pinned commit, ensure a matching binary is
  * installed, execute the compatibility check, parse stdout into a report,
  * emit annotations, write the job summary, set the Action outputs, and
@@ -168,6 +169,19 @@ export async function run(): Promise<void> {
     inputs = getInputs();
   } catch (error) {
     core.setFailed(describeError(error));
+    return;
+  }
+
+  // #400: fail fast when `fixtures-dir` does not name an existing directory
+  // — after input parsing, before any version resolution or installation
+  // work — so a mistyped path costs milliseconds, not a full `cargo
+  // install`. Routed through the execution-failure handler so the error
+  // reaches the annotation, the job summary, and the failure outputs exactly
+  // like every other reason Canary could not be executed.
+  try {
+    validateFixturesDir(inputs.fixturesDir, inputs.allowEmpty);
+  } catch (error) {
+    await handleExecutionFailure(describeError(error), "", inputs.annotations, "");
     return;
   }
 

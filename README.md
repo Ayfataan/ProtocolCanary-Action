@@ -76,10 +76,11 @@ entry in [Inputs](#inputs) for the full explanation and setup guidance.
 
 This snippet is not runnable on its own: `fixtures-dir` defaults to
 `fixtures`, relative to the job's working directory, and a freshly
-checked-out project normally has no `fixtures/` directory, so there is
-nothing for Canary to check. Either point `fixtures-dir` at your own
-fixtures or check out a fixtures pack first, as
-[`examples/protocol-28.yml`](examples/protocol-28.yml) does.
+checked-out project normally has no `fixtures/` directory — so the step
+now fails fast with a clear `fixtures-dir` error, before the engine is
+installed, instead of installing Canary just to check nothing. Either
+point `fixtures-dir` at your own fixtures or check out a fixtures pack
+first, as [`examples/protocol-28.yml`](examples/protocol-28.yml) does.
 
 See [`examples/`](examples/) for the complete, runnable workflows —
 including that Protocol 28 one, which checks out the real
@@ -148,7 +149,7 @@ jobs:
 | `rpc-url` | Stellar RPC endpoint (`--rpc-url`). Must be `https://`, or `http://localhost`/`127.0.0.1` for local development. | (none) |
 | `rpc-max-retries` | Maximum retries after a failed RPC request (`--rpc-max-retries`). `0` disables retries; accepted range is 0 to 4294967295. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | Engine default (3) |
 | `rpc-retry-delay-ms` | Linear-backoff base delay between RPC retries (`--rpc-retry-delay-ms`), in milliseconds; accepted range is 0 to 9007199254740991. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | Engine default (500) |
-| `fixtures-dir` | Path to a directory of fixtures, e.g. a checkout of `ProtocolCanary-Fixtures` (`--fixtures-dir`). | `fixtures` |
+| `fixtures-dir` | Path to a directory of fixtures, e.g. a checkout of `ProtocolCanary-Fixtures` (`--fixtures-dir`). Resolved against the job's working directory and validated **before** the engine version is resolved or installed: it must name an existing directory. A missing directory fails the run immediately with an error naming `fixtures-dir` and the resolved absolute path; with `allow-empty: true` a missing directory only warns (naming the input and path) and the run continues; a path that exists but is not a directory (e.g. a regular file) is always rejected, even with `allow-empty: true`. | `fixtures` |
 | `fixture` | Run only the fixture with this exact id (`--fixture=<id>`) — the usual way to reproduce one failing check in CI. Empty/whitespace means unset; must not contain control characters (no other restrictions — the value is passed as one `--flag=value` argument, so an id beginning with `-` is safe). **Requires an engine release whose `check` accepts `--fixture`:** while no released Protocol-Canary supports it (today's state), setting this fails the run *before* install/run, naming the input and resolved `version` — the Action never silently runs the whole suite instead. | (none) |
 | `surface` | Run only fixtures of this surface (`--surface=`): exactly `xdr`, `rpc`, or `soroban` (lower case, as the engine accepts); anything else fails with an input error naming the accepted values. Same pre-run engine gate as `fixture`: rather than checking every surface, the Action fails before installing or running. | (none) |
 | `cache-dir` | Directory for cached fixture results (`--cache-dir=`), forwarded to the engine **unchanged**: a relative path is resolved by the *engine* against `--project-root` when one is given — not against `GITHUB_WORKSPACE`, `fixtures-dir`, or a future `working-directory` input (#348). Missing directories are created by the engine; a path that is an existing file is rejected by the engine; it may be combined with the engine's cache-disabling flag (the engine accepts both, though this Action does not yet expose `--no-cache` as an input). Empty/whitespace means unset; control characters are rejected. Same pre-run engine gate as `fixture`: an unsupported engine fails the run rather than caching results somewhere you did not ask for. | (none) |
@@ -394,9 +395,10 @@ what to do about each.
 | `Unsupported report schemaVersion N (this Action supports schemaVersion 1).` | The installed Canary release emits a newer report schema than this Action understands. | Pin `version` to a release from the supported versions table, or wait for a release of this Action that declares support for the new schema (schema changes are called out in [Versioning](#versioning)). |
 | `Configuration file not found: <path>` | The `config` input names a file that does not exist. | Fix the path (it is resolved against the job's working directory) or check out the file before this step. |
 | `The "fixture" input is set, but Canary X cannot honour it: …` (also `"surface"`, `"cache-dir"`) | You set one of the scope/cache inputs, but the resolved `version` cannot accept it — today **no released Protocol-Canary supports these flags** (they exist only on the engine's `main`), so the Action fails before installing or running anything. Unlike `allow-empty` (ignored with a note, because it only relaxes a check), silently dropping a filter would report success for a *different* scope than you asked for, so this fails closed. | Remove the input, or set `version` to a release that supports the flag once a maintainer names one on [#458](https://github.com/StellarCanary/ProtocolCanary-Action/issues/458). The message names the input, the resolved version, and the minimum supporting release (or that none exists yet). |
+| ``Invalid "fixtures-dir" input: the fixtures directory <path> does not exist.`` | The `fixtures-dir` input (default `fixtures`) names a directory that is not there. The check runs after input parsing and before version resolution or installation, so no engine was installed or run and there are no engine diagnostics. | Point `fixtures-dir` at an existing directory (resolved against the job's working directory) — typically by checking out `ProtocolCanary-Fixtures` first — or set `allow-empty: true` to downgrade a missing directory to a warning. If the path exists but is a regular file, the message says it "is not a directory" instead. |
 | `Failed to publish Canary summary.` | The GitHub job summary could not be written — an infrastructure problem, distinct from both failure kinds above. | Re-run the job; if it reproduces on a GitHub-hosted runner, file a bug with the run link. |
 
-`Invalid "…" input` messages (`protocol`, `config`, `rpc-url`, `surface`,
+`Invalid "…" input` messages (`protocol`, `config`, `rpc-url`, `fixtures-dir`, `surface`,
 `fixture`, `cache-dir`, `version`, `timeout-minutes`, and the boolean
 inputs) state the expected format in
 the message itself; see [Inputs](#inputs) for each input's accepted
