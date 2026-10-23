@@ -23,7 +23,9 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "check:root": "node scripts/check-root-files.mjs",
-    "lint": "eslint src tests"
+    "lint": "eslint src tests",
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "check:licenses": "node scripts/check-licenses.mjs"
   },
   "dependencies": {
     "@actions/artifact": "^6.2.1",
