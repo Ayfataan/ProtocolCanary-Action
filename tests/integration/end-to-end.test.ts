@@ -126,6 +126,8 @@ function readOutputs(outputPath: string): Record<string, string> {
   const content = fs.readFileSync(outputPath, "utf8");
   const outputs: Record<string, string> = {};
   const lines = content.split("\n");
+  // Output names are written verbatim as the file-command key, so they may
+  // contain `-` (`coverage-state`, `report-path`, …), not just word characters.
   for (let i = 0; i < lines.length; i++) {
     const match = /^([A-Za-z_][A-Za-z0-9_-]*)<<(.+)$/.exec(lines[i] ?? "");
     if (match) {
@@ -180,6 +182,7 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(outputs.status).toBe("pass");
     expect(outputs.passed).toBe("1");
     expect(outputs.failures).toBe("0");
+    expect(outputs["coverage-state"]).toBe("full");
     expect(outputs.total).toBe("1");
     expect(outputs.skipped).toBe("0");
     expect(outputs["engine-version"]).toBe("0.1.0");
@@ -257,6 +260,9 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(outputs["engine-version"]).toBe("0.1.0");
     expect(outputs["observed-protocol"]).toBe("");
     expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain("could not be executed");
+    // #333: an execution failure executed no fixture at all, so coverage-state
+    // is set (not left empty) and says so.
+    expect(outputs["coverage-state"]).toBe("none");
   });
 
   it("pass-network: succeeds, sets observed-protocol, engine-version, total and skipped", async () => {
@@ -329,6 +335,10 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     const outputs = readOutputs(fixture.outputPath);
     expect(outputs.status).toBe("pass");
     expect(outputs.passed).toBe("2");
+    // #333: this scenario's report carries a `skipped[]` entry, so the run is
+    // a `pass` with incomplete coverage — exactly the distinction the output
+    // exists to make.
+    expect(outputs["coverage-state"]).toBe("partial");
   });
 
   it("rpc-error: a per-fixture execution error still produces a real report", async () => {

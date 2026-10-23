@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import { InvalidReportError } from "../../src/errors";
-import { countReplayed, describeExitCode, isReplayed, parseReport, resolvePackIdentity } from "../../src/output";
+import type { CanaryReport } from "../../src/output";
+import { classifyCoverage, countReplayed, describeExitCode, isReplayed, parseReport, resolvePackIdentity } from "../../src/output";
 import type { CanaryFixturePack } from "../../src/output";
 import { report, result } from "./helpers";
 
@@ -392,6 +393,134 @@ describe("isReplayed / countReplayed", () => {
       }),
     );
     expect(countReplayed(parsed)).toBe(1);
+  });
+});
+
+describe("classifyCoverage", () => {
+  // #333: `coverage-state` is what a downstream job reads to decide whether a
+  // pass may be promoted. `full` therefore has to mean "every fixture the
+  // engine knew about ran", not merely "some checks passed".
+
+  it("reports `full` when every discovered fixture ran and nothing was skipped", () => {
+    const covered = report([
+      result({ testId: "a", fixtureId: "a" }),
+      result({ testId: "b", fixtureId: "b", surface: "rpc" }),
+      result({ testId: "c", fixtureId: "c", surface: "soroban", status: "warning" }),
+      // An errored check still executed: coverage is about what ran, not about
+      // how it turned out.
+      result({ testId: "d", fixtureId: "d", surface: "rpc", status: "error" }),
+    ]);
+    expect(classifyCoverage(covered)).toBe("full");
+  });
+
+  it("reports `partial` when at least one fixture was skipped", () => {
+    const partial = report({
+      results: [result({ testId: "a", fixtureId: "a" })],
+      skipped: [{ fixtureId: "p27-xdr-legacy", surface: "xdr", reason: "fixture targets protocol 27" }],
+      counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+    });
+    expect(classifyCoverage(partial)).toBe("partial");
+  });
+
+  it("reports `partial` when a result's own status is `skipped`, even with no skipped[] entry", () => {
+    // Some engine builds surface a skip as a result with status "skipped"
+    // rather than as a `skipped[]` entry; coverage must not read that as full.
+    const partial = report([
+      result({ testId: "a", fixtureId: "a" }),
+      result({ testId: "b", fixtureId: "b", status: "skipped", summary: "not applicable" }),
+    ]);
+    expect(classifyCoverage(partial)).toBe("partial");
+  });
+
+  it("reports `partial` when only counts.skipped records the skip", () => {
+    // An older release can report a skipped count without shipping the
+    // `skipped[]` array at all; the count alone must still demote `full`.
+    const partial = report({
+      results: [result({ testId: "a", fixtureId: "a" })],
+      counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 4 },
+    });
+    expect(classifyCoverage(partial)).toBe("partial");
+  });
+
+  it("reports `none` when no fixture executed (empty results)", () => {
+    expect(classifyCoverage(report({}))).toBe("none");
+    // The empty-but-explicitly-shaped form an `--allow-empty` run produces:
+    // no results at all and an all-zero counts object.
+    expect(
+      classifyCoverage(report({ results: [], counts: { total: 0, passed: 0, failed: 0, warnings: 0, errors: 0, skipped: 0 } })),
+    ).toBe("none");
+  });
+
+  it("reports `none` when every discovered fixture was skipped", () => {
+    // Something was discovered, but nothing ran: coverage is still none, and
+    // the skips must not turn it into `partial` (which implies real coverage).
+    const none = report({
+      results: [result({ testId: "a", fixtureId: "a", status: "skipped" })],
+      skipped: [{ fixtureId: "b", surface: "xdr", reason: "disabled" }],
+    });
+    expect(classifyCoverage(none)).toBe("none");
+  });
+
+  // Negative testing: a report that cannot prove coverage must classify, not
+  // throw. This runs inside the reporting path of a real run, where an
+  // exception would replace the run's results with a crash.
+  it("defaults to `none` for missing coverage fields without throwing", () => {
+    const missingResults = { schemaVersion: 1, toolVersion: "0.1.0" } as unknown as CanaryReport;
+    expect(() => classifyCoverage(missingResults)).not.toThrow();
+    expect(classifyCoverage(missingResults)).toBe("none");
+  });
+
+  it("defaults to `none` when results or counts are present but the wrong shape", () => {
+    const wrongShape = {
+      schemaVersion: 1,
+      toolVersion: "0.1.0",
+      results: { not: "an array" },
+      counts: "not an object",
+    } as unknown as CanaryReport;
+    expect(() => classifyCoverage(wrongShape)).not.toThrow();
+    expect(classifyCoverage(wrongShape)).toBe("none");
+  });
+
+  it("tolerates entries inside results that are not readable result objects", () => {
+    const oddEntries = {
+      ...report([result({ testId: "a", fixtureId: "a" })]),
+      results: [null, "not-an-object", result({ testId: "b", fixtureId: "b" })],
+    } as unknown as CanaryReport;
+    expect(() => classifyCoverage(oddEntries)).not.toThrow();
+    // None of those entries is readable as a skipped result, and nothing else
+    // in the report records a skip, so the run is fully covered.
+    expect(classifyCoverage(oddEntries)).toBe("full");
+  });
+
+  it("ignores a skipped[] field that is not an array instead of throwing", () => {
+    const badSkipped = {
+      ...report([result({ testId: "a", fixtureId: "a" })]),
+      skipped: "none",
+    } as unknown as CanaryReport;
+    expect(classifyCoverage(badSkipped)).toBe("full");
+  });
+
+  it("does not read counts.total as coverage (a total can include skipped fixtures)", () => {
+    // counts.total counts every result entry, including skipped ones, so using
+    // it as the denominator would call a one-check run with four skipped
+    // fixtures "full". Coverage is derived from what actually executed.
+    const partial = report({
+      results: [result({ testId: "a", fixtureId: "a" })],
+      counts: { total: 5, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 4 },
+    });
+    expect(classifyCoverage(partial)).toBe("partial");
+  });
+
+  it("classifies a report that came through parseReport the same way as a hand-built one", () => {
+    const parsed = parseReport(
+      JSON.stringify({
+        ...JSON.parse(VALID_REPORT),
+        results: [result({ testId: "a", fixtureId: "a" })],
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+        skipped: [{ fixtureId: "b", surface: "xdr", reason: "disabled" }],
+      }),
+    );
+    expect(classifyCoverage(parsed)).toBe("partial");
   });
 });
 

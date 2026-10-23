@@ -550,6 +550,68 @@ export function resolvePackIdentity(
 }
 
 /**
+ * How completely the fixture set was exercised, exposed as the Action's
+ * `coverage-state` output so a downstream job can gate a release promotion on
+ * coverage rather than on the pass/fail verdict alone:
+ *
+ * - `full`: every discovered fixture ran and nothing was skipped;
+ * - `partial`: at least one fixture ran, but some were skipped;
+ * - `none`: no fixture ran at all (an empty run, or a report too malformed to
+ *   say otherwise).
+ *
+ * `none` is deliberately the conservative default: a run that cannot prove it
+ * executed the fixtures must not claim full coverage.
+ */
+export type CoverageState = "full" | "partial" | "none";
+
+/**
+ * Classifies a report's fixture coverage (#333).
+ *
+ * "Discovered" fixtures are the ones the engine reported on at all — the
+ * executed `results[]` plus the `skipped[]` fixtures it deliberately did not
+ * run. Classification is therefore:
+ *
+ * - `none` when nothing executed, which also covers a report that carries no
+ *   usable coverage information at all (an absent/!array `results`, an absent
+ *   `counts`): such a report must never be reported as `full`;
+ * - `full` when something executed and no fixture was skipped anywhere;
+ * - `partial` when something executed *and* something was skipped.
+ *
+ * Skips are detected from three independent signals, because which one is
+ * populated depends on the engine release: a `skipped[]` entry, a result whose
+ * own status is `skipped`, and `counts.skipped` (which older releases report
+ * without sending the `skipped[]` array at all). Any non-zero signal is enough.
+ *
+ * Tolerant by construction — every field access is guarded — so a partially
+ * shaped report yields a state instead of throwing inside the reporting path.
+ */
+export function classifyCoverage(report: CanaryReport): CoverageState {
+  // Read defensively rather than trusting the declared types: this runs in the
+  // reporting path on a report that may have come from an unexpected engine
+  // build, so a missing or oddly shaped field must classify as `none` rather
+  // than throw and take the run's reporting down with it.
+  const raw = report as CanaryReport | undefined;
+  const results: readonly unknown[] = Array.isArray(raw?.results) ? raw.results : [];
+
+  const isSkipped = (entry: unknown): boolean =>
+    typeof entry === "object" && entry !== null && (entry as Partial<CanaryResult>).status === "skipped";
+
+  // An entry the Action cannot read as a result is treated as an executed
+  // one: it came back inside `results[]`, which the engine only populates for
+  // checks it ran.
+  const executed = results.filter((entry) => !isSkipped(entry)).length;
+  if (executed === 0) {
+    return "none";
+  }
+
+  const skippedResults = results.filter(isSkipped).length;
+  const skippedEntries = Array.isArray(raw?.skipped) ? (raw.skipped ?? []).length : 0;
+  const reportedSkipped = isCountsShape(raw?.counts) ? (raw.counts?.skipped ?? 0) : 0;
+
+  return Math.max(skippedResults, skippedEntries, reportedSkipped) > 0 ? "partial" : "full";
+}
+
+/**
  * Whether a result was replayed from the engine's result cache rather than
  * executed in this run (CF-01 §6). `source: "cache"` is the contract's
  * spelling; the boolean `replayed`/`cached` attributes are honored too.

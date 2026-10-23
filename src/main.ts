@@ -17,7 +17,7 @@ import { InstallationFailedError, TimeoutError, describeError, isCanaryActionErr
 import type { ActionInputs } from "./inputs";
 import { getInputs, validateFixturesDir } from "./inputs";
 import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
-import { countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
+import { classifyCoverage, countReplayed, describeExitCode, parseReport, resolvePackIdentity } from "./output";
 import type { CanaryReport } from "./output";
 import { buildReceipt, serializeReceipt } from "./receipt";
 import {
@@ -135,6 +135,10 @@ async function handleExecutionFailure(
   core.setOutput("warnings", "0");
   core.setOutput("failures", "0");
   core.setOutput("errors", "0");
+  // No report was produced, so no fixture can be claimed as executed. #333:
+  // set explicitly so a downstream job reading `coverage-state` sees `none`
+  // rather than an unset (empty) output on the execution-failure path.
+  core.setOutput("coverage-state", "none");
   core.setOutput("total", "0");
   core.setOutput("skipped", "0");
   core.setOutput("replayed-count", "0");
@@ -334,6 +338,8 @@ export async function run(): Promise<void> {
 
   core.info(`${String(report.counts.passed)}/${String(report.counts.total)} applicable checks passed.`);
   core.info(`Status: ${report.status.toUpperCase()}`);
+  const coverageState = classifyCoverage(report);
+  core.info(`Coverage: ${coverageState}`);
 
   if (baselineReport !== undefined && inputs.baselineReport !== undefined) {
     try {
@@ -437,6 +443,7 @@ export async function run(): Promise<void> {
   if (reportWritten) {
     core.setOutput("report", reportPath);
   }
+  core.setOutput("coverage-state", coverageState);
 
   // #423: optional JUnit rendering through the engine's own `report` command,
   // before the artifact upload so the XML ships with the JSON report. Like

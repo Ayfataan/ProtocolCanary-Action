@@ -199,6 +199,19 @@ literals below.
 | `report` | Absolute path to the JSON report file this invocation wrote. The file is uniquely named per invocation (see below), so it is never shared with another Action step. Only set when Canary produced output to parse and the report file was written successfully; empty/unset on report write failure or execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report-canary-check-4b9c1d2e3f4a5b6c.json` |
 | `receipt-path` | Absolute path to the generated Execution Receipt JSON. Set only when `generate-receipt` is `true` and Canary produced a parseable report; unset otherwise, including on an execution failure. | `/home/runner/work/_temp/stellar-canary-receipt.json` |
 | `junit-report-path` | Absolute path to the generated JUnit XML file. Only set when `junit-report` is `true` **and** the engine's render succeeded; unset otherwise (input disabled, engine without the command, failed/empty render) and on an execution failure. A failed render is always a warning, never a status change. | `/home/runner/work/_temp/stellar-canary-report.junit.xml` |
+| `coverage-state` | How completely the fixture set was exercised: `full` (every discovered fixture ran, none skipped), `partial` (something ran, but fixtures were skipped), or `none` (nothing ran — an empty run or an execution failure). | `"full"` |
+
+`coverage-state` is meant for a job that gates a promotion on *coverage*
+rather than on the verdict alone — a `pass` with `coverage-state: partial`
+means Canary only exercised part of the fixture set:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  id: canary
+- name: Require full fixture coverage before promoting
+  if: steps.canary.outputs.coverage-state != 'full'
+  run: echo "Coverage was ${{ steps.canary.outputs.coverage-state }}, not full — see the JSON report artifact."
+```
 
 A concrete consumer, using the outputs to gate a follow-up step:
 
@@ -233,6 +246,7 @@ safely read or upload an earlier step's report:
 ```
 
 > **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol`, `pack-protocol`, `pack-version`, and `pack-digest` are set to empty strings `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> `coverage-state` is set on that path too, always as `none`, so a consumer never has to distinguish "unset" from "no coverage".
 
 ## How failures appear
 
