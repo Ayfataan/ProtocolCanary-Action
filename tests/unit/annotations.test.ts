@@ -71,6 +71,34 @@ describe("emitAnnotations", () => {
     expect(warningMock.mock.calls[0]?.[0]).toBe(`[xdr] p28-rpc-3: [warning] ${summary}`);
     expect(errorMock).not.toHaveBeenCalled();
   });
+
+  describe("observed protocol mismatch (#430)", () => {
+    it("emits a workflow-level warning when the network protocol differs from the target", () => {
+      emitAnnotations(report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 27 } }));
+
+      expect(warningMock).toHaveBeenCalledTimes(1);
+      const message = String(warningMock.mock.calls[0]?.[0]);
+      expect(message).toContain("Protocol mismatch");
+      expect(message).toContain("protocol 27");
+      expect(message).toContain("protocol 28");
+      expect(warningMock.mock.calls[0]?.[1]).toMatchObject({ title: "Stellar Protocol Canary" });
+      // A mismatch is a warning, never a compatibility failure.
+      expect(errorMock).not.toHaveBeenCalled();
+    });
+
+    it("does not emit an extra warning when the protocols agree", () => {
+      emitAnnotations(report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }));
+
+      expect(warningMock).not.toHaveBeenCalled();
+      expect(errorMock).not.toHaveBeenCalled();
+    });
+
+    it("does not emit a mismatch warning when no protocol was observed", () => {
+      emitAnnotations(report({ targetProtocol: 28, network: { name: "testnet" } }));
+
+      expect(warningMock).not.toHaveBeenCalled();
+    });
+  });
 });describe("emitExecutionFailureAnnotation", () => {
   it("emits a single general error annotation", () => {
     emitExecutionFailureAnnotation("cargo install failed");
