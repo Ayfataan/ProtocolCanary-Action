@@ -5,13 +5,11 @@ import * as path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// vi.mock is hoisted above the imports, so the spy must be too. Only `info`,
-// `warning`, and `setSecret` are replaced: the whole suite reads inputs
-// through the real `core.getInput`, and CONTRIBUTING's partial-mock
-// convention requires spreading the real module so everything else keeps
-// working. `vi.spyOn` cannot be used here because an ESM namespace object is
-// not configurable. `warning` is mocked for `validateFixturesDir`'s
-// allow-empty path (#400).
+// vi.mock is hoisted above the imports, so the spies must be too. The suite
+// reads inputs through the real `core.getInput`, and CONTRIBUTING's
+// partial-mock convention requires spreading the real module so everything
+// else keeps working. `vi.spyOn` cannot be used here because an ESM namespace
+// object is not configurable.
 const { infoMock, warningMock, setSecretMock } = vi.hoisted(() => ({
   infoMock: vi.fn(),
   warningMock: vi.fn(),
@@ -24,31 +22,44 @@ vi.mock("@actions/core", async (importOriginal) => {
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
-import { getInputs, validateFixturesDir } from "../../src/inputs";
+import { getInputs, parseScopedFilter, validateFixturesDir } from "../../src/inputs";
 
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
+  "INPUT_WORKING-DIRECTORY",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
+  "INPUT_RPC-MAX-RETRIES",
+  "INPUT_RPC-RETRY-DELAY-MS",
   "INPUT_FIXTURES-DIR",
+  "INPUT_FIXTURE",
+  "INPUT_SURFACE",
+  "INPUT_CACHE-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
+  "INPUT_DIAGNOSTICS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
+  "INPUT_FAIL-ON-WARNING",
+  "INPUT_OFFLINE",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_BASELINE-REPORT",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_PR-COMMENT",
+  "INPUT_JUNIT-REPORT",
 ];
 
 function clearInputs(): void {
   for (const key of INPUT_KEYS) {
     delete process.env[key];
   }
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
@@ -64,20 +75,29 @@ describe("getInputs", () => {
     expect(inputs).toEqual({
       protocol: undefined,
       config: undefined,
+      workingDirectory: process.cwd(),
       network: undefined,
+      networkPassphrase: undefined,
       rpcUrl: undefined,
+      rpcMaxRetries: undefined,
+      rpcRetryDelayMs: undefined,
       fixturesDir: "fixtures",
-      version: "0.1.1",
+      version: "0.2.0",
       uploadReport: true,
       annotations: true,
+      diagnostics: false,
       timeoutMinutes: 15,
       allowEmpty: false,
+      failOnWarning: false,
+      offline: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      junitReport: false,
       strictIntegrity: false,
+      prComment: false,
     });
   });
 
@@ -201,6 +221,61 @@ describe("getInputs", () => {
     expect(getInputs().network).toBe("testnet");
   });
 
+  it("preserves the exact network passphrase for endpoint identity checks", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "  Local Network ; 2026  ";
+    expect(getInputs().networkPassphrase).toBe("  Local Network ; 2026  ");
+    expect(setSecretMock).toHaveBeenCalledWith("  Local Network ; 2026  ");
+  });
+
+  it("rejects an explicitly empty network passphrase", () => {
+    process.env["INPUT_NETWORK-PASSPHRASE"] = "";
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"network-passphrase"/);
+  });
+
+  it.each(["line\nbreak", "tab\tvalue", "delete\u007fvalue"])(
+    "rejects control characters in network-passphrase %j",
+    (value) => {
+      process.env["INPUT_NETWORK-PASSPHRASE"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"network-passphrase"/);
+    },
+  );
+
+  it("leaves an omitted network-passphrase unset", () => {
+    expect(getInputs().networkPassphrase).toBeUndefined();
+  });
+
+  it.each([
+    ["0", 0],
+    ["3", 3],
+    ["4294967295", 4294967295],
+  ])("accepts rpc-max-retries %s", (value, expected) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(getInputs().rpcMaxRetries).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "4294967296"])("rejects rpc-max-retries %s", (value) => {
+    process.env["INPUT_RPC-MAX-RETRIES"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-max-retries"/);
+  });
+
+  it.each([
+    ["0", 0],
+    ["500", 500],
+    [String(Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER],
+  ])("accepts rpc-retry-delay-ms %s", (value, expected) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(getInputs().rpcRetryDelayMs).toBe(expected);
+  });
+
+  it.each(["-1", "1.5", "1e3", "9007199254740992"])("rejects rpc-retry-delay-ms %s", (value) => {
+    process.env["INPUT_RPC-RETRY-DELAY-MS"] = value;
+    expect(() => getInputs()).toThrow(InvalidInputError);
+    expect(() => getInputs()).toThrow(/"rpc-retry-delay-ms"/);
+  });
+
   it("trims surrounding whitespace from rpc-url", () => {
     process.env["INPUT_RPC-URL"] = "  https://soroban-testnet.stellar.org  ";
     expect(getInputs().rpcUrl).toBe("https://soroban-testnet.stellar.org");
@@ -253,6 +328,11 @@ describe("getInputs", () => {
   it("normalizes a version with a leading v", () => {
     process.env.INPUT_VERSION = "v0.1.0";
     expect(getInputs().version).toBe("0.1.0");
+  });
+
+  it("preserves an explicit legacy engine pin for migration compatibility", () => {
+    process.env.INPUT_VERSION = "0.1.1";
+    expect(getInputs().version).toBe("0.1.1");
   });
 
   it("rejects a non-semver version", () => {
@@ -401,6 +481,20 @@ describe("getInputs", () => {
     expect(() => getInputs()).toThrow(/"allow-empty"/);
   });
 
+  it("warns when unsupported fail-on-warning or offline inputs are enabled", () => {
+    process.env["INPUT_FAIL-ON-WARNING"] = "true";
+    process.env.INPUT_OFFLINE = "true";
+
+    const inputs = getInputs();
+
+    expect(inputs.failOnWarning).toBe(true);
+    expect(inputs.offline).toBe(true);
+    expect(warningMock.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringContaining('"fail-on-warning"'),
+      expect.stringContaining('"offline"'),
+    ]);
+  });
+
   // #361: `generate-receipt` opts a run into producing an Execution Receipt.
   // It shares the documented boolean literals with the other toggles.
   it("defaults generate-receipt to false", () => {
@@ -423,6 +517,49 @@ describe("getInputs", () => {
     process.env["INPUT_GENERATE-RECEIPT"] = "yes";
     expect(() => getInputs()).toThrow(InvalidInputError);
     expect(() => getInputs()).toThrow(/"generate-receipt"/);
+  });
+});
+
+/**
+ * #331 / CF-08 / D-10: `diagnostics` is strictly opt-in and disabled by
+ * default, so an omitted input must never start uploading diagnostic
+ * artifacts. The input only records the workflow author's intent here; the
+ * bundle itself is uploaded by the diagnostics path that consumes it.
+ */
+describe("getInputs diagnostics (#331)", () => {
+  beforeEach(clearInputs);
+  afterEach(clearInputs);
+
+  it("defaults diagnostics to false when omitted", () => {
+    expect(getInputs().diagnostics).toBe(false);
+  });
+
+  it.each([
+    ["true", true],
+    ["True", true],
+    ["TRUE", true],
+    ["false", false],
+    ["False", false],
+    ["FALSE", false],
+  ])("parses diagnostics %s strictly", (value, expected) => {
+    process.env.INPUT_DIAGNOSTICS = value;
+    expect(getInputs().diagnostics).toBe(expected);
+  });
+
+  it.each(["yes", "1", "0", "on", "diagnostics"])(
+    "rejects the non-boolean diagnostics value %s and names the input",
+    (value) => {
+      process.env.INPUT_DIAGNOSTICS = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"diagnostics"/);
+    },
+  );
+
+  it("leaves artifacts disabled when the input is empty", () => {
+    // GitHub passes an omitted input as the empty string, which is not a
+    // boolean literal: the documented default must still apply.
+    process.env.INPUT_DIAGNOSTICS = "";
+    expect(getInputs().diagnostics).toBe(false);
   });
 });
 
@@ -631,6 +768,112 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       expect(setSecretMock).not.toHaveBeenCalled();
     });
   });
+
+  describe("fixture, surface, and cache-dir inputs (#458)", () => {
+    it("are all unset when omitted", () => {
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("treats empty and whitespace-only values as unset rather than rejecting them", () => {
+      process.env.INPUT_FIXTURE = "   ";
+      process.env.INPUT_SURFACE = "";
+      process.env["INPUT_CACHE-DIR"] = "\t\n";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("parses valid values, trimming surrounding whitespace", () => {
+      process.env.INPUT_FIXTURE = "  p28-xdr-cap83-empty-tx-set  ";
+      process.env.INPUT_SURFACE = " rpc ";
+      process.env["INPUT_CACHE-DIR"] = " .canary-cache ";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("p28-xdr-cap83-empty-tx-set");
+      expect(inputs.surface).toBe("rpc");
+      expect(inputs.cacheDir).toBe(".canary-cache");
+    });
+
+    it("accepts each engine surface name and nothing else", () => {
+      for (const surface of ["xdr", "rpc", "soroban"]) {
+        process.env.INPUT_SURFACE = surface;
+        expect(getInputs().surface).toBe(surface);
+      }
+    });
+
+    it.each(["XDR", "Rpc", "xdr rpc", "all", "soroban-rpc"])(
+      "rejects surface %j with an error naming the accepted values",
+      (value) => {
+        process.env.INPUT_SURFACE = value;
+        expect(() => getInputs()).toThrow(InvalidInputError);
+        expect(() => getInputs()).toThrow(/"surface"/);
+        expect(() => getInputs()).toThrow(/xdr.*rpc.*soroban/);
+      },
+    );
+
+    it.each([
+      ["newline", "a\nb"],
+      ["tab", "a\tb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in fixture", (_label, value) => {
+      process.env.INPUT_FIXTURE = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"fixture"/);
+      expect(() => getInputs()).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it.each([
+      ["newline", "a\nb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in cache-dir", (_label, value) => {
+      process.env["INPUT_CACHE-DIR"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"cache-dir"/);
+    });
+
+    // NUL cannot be carried through process.env (the platform rejects the
+    // byte), so the NUL case of the shared validator is exercised directly.
+    it.each([["fixture"], ["cache-dir"]])("rejects a NUL control character in %s", (inputName) => {
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(InvalidInputError);
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(new RegExp(`"${inputName}"`));
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it("accepts ids and paths containing spaces, dots, slashes, and a leading dash", () => {
+      process.env.INPUT_FIXTURE = "-weird id.v1/x";
+      process.env["INPUT_CACHE-DIR"] = "-cache dir/./nested";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("-weird id.v1/x");
+      expect(inputs.cacheDir).toBe("-cache dir/./nested");
+    });
+  });
+
+  describe("junit-report input (#423)", () => {
+    it("defaults to false", () => {
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it.each([["true"], ["True"], ["TRUE"]])("parses %j as enabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(true);
+    });
+
+    it.each([["false"], ["False"], [""]])("parses %j as disabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it("rejects an undocumented boolean form by name", () => {
+      process.env["INPUT_JUNIT-REPORT"] = "yes";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"junit-report"/);
+    });
+  });
 });
 
 /**
@@ -789,3 +1032,74 @@ describe("validateFixturesDir (#400)", () => {
     expect(warningMock).not.toHaveBeenCalled();
   });
 });
+    // Masking tests for credential-bearing RPC URLs
+    it("masks username and password from userinfo", () => {
+      process.env["INPUT_RPC-URL"] = "https://alice:password123@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("alice");
+      expect(setSecretMock).toHaveBeenCalledWith("password123");
+      expect(setSecretMock).toHaveBeenCalledWith("https://alice:password123@example.com/soroban/rpc");
+    });
+
+    it("masks query parameter values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?apikey=secret123&token=abc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("secret123");
+      expect(setSecretMock).toHaveBeenCalledWith("abc");
+      expect(setSecretMock).toHaveBeenCalledWith("https://example.com/soroban/rpc?apikey=secret123&token=abc");
+    });
+
+    it("masks URL fragment", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc#fragment";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("fragment");
+      expect(setSecretMock).toHaveBeenCalledWith("https://example.com/soroban/rpc#fragment");
+    });
+
+    it("does not mask plain URL without sensitive components", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("does not mask empty username", () => {
+      process.env["INPUT_RPC-URL"] = "https://@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("masks password from userinfo even when username is empty", () => {
+      process.env["INPUT_RPC-URL"] = "https://:password@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("password"); expect(setSecretMock).toHaveBeenCalledWith("https://:password@example.com/soroban/rpc");
+    });
+
+    it("handles repeated query parameters", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=val1&key=val2";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("val1");
+      expect(setSecretMock).toHaveBeenCalledWith("val2");
+    });
+
+    it("does not mask empty query parameter values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("handles percent-encoded values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=%24secre7";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("$secre7");
+    });
+
+    it("handles plain http localhost URL without masking", () => {
+      process.env["INPUT_RPC-URL"] = "http://localhost:8000/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid URL still throws error", () => {
+      process.env["INPUT_RPC-URL"] = "not a url";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+    });

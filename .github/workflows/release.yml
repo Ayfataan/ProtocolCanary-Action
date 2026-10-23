@@ -60,6 +60,57 @@ jobs:
             exit 1
           fi
 
+      # #457, option "stamp the release": make a caller's pin of THIS
+      # workflow actually select this release's Action code. The Action
+      # reference inside reusable-canary-check.yml is fixed text (a `uses:`
+      # value cannot contain expressions), so on main it reads `@v1` — the
+      # stamp template. For each release tag this step creates a stamped
+      # commit whose workflow refers to the Action at this release's own
+      # commit SHA (literal 40-hex), then moves the release tag to that
+      # stamped commit; the existing "Move floating major tag" step below
+      # then resolves the (moved) release tag and points v1 at the same
+      # commit. A caller who pins the workflow to this tag or to the
+      # stamped commit therefore runs `uses: ...@<release commit>`: no
+      # skew between the pinned workflow file and the Action that executes.
+      - name: Stamp the reusable workflow with this release's commit (#457)
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          workflow=".github/workflows/reusable-canary-check.yml"
+
+          # Idempotency: force-moving the release tag re-triggers this
+          # workflow at the stamped commit. That run must not stamp again,
+          # or the tag would move forever.
+          if grep -q "# release-stamp: ${RELEASE_TAG}" "$workflow"; then
+            echo "::notice::${workflow} is already stamped for ${RELEASE_TAG}; nothing to do."
+            exit 0
+          fi
+
+          # Literal SHA only — this is the whole point: a ref a caller's
+          # pin can trust. The pattern accepts the `@v1` template and any
+          # previously stamped SHA, so a re-stamp from either state works.
+          sed -i -E \
+            "s|(uses:[[:space:]]+StellarCanary/ProtocolCanary-Action@)(v[0-9]+|[0-9a-f]{40})|\1${RELEASE_COMMIT} # release-stamp: ${RELEASE_TAG}|" \
+            "$workflow"
+
+          if ! grep -qF "uses: StellarCanary/ProtocolCanary-Action@${RELEASE_COMMIT} # release-stamp: ${RELEASE_TAG}" "$workflow"; then
+            echo "::error::Stamping failed: ${workflow} does not reference the release commit ${RELEASE_COMMIT}."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$workflow"
+          git commit -m "Stamp ${RELEASE_TAG}: reusable workflow uses Action ${RELEASE_COMMIT}"
+          stamped="$(git rev-parse HEAD)"
+
+          git tag -fa "$RELEASE_TAG" -m "Release ${RELEASE_TAG} (stamped to ${RELEASE_COMMIT})"
+          git push origin "refs/tags/${RELEASE_TAG}" --force
+          echo "::notice::Stamped ${RELEASE_TAG}: its reusable workflow now uses Action@${RELEASE_COMMIT}; tag moved to ${stamped}."
+
       - name: Create GitHub Release
         # zizmor: ignore[superfluous-actions] action-gh-release handles asset uploads and automatic release notes cleanly
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3

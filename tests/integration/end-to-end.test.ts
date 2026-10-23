@@ -52,6 +52,7 @@ const ENV_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
@@ -75,7 +76,7 @@ interface Fixture {
 // shares one persistent summary file instead, truncated between tests.
 const SUMMARY_PATH = path.join(os.tmpdir(), `canary-e2e-summary-${String(process.pid)}.md`);
 
-function setUp(scenario: string): Fixture {
+function setUp(scenario: string, version = "0.1.0", omitVersion = false): Fixture {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-e2e-"));
   const cargoHome = path.join(workDir, "cargo-home");
   fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
@@ -95,8 +96,11 @@ function setUp(scenario: string): Fixture {
   process.env.GITHUB_OUTPUT = outputPath;
   process.env.GITHUB_STEP_SUMMARY = summaryPath;
   process.env.MOCK_CANARY_SCENARIO = scenario;
-  process.env.MOCK_CANARY_VERSION = "0.1.0";
-  process.env.INPUT_VERSION = "0.1.0";
+  process.env.MOCK_CANARY_VERSION = version;
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
+  if (!omitVersion) {
+    process.env.INPUT_VERSION = version;
+  }
   process.env.INPUT_PROTOCOL = "28";
   // #400: run() validates fixtures-dir on disk before version resolution
   // and installation, so the input must point at an existing directory —
@@ -154,6 +158,15 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
 
   afterAll(() => {
     fs.rmSync(SUMMARY_PATH, { force: true });
+  });
+
+  it("uses Protocol-Canary 0.2.0 when the version input is omitted", async () => {
+    fixture = setUp("pass", "0.2.0", true);
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(readOutputs(fixture.outputPath)["engine-version"]).toBe("0.2.0");
   });
 
   it("pass: succeeds, sets outputs, and writes no annotations", async () => {
