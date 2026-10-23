@@ -85,7 +85,7 @@ jobs:
           '
 
       - name: Upload mutation report
-        uses: actions/upload-artifact@ea89a88365868d56e1d8c6c84ff60497550031e2 # v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: mutation-report
