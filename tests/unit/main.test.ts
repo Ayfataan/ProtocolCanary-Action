@@ -136,7 +136,8 @@ const INPUTS: ActionInputs = {
   generateReceipt: false,
   junitReport: false,
   strictIntegrity: false,
-};
+  workingDirectory: path.resolve("."),
+} as ActionInputs;
 
 const PASS_REPORT = report({
   status: "pass",

@@ -26,6 +26,7 @@ import { getInputs, parseScopedFilter } from "../../src/inputs";
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
+  "INPUT_WORKING-DIRECTORY",
   "INPUT_NETWORK",
   "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
@@ -68,6 +69,7 @@ describe("getInputs", () => {
     expect(inputs).toEqual({
       protocol: undefined,
       config: undefined,
+      workingDirectory: process.cwd(),
       network: undefined,
       networkPassphrase: undefined,
       rpcUrl: undefined,

@@ -87,6 +87,7 @@ const BASE_INPUTS: ActionInputs = {
   generateReceipt: false,
   junitReport: false,
   strictIntegrity: false,
+  workingDirectory: path.resolve("."),
 };
 
 describe("buildCheckArgs", () => {
