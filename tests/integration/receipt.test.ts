@@ -218,7 +218,10 @@ describe.skipIf(process.platform === "win32")("Execution Receipt integration (re
 
     expect(setFailedMock).not.toHaveBeenCalled();
     const outputs = readOutputs(fixture.outputPath);
-    const receiptPath = path.join(fixture.runnerTemp, "stellar-canary-receipt.json");
+    const receiptPath = outputs["receipt-path"] as string;
+    expect(path.isAbsolute(receiptPath)).toBe(true);
+    expect(path.dirname(receiptPath)).toBe(fixture.runnerTemp);
+    expect(fs.existsSync(receiptPath)).toBe(true);
 
     const actual = fs.readFileSync(receiptPath);
     // Byte fixed point: re-serializing the parsed artifact through the real
@@ -260,7 +263,10 @@ describe.skipIf(process.platform === "win32")("Execution Receipt integration (re
     await run();
 
     const outputs = readOutputs(fixture.outputPath);
-    const receiptPath = path.join(fixture.runnerTemp, "stellar-canary-receipt.json");
+    const receiptPath = outputs["receipt-path"] as string;
+    expect(path.isAbsolute(receiptPath)).toBe(true);
+    expect(path.dirname(receiptPath)).toBe(fixture.runnerTemp);
+    expect(fs.existsSync(receiptPath)).toBe(true);
     expect(outputs["receipt-path"]).toBe(receiptPath);
     expect(outputs.status).toBe("pass");
     expect(uploadArtifactMock).toHaveBeenCalledWith(
@@ -277,7 +283,7 @@ describe.skipIf(process.platform === "win32")("Execution Receipt integration (re
     await run();
 
     expect(setFailedMock).not.toHaveBeenCalled();
-    const receiptText = fs.readFileSync(path.join(fixture.runnerTemp, "stellar-canary-receipt.json"), "utf8");
+    const receiptText = fs.readFileSync(readOutputs(fixture.outputPath)["receipt-path"] as string, "utf8");
     expect(receiptText).not.toContain(SYNTHETIC_TOKEN.slice(0, 12));
     expect(receiptText).not.toContain("/home/runner");
     expect(receiptText).toContain("[REDACTED]");
