@@ -5,44 +5,54 @@ import * as path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// vi.mock is hoisted above the imports, so the spy must be too. Only `info` is
-// replaced: the whole suite reads inputs through the real `core.getInput`, and
-// CONTRIBUTING's partial-mock convention requires spreading the real module so
-// everything else keeps working. `vi.spyOn` cannot be used here because an ESM
-// namespace object is not configurable.
-const { infoMock, setSecretMock } = vi.hoisted(() => ({
+// vi.mock is hoisted above the imports, so the spies must be too. The suite
+// reads inputs through the real `core.getInput`, and CONTRIBUTING's
+// partial-mock convention requires spreading the real module so everything
+// else keeps working. `vi.spyOn` cannot be used here because an ESM namespace
+// object is not configurable.
+const { infoMock, warningMock, setSecretMock } = vi.hoisted(() => ({
   infoMock: vi.fn(),
+  warningMock: vi.fn(),
   setSecretMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof actionsCore>();
-  return { ...actual, info: infoMock, setSecret: setSecretMock };
+  return { ...actual, info: infoMock, warning: warningMock, setSecret: setSecretMock };
 });
 
 import { ConfigNotFoundError, InvalidInputError } from "../../src/errors";
-import { getInputs } from "../../src/inputs";
+import { getInputs, parseScopedFilter, validateFixturesDir } from "../../src/inputs";
 
 const INPUT_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
+  "INPUT_WORKING-DIRECTORY",
   "INPUT_NETWORK",
   "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_RPC-MAX-RETRIES",
   "INPUT_RPC-RETRY-DELAY-MS",
   "INPUT_FIXTURES-DIR",
+  "INPUT_FIXTURE",
+  "INPUT_SURFACE",
+  "INPUT_CACHE-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
+  "INPUT_DIAGNOSTICS",
   "INPUT_TIMEOUT-MINUTES",
   "INPUT_ALLOW-EMPTY",
+  "INPUT_FAIL-ON-WARNING",
+  "INPUT_OFFLINE",
   "INPUT_FIXTURES-PACK-VERSION",
   "INPUT_FIXTURES-PACK-PROTOCOL",
   "INPUT_BASELINE-REPORT",
   "INPUT_GITHUB-TOKEN",
   "INPUT_GITHUB_TOKEN",
   "INPUT_GENERATE-RECEIPT",
+  "INPUT_PR-COMMENT",
+  "INPUT_JUNIT-REPORT",
 ];
 
 function clearInputs(): void {
@@ -53,6 +63,7 @@ function clearInputs(): void {
   delete process.env.GITHUB_TOKEN;
   setSecretMock.mockClear();
   infoMock.mockClear();
+  warningMock.mockClear();
 }
 
 describe("getInputs", () => {
@@ -64,6 +75,7 @@ describe("getInputs", () => {
     expect(inputs).toEqual({
       protocol: undefined,
       config: undefined,
+      workingDirectory: process.cwd(),
       network: undefined,
       networkPassphrase: undefined,
       rpcUrl: undefined,
@@ -73,14 +85,19 @@ describe("getInputs", () => {
       version: "0.2.0",
       uploadReport: true,
       annotations: true,
+      diagnostics: false,
       timeoutMinutes: 15,
       allowEmpty: false,
+      failOnWarning: false,
+      offline: false,
       fixturesPackVersion: undefined,
       fixturesPackProtocol: undefined,
       baselineReport: undefined,
       githubToken: undefined,
       generateReceipt: false,
+      junitReport: false,
       strictIntegrity: false,
+      prComment: false,
     });
   });
 
@@ -464,6 +481,20 @@ describe("getInputs", () => {
     expect(() => getInputs()).toThrow(/"allow-empty"/);
   });
 
+  it("warns when unsupported fail-on-warning or offline inputs are enabled", () => {
+    process.env["INPUT_FAIL-ON-WARNING"] = "true";
+    process.env.INPUT_OFFLINE = "true";
+
+    const inputs = getInputs();
+
+    expect(inputs.failOnWarning).toBe(true);
+    expect(inputs.offline).toBe(true);
+    expect(warningMock.mock.calls.map(([message]) => message)).toEqual([
+      expect.stringContaining('"fail-on-warning"'),
+      expect.stringContaining('"offline"'),
+    ]);
+  });
+
   // #361: `generate-receipt` opts a run into producing an Execution Receipt.
   // It shares the documented boolean literals with the other toggles.
   it("defaults generate-receipt to false", () => {
@@ -486,6 +517,49 @@ describe("getInputs", () => {
     process.env["INPUT_GENERATE-RECEIPT"] = "yes";
     expect(() => getInputs()).toThrow(InvalidInputError);
     expect(() => getInputs()).toThrow(/"generate-receipt"/);
+  });
+});
+
+/**
+ * #331 / CF-08 / D-10: `diagnostics` is strictly opt-in and disabled by
+ * default, so an omitted input must never start uploading diagnostic
+ * artifacts. The input only records the workflow author's intent here; the
+ * bundle itself is uploaded by the diagnostics path that consumes it.
+ */
+describe("getInputs diagnostics (#331)", () => {
+  beforeEach(clearInputs);
+  afterEach(clearInputs);
+
+  it("defaults diagnostics to false when omitted", () => {
+    expect(getInputs().diagnostics).toBe(false);
+  });
+
+  it.each([
+    ["true", true],
+    ["True", true],
+    ["TRUE", true],
+    ["false", false],
+    ["False", false],
+    ["FALSE", false],
+  ])("parses diagnostics %s strictly", (value, expected) => {
+    process.env.INPUT_DIAGNOSTICS = value;
+    expect(getInputs().diagnostics).toBe(expected);
+  });
+
+  it.each(["yes", "1", "0", "on", "diagnostics"])(
+    "rejects the non-boolean diagnostics value %s and names the input",
+    (value) => {
+      process.env.INPUT_DIAGNOSTICS = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"diagnostics"/);
+    },
+  );
+
+  it("leaves artifacts disabled when the input is empty", () => {
+    // GitHub passes an omitted input as the empty string, which is not a
+    // boolean literal: the documented default must still apply.
+    process.env.INPUT_DIAGNOSTICS = "";
+    expect(getInputs().diagnostics).toBe(false);
   });
 });
 
@@ -693,5 +767,487 @@ describe("getInputs fixtures-pack inputs (#337)", () => {
       expect(inputs.githubToken).toBeUndefined();
       expect(setSecretMock).not.toHaveBeenCalled();
     });
+  });
+
+  describe("fixture, surface, and cache-dir inputs (#458)", () => {
+    it("are all unset when omitted", () => {
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("treats empty and whitespace-only values as unset rather than rejecting them", () => {
+      process.env.INPUT_FIXTURE = "   ";
+      process.env.INPUT_SURFACE = "";
+      process.env["INPUT_CACHE-DIR"] = "\t\n";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBeUndefined();
+      expect(inputs.surface).toBeUndefined();
+      expect(inputs.cacheDir).toBeUndefined();
+    });
+
+    it("parses valid values, trimming surrounding whitespace", () => {
+      process.env.INPUT_FIXTURE = "  p28-xdr-cap83-empty-tx-set  ";
+      process.env.INPUT_SURFACE = " rpc ";
+      process.env["INPUT_CACHE-DIR"] = " .canary-cache ";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("p28-xdr-cap83-empty-tx-set");
+      expect(inputs.surface).toBe("rpc");
+      expect(inputs.cacheDir).toBe(".canary-cache");
+    });
+
+    it("accepts each engine surface name and nothing else", () => {
+      for (const surface of ["xdr", "rpc", "soroban"]) {
+        process.env.INPUT_SURFACE = surface;
+        expect(getInputs().surface).toBe(surface);
+      }
+    });
+
+    it.each(["XDR", "Rpc", "xdr rpc", "all", "soroban-rpc"])(
+      "rejects surface %j with an error naming the accepted values",
+      (value) => {
+        process.env.INPUT_SURFACE = value;
+        expect(() => getInputs()).toThrow(InvalidInputError);
+        expect(() => getInputs()).toThrow(/"surface"/);
+        expect(() => getInputs()).toThrow(/xdr.*rpc.*soroban/);
+      },
+    );
+
+    it.each([
+      ["newline", "a\nb"],
+      ["tab", "a\tb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in fixture", (_label, value) => {
+      process.env.INPUT_FIXTURE = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"fixture"/);
+      expect(() => getInputs()).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it.each([
+      ["newline", "a\nb"],
+      ["DEL", "a\u007fb"],
+      ["C1", "a\u0085b"],
+    ])("rejects a %s control character in cache-dir", (_label, value) => {
+      process.env["INPUT_CACHE-DIR"] = value;
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"cache-dir"/);
+    });
+
+    // NUL cannot be carried through process.env (the platform rejects the
+    // byte), so the NUL case of the shared validator is exercised directly.
+    it.each([["fixture"], ["cache-dir"]])("rejects a NUL control character in %s", (inputName) => {
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(InvalidInputError);
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(new RegExp(`"${inputName}"`));
+      expect(() => parseScopedFilter("a\u0000b", inputName)).toThrow(/[Cc]ontrol characters/);
+    });
+
+    it("accepts ids and paths containing spaces, dots, slashes, and a leading dash", () => {
+      process.env.INPUT_FIXTURE = "-weird id.v1/x";
+      process.env["INPUT_CACHE-DIR"] = "-cache dir/./nested";
+      const inputs = getInputs();
+      expect(inputs.fixture).toBe("-weird id.v1/x");
+      expect(inputs.cacheDir).toBe("-cache dir/./nested");
+    });
+  });
+
+  describe("junit-report input (#423)", () => {
+    it("defaults to false", () => {
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it.each([["true"], ["True"], ["TRUE"]])("parses %j as enabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(true);
+    });
+
+    it.each([["false"], ["False"], [""]])("parses %j as disabled", (value) => {
+      process.env["INPUT_JUNIT-REPORT"] = value;
+      expect(getInputs().junitReport).toBe(false);
+    });
+
+    it("rejects an undocumented boolean form by name", () => {
+      process.env["INPUT_JUNIT-REPORT"] = "yes";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+      expect(() => getInputs()).toThrow(/"junit-report"/);
+    });
+  });
+});
+
+/**
+ * Issue #400: `fixtures-dir` is validated against the filesystem before the
+ * engine version is resolved or installed. The helper resolves the input
+ * against the working directory, distinguishes a missing path from one that
+ * is not a directory, treats a dangling symlink as a missing path (statSync
+ * follows links), and preserves the `allow-empty` exception for a missing
+ * directory via a `core.warning` — while never creating the directory.
+ */
+describe("validateFixturesDir (#400)", () => {
+  let root: string;
+
+  beforeEach(() => {
+    clearInputs();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "canary-fixtures-dir-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    clearInputs();
+  });
+
+  it("accepts an existing directory and returns the resolved absolute path", () => {
+    const dir = path.join(root, "fixtures");
+    fs.mkdirSync(dir);
+
+    const resolved = validateFixturesDir(dir, false);
+
+    expect(resolved).toBe(path.resolve(dir));
+    expect(path.isAbsolute(resolved)).toBe(true);
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a missing directory, naming the input, the resolved absolute path, and the reason", () => {
+    const missing = path.join(root, "no-such-fixtures");
+
+    expect(() => validateFixturesDir(missing, false)).toThrow(InvalidInputError);
+    expect(() => validateFixturesDir(missing, false)).toThrow(/"fixtures-dir"/);
+    expect(() => validateFixturesDir(missing, false)).toThrow(path.resolve(missing));
+    expect(() => validateFixturesDir(missing, false)).toThrow(/does not exist/);
+  });
+
+  it("rejects a nonexistent absolute path the same way", () => {
+    const missing = path.join(path.resolve(path.parse(root).root), "canary-absent", "fixtures");
+    expect(fs.existsSync(missing)).toBe(false);
+
+    expect(() => validateFixturesDir(missing, false)).toThrow(InvalidInputError);
+    expect(() => validateFixturesDir(missing, false)).toThrow(path.resolve(missing));
+  });
+
+  it("rejects a resolved path that is a regular file with a distinct not-a-directory message", () => {
+    const file = path.join(root, "fixtures.toml");
+    fs.writeFileSync(file, "[tests]\n", "utf8");
+
+    expect(() => validateFixturesDir(file, false)).toThrow(InvalidInputError);
+    expect(() => validateFixturesDir(file, false)).toThrow(/is not a directory/);
+    expect(() => validateFixturesDir(file, false)).toThrow(/"fixtures-dir"/);
+    expect(() => validateFixturesDir(file, false)).toThrow(path.resolve(file));
+
+    // allow-empty excuses an empty fixture set, not a mistyped path: a
+    // regular file is rejected even when the run may load no fixtures.
+    expect(() => validateFixturesDir(file, true)).toThrow(/is not a directory/);
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  // Symlink creation needs elevated privileges or Developer Mode on Windows,
+  // so the capability is probed once (with the same dangling shape the test
+  // uses) and the test is skipped where creation is impossible — it must
+  // never fail the suite on a platform that merely cannot make symlinks.
+  describe("dangling symlink", () => {
+    const supported = (() => {
+      const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "canary-symlink-probe-"));
+      try {
+        fs.symlinkSync(path.join(probeRoot, "absent-target"), path.join(probeRoot, "link"));
+        return true;
+      } catch {
+        return false;
+      } finally {
+        fs.rmSync(probeRoot, { recursive: true, force: true });
+      }
+    })();
+
+    it.skipIf(!supported)("follows the documented missing-path behavior", () => {
+      const link = path.join(root, "dangling");
+      fs.symlinkSync(path.join(root, "absent-target"), link);
+      expect(fs.existsSync(link)).toBe(false);
+
+      // statSync follows the link to a target that does not exist, so the
+      // result is exactly the missing-path behavior above...
+      expect(() => validateFixturesDir(link, false)).toThrow(InvalidInputError);
+      expect(() => validateFixturesDir(link, false)).toThrow(/does not exist/);
+      expect(() => validateFixturesDir(link, false)).toThrow(path.resolve(link));
+
+      // ...including the allow-empty warning branch.
+      expect(validateFixturesDir(link, true)).toBe(path.resolve(link));
+      expect(warningMock).toHaveBeenCalledTimes(1);
+      const warning = String(warningMock.mock.calls[0]?.[0]);
+      expect(warning).toContain('"fixtures-dir"');
+      expect(warning).toContain(path.resolve(link));
+    });
+  });
+
+  it("resolves a relative path against the current working directory", () => {
+    const dir = path.join(root, "relative-fixtures");
+    fs.mkdirSync(dir);
+    // Deliberately relative: this is what distinguishes the resolved value
+    // from the raw input. GitHub-hosted Windows runners can check the
+    // repository out on a different drive from the system temp directory;
+    // then path.relative returns an absolute path and this stops exercising
+    // a relative input, so the assertion below is written in terms of
+    // path.resolve rather than the raw string.
+    const relative = path.relative(process.cwd(), dir);
+
+    expect(validateFixturesDir(relative, false)).toBe(path.resolve(relative));
+  });
+
+  it("normalizes `..` segments and validates the normalized destination", () => {
+    const dir = path.join(root, "fx");
+    fs.mkdirSync(dir);
+
+    // An existing directory reached through `..` is accepted, and the
+    // returned path is the normalized one.
+    const viaParent = `${dir}${path.sep}..${path.sep}fx`;
+    expect(validateFixturesDir(viaParent, false)).toBe(path.resolve(dir));
+
+    // A missing destination is rejected at its normalized path — the
+    // lexically-passed string with `..` in it never reaches the message.
+    const missingViaParent = `${dir}${path.sep}..${path.sep}missing`;
+    expect(() => validateFixturesDir(missingViaParent, false)).toThrow(
+      path.join(root, "missing"),
+    );
+    expect(() => validateFixturesDir(missingViaParent, false)).not.toThrow(
+      `${path.sep}fx${path.sep}..${path.sep}missing`,
+    );
+  });
+
+  it("warns and continues for a missing directory when allow-empty is true", () => {
+    const missing = path.join(root, "missing-pack");
+
+    expect(validateFixturesDir(missing, true)).toBe(path.resolve(missing));
+
+    expect(warningMock).toHaveBeenCalledTimes(1);
+    const warning = String(warningMock.mock.calls[0]?.[0]);
+    expect(warning).toContain('"fixtures-dir"');
+    expect(warning).toContain(path.resolve(missing));
+    // The directory is never created behind the user's back.
+    expect(fs.existsSync(missing)).toBe(false);
+  });
+
+  it("emits no warning for an existing directory even when allow-empty is true", () => {
+    const dir = path.join(root, "fixtures");
+    fs.mkdirSync(dir);
+
+    expect(validateFixturesDir(dir, true)).toBe(path.resolve(dir));
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+});
+    // Masking tests for credential-bearing RPC URLs
+    it("masks username and password from userinfo", () => {
+      process.env["INPUT_RPC-URL"] = "https://alice:password123@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("alice");
+      expect(setSecretMock).toHaveBeenCalledWith("password123");
+      expect(setSecretMock).toHaveBeenCalledWith("https://alice:password123@example.com/soroban/rpc");
+    });
+
+    it("masks query parameter values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?apikey=secret123&token=abc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("secret123");
+      expect(setSecretMock).toHaveBeenCalledWith("abc");
+      expect(setSecretMock).toHaveBeenCalledWith("https://example.com/soroban/rpc?apikey=secret123&token=abc");
+    });
+
+    it("masks URL fragment", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc#fragment";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("fragment");
+      expect(setSecretMock).toHaveBeenCalledWith("https://example.com/soroban/rpc#fragment");
+    });
+
+    it("does not mask plain URL without sensitive components", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("does not mask empty username", () => {
+      process.env["INPUT_RPC-URL"] = "https://@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("masks password from userinfo even when username is empty", () => {
+      process.env["INPUT_RPC-URL"] = "https://:password@example.com/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("password"); expect(setSecretMock).toHaveBeenCalledWith("https://:password@example.com/soroban/rpc");
+    });
+
+    it("handles repeated query parameters", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=val1&key=val2";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("val1");
+      expect(setSecretMock).toHaveBeenCalledWith("val2");
+    });
+
+    it("does not mask empty query parameter values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("handles percent-encoded values", () => {
+      process.env["INPUT_RPC-URL"] = "https://example.com/soroban/rpc?key=%24secre7";
+      getInputs();
+      expect(setSecretMock).toHaveBeenCalledWith("$secre7");
+    });
+
+    it("handles plain http localhost URL without masking", () => {
+      process.env["INPUT_RPC-URL"] = "http://localhost:8000/soroban/rpc";
+      getInputs();
+      expect(setSecretMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects invalid URL still throws error", () => {
+      process.env["INPUT_RPC-URL"] = "not a url";
+      expect(() => getInputs()).toThrow(InvalidInputError);
+    });
+
+describe("rejected rpc-url values never echo credentials (#510)", () => {
+  beforeEach(clearInputs);
+  afterEach(clearInputs);
+
+  /** The message getInputs() throws for this rpc-url value. Secrets are built
+   * from fragments inside each test so no literal credential-looking string
+   * appears in a log if an assertion fails. */
+  function rejectionMessage(rpcUrl: string): string {
+    process.env["INPUT_RPC-URL"] = rpcUrl;
+    try {
+      getInputs();
+    } catch (error) {
+      expect(error).toBeInstanceOf(InvalidInputError);
+      return (error as Error).message;
+    }
+    throw new Error("expected getInputs() to reject this rpc-url");
+  }
+
+  it("redacts userinfo and query credentials of a rejected http:// URL but keeps the host and the https rule", () => {
+    const userSecret = ["KEY", "SECRET", "123"].join("");
+    const querySecret = ["SECRET", "456"].join("");
+    const message = rejectionMessage(`http://user:${userSecret}@rpc.example.org/v1?api_key=${querySecret}`);
+
+    expect(message).not.toContain(userSecret);
+    expect(message).not.toContain(querySecret);
+    expect(message).not.toContain("user:");
+    expect(message).not.toContain("api_key");
+    expect(message).toContain("rpc.example.org");
+    expect(message).toContain("/v1");
+    expect(message).toContain("[REDACTED]");
+    expect(message).toContain("Must be an https:// URL (plain http:// is only accepted for localhost/127.0.0.1).");
+  });
+
+  it("keeps the exact message shape for a rejected URL that carries no credentials", () => {
+    expect(rejectionMessage("http://example.com/rpc")).toBe(
+      'Invalid "rpc-url" input: http://example.com/rpc. Must be an https:// URL ' +
+        "(plain http:// is only accepted for localhost/127.0.0.1).",
+    );
+  });
+
+  it("redacts userinfo, query and fragment of a rejected non-http scheme", () => {
+    const message = rejectionMessage("ftp://user:pw@example.org/x?token=abc#frag");
+
+    for (const secret of ["pw", "abc", "frag", "token", "user"]) {
+      expect(message).not.toContain(secret);
+    }
+    expect(message).toContain("example.org");
+    expect(message).toContain("/x");
+  });
+
+  it("redacts a fragment on its own", () => {
+    const fragment = ["frag", "secret"].join("-");
+    const message = rejectionMessage(`ftp://example.org/x#${fragment}`);
+
+    expect(message).not.toContain(fragment);
+    expect(message).toContain("example.org");
+  });
+
+  it("keeps a non-default port visible", () => {
+    const message = rejectionMessage("http://user:pw@rpc.example.org:8545/v1");
+
+    expect(message).toContain("rpc.example.org:8545");
+    expect(message).not.toContain("pw");
+  });
+
+  it("masks a GitHub token that sits in the path of a rejected URL", () => {
+    const token = `ghp_${"a1B2".repeat(9)}`;
+    const message = rejectionMessage(`http://rpc.example.org/${token}/v1`);
+
+    expect(message).not.toContain(token);
+    expect(message).toContain("rpc.example.org");
+    expect(message).toContain("[REDACTED]");
+  });
+
+  it("describes a URL without an authority as having no host, without echoing its scheme or remainder", () => {
+    const secret = ["mail", "secret"].join("-");
+    const message = rejectionMessage(`mailto:${secret}@example.org?subject=${secret}`);
+
+    expect(message).not.toContain(secret);
+    expect(message).not.toContain("example.org");
+    expect(message).not.toContain("mailto");
+    expect(message).toContain("a URL with no host");
+    expect(message).toContain("Must be an https:// URL");
+  });
+
+  it("does not echo any part of an unparseable value with whitespace in the host", () => {
+    const secret = ["SECRET"].join("");
+    const message = rejectionMessage(`https://user:KEY@exa mple.org/?key=${secret}`);
+
+    for (const fragment of ["user", "KEY", secret, "exa", "mple", "key="]) {
+      expect(message).not.toContain(fragment);
+    }
+    expect(message).toContain("contains whitespace");
+    expect(message).toContain("Expected a valid URL.");
+  });
+
+  it("does not echo an unparseable value that is not a URL at all", () => {
+    const message = rejectionMessage("not a url KEY");
+
+    expect(message).not.toContain("not a url");
+    expect(message).not.toContain("KEY");
+    expect(message).toContain("13 characters");
+    expect(message).toContain("contains whitespace");
+  });
+
+  it("does not echo the leading part of a value that merely parses as an opaque scheme", () => {
+    const message = rejectionMessage("tok3n:rest:KEY");
+
+    for (const fragment of ["tok3n", "rest", "KEY"]) {
+      expect(message).not.toContain(fragment);
+    }
+    expect(message).toContain("a URL with no host");
+  });
+
+  it("reports only the length for an unparseable value without whitespace", () => {
+    const message = rejectionMessage("//KEY-only");
+
+    expect(message).not.toContain("KEY");
+    expect(message).toContain("10 characters");
+    expect(message).not.toContain("contains whitespace");
+  });
+
+  it("writes nothing that contains the original value to the log while rejecting", () => {
+    const secret = ["LOG", "SECRET", "789"].join("");
+    rejectionMessage(`http://user:${secret}@rpc.example.org/v1?api_key=${secret}`);
+
+    for (const mock of [infoMock, warningMock, setSecretMock]) {
+      expect(JSON.stringify(mock.mock.calls)).not.toContain(secret);
+    }
+  });
+
+  it("leaves accepted values untouched: https with a query string, localhost and loopback http", () => {
+    process.env["INPUT_RPC-URL"] = "https://rpc.example.org/v1?api_key=kept-as-is";
+    expect(getInputs().rpcUrl).toBe("https://rpc.example.org/v1?api_key=kept-as-is");
+
+    process.env["INPUT_RPC-URL"] = "http://localhost:8000/soroban/rpc";
+    expect(getInputs().rpcUrl).toBe("http://localhost:8000/soroban/rpc");
+
+    process.env["INPUT_RPC-URL"] = "http://127.0.0.1:8000/soroban/rpc";
+    expect(getInputs().rpcUrl).toBe("http://127.0.0.1:8000/soroban/rpc");
+  });
+
+  it("treats an empty or whitespace-only rpc-url as unset", () => {
+    process.env["INPUT_RPC-URL"] = "   ";
+    expect(getInputs().rpcUrl).toBeUndefined();
   });
 });

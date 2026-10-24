@@ -3,22 +3,55 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { ConfigNotFoundError, InvalidInputError } from "./errors";
+import type { Surface } from "./output";
+import { describeUrlSafely } from "./redact";
+
+/** The `surface` input accepts exactly the engine's three surface names. */
+export type SurfaceFilter = Surface;
 
 export interface ActionInputs {
   readonly protocol: number | undefined;
   readonly config: string | undefined;
+  /** Directory treated as Canary's project root (#348), resolved to an
+   * absolute path against the working directory; defaults to `.` (the
+   * workspace itself). Forwarded as `--project-root` only when it differs
+   * from the working directory — see {@link parseWorkingDirectory} and
+   * `buildCheckArgs` for why the default is deliberately not forwarded. */
+  readonly workingDirectory: string;
   readonly network: string | undefined;
   readonly networkPassphrase: string | undefined;
   readonly rpcUrl: string | undefined;
   readonly rpcMaxRetries: number | undefined;
   readonly rpcRetryDelayMs: number | undefined;
   readonly fixturesDir: string;
+  /** Run only the fixture with this exact id (`--fixture=<id>`, #458).
+   * `undefined` when unset. Requires an engine release whose `check` accepts
+   * `--fixture`; see `engineSupportsFixtureSurfaceCacheDir` in runner.ts. */
+  readonly fixture: string | undefined;
+  /** Run only fixtures of this surface (`--surface=<surface>`, #458):
+   * exactly one of the engine's three lower-case surface names. `undefined`
+   * when unset. Same engine gate as {@link fixture}. */
+  readonly surface: SurfaceFilter | undefined;
+  /** Directory for cached fixture results (`--cache-dir=<path>`, #458),
+   * forwarded unchanged — the engine resolves a relative path against
+   * `--project-root` when one is given, so the Action never resolves it
+   * against the workspace. `undefined` when unset. Same engine gate as
+   * {@link fixture}. */
+  readonly cacheDir: string | undefined;
   readonly version: string;
   readonly uploadReport: boolean;
   readonly annotations: boolean;
+  /** Opt in to a best-effort redacted diagnostics bundle. Disabled by
+   * default (CF-08 / D-10): such an artifact is readable by anyone who can
+   * read the repository, and redaction by pattern is only best effort. */
+  readonly diagnostics: boolean;
   readonly timeoutMinutes: number;
   /** Pass `--allow-empty` to engines that support it (0.2.0 and newer). */
   readonly allowEmpty: boolean;
+  /** Fail the check when supported engines report warnings. */
+  readonly failOnWarning: boolean;
+  /** Skip network-dependent fixtures when supported by the engine. */
+  readonly offline: boolean;
   /** Release tag of the fixture pack to run against, e.g. `v1.2.0`, kept as
    * written (leading `v` optional). Validated for format only — see
    * {@link parseFixturesPackVersion} for why it is not forwarded yet. */
@@ -37,9 +70,17 @@ export interface ActionInputs {
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
   readonly generateReceipt: boolean;
+  /** Render the parsed JSON report to JUnit XML through the engine's own
+   * `report <file> --format junit` command (#423) and expose the file as the
+   * `junit-report-path` output (also included in the artifact upload).
+   * Auxiliary: any failure — an engine without the command, a non-zero exit,
+   * empty output, a missing report file — is a warning only and can never
+   * change the compatibility result. */
+  readonly junitReport: boolean;
   /** Fail closed whenever binary integrity cannot be proven (issue #372).
    * Default `false` preserves the historical degrade-to-pinning behaviour. */
   readonly strictIntegrity: boolean;
+  readonly prComment: boolean;
 }
 
 const SEMVER_LIKE = /^\d+\.\d+\.\d+$/;
@@ -142,9 +183,13 @@ const PACK_VERSION_LIKE = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-
 export function getInputs(): ActionInputs {
   const protocol = parseProtocol(core.getInput("protocol"));
   const config = parseConfig(core.getInput("config"));
+  const workingDirectory = parseWorkingDirectory(core.getInput("working-directory"));
   const network = optional(core.getInput("network"));
   const networkPassphrase = parseNetworkPassphrase(core.getInput("network-passphrase", { trimWhitespace: false }));
   const rpcUrl = parseRpcUrl(core.getInput("rpc-url"));
+  if (rpcUrl !== undefined) {
+    maskRpcUrlSecrets(rpcUrl, core.setSecret);
+  }
   const rpcMaxRetries = parseDecimalInteger(
     core.getInput("rpc-max-retries"),
     "rpc-max-retries",
@@ -158,11 +203,20 @@ export function getInputs(): ActionInputs {
     RPC_RETRY_DELAY_MS_MAX,
   );
   const fixturesDir = core.getInput("fixtures-dir") || "fixtures";
+  const fixture = parseScopedFilter(core.getInput("fixture"), "fixture");
+  const surface = parseSurface(core.getInput("surface"));
+  const cacheDir = parseScopedFilter(core.getInput("cache-dir"), "cache-dir");
   const version = parseVersion(core.getInput("version") || "0.2.0");
   const uploadReport = parseBoolean("upload-report", core.getInput("upload-report") || "true");
   const annotations = parseBoolean("annotations", core.getInput("annotations") || "true");
+  const diagnostics = parseBoolean("diagnostics", core.getInput("diagnostics") || "false");
   const timeoutMinutes = parseTimeout(core.getInput("timeout-minutes") || "15");
   const allowEmpty = parseBoolean("allow-empty", core.getInput("allow-empty") || "false");
+  const failOnWarning = parseBoolean(
+    "fail-on-warning",
+    core.getInput("fail-on-warning") || "false",
+  );
+  const offline = parseBoolean("offline", core.getInput("offline") || "false");
   const fixturesPackVersion = parseFixturesPackVersion(core.getInput("fixtures-pack-version"));
   const fixturesPackProtocol = parseFixturesPackProtocol(core.getInput("fixtures-pack-protocol"));
   const baselineReport = parseBaselineReport(core.getInput("baseline-report"));
@@ -171,12 +225,40 @@ export function getInputs(): ActionInputs {
   if (githubToken !== undefined) {
     core.setSecret(githubToken);
   }
+  // A `working-directory` that resolves to the workspace itself is exactly
+  // what the engine already uses as its project root, so the default run is
+  // not forwarded anything and needs no explanation. Any other value changes
+  // what the engine treats as the project root and requires an engine that
+  // accepts `--project-root`; say so up front instead of leaving the user to
+  // infer it from a version-dependent CLI usage error.
+  if (workingDirectory !== path.resolve(".")) {
+    core.info(
+      `"working-directory" will be forwarded to Canary as --project-root (${JSON.stringify(workingDirectory)}). ` +
+        "This requires a Protocol-Canary release whose CLI supports --project-root; older releases reject the argument.",
+    );
+  }
   if (networkPassphrase !== undefined) {
     core.setSecret(networkPassphrase);
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+  const junitReport = parseBoolean("junit-report", core.getInput("junit-report") || "false");
 
   const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
+
+  if (!engineSupportsFailOnWarningAndOffline(version)) {
+    if (failOnWarning) {
+      core.warning(
+        `"fail-on-warning" is enabled, but Protocol Canary ${version} does not support it yet; ` +
+          "the option will be ignored.",
+      );
+    }
+    if (offline) {
+      core.warning(
+        `"offline" is enabled, but Protocol Canary ${version} does not support it yet; ` +
+          "the option will be ignored.",
+      );
+    }
+  }
 
   // A validated input that silently does nothing is worse than a missing one:
   // it reads as "my pack is pinned" when the run used whatever
@@ -194,24 +276,58 @@ export function getInputs(): ActionInputs {
   return {
     protocol,
     config,
+    workingDirectory,
     network,
     networkPassphrase,
     rpcUrl,
     rpcMaxRetries,
     rpcRetryDelayMs,
     fixturesDir,
+    fixture,
+    surface,
+    cacheDir,
     version,
     uploadReport,
     annotations,
+    diagnostics,
     timeoutMinutes,
     allowEmpty,
+    failOnWarning,
+    offline,
     fixturesPackVersion,
     fixturesPackProtocol,
     baselineReport,
     githubToken,
     generateReceipt,
+    junitReport,
     strictIntegrity,
+    prComment: parseBoolean("pr-comment", core.getInput("pr-comment") || "false"),
   };
+}
+
+// TODO(#421): Replace this placeholder when Protocol-Canary publishes the
+// release containing PRs #567 and #527.
+const FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION: readonly [number, number, number] = [
+  999_999_999,
+  0,
+  0,
+];
+
+/** Returns whether the pinned engine supports `--fail-on-warning` and `--offline`. */
+export function engineSupportsFailOnWarningAndOffline(version: string | undefined): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
+  if (match === null) {
+    return false;
+  }
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let i = 0; i < FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION.length; i++) {
+    const minimum = FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION[i] as number;
+    const part = parts[i] as number;
+    if (part !== minimum) {
+      return part > minimum;
+    }
+  }
+  return true;
 }
 
 /** Validates an explicitly supplied passphrase without trimming it: spaces
@@ -271,15 +387,66 @@ function parseFixturesPackVersion(raw: string): string | undefined {
 }
 
 /**
- * Validates the "fixtures-pack-protocol" input as a **positive** integer
- * string; `undefined` when unset. Throws {@link InvalidInputError}, naming the
- * input and an accepted example, for anything else.
+ * Masks sensitive components extracted from a validated RPC URL by registering
+ * them with the GitHub Actions runner via `core.setSecret()`.
  *
- * Unlike the `protocol` input — which accepts `0` because a non-negative
- * integer is the right shape there — zero is rejected here: a pack pinned to
- * protocol 0 is not a pack anyone publishes, so accepting it would only defer
- * the error to somewhere less actionable.
+ * This runs after `parseRpcUrl` validation, so malformed URLs are already
+ * rejected. The original URL string is preserved for full-URL masking.
  *
+ * Components masked (if non-empty):
+ *   - Username from URL userinfo (`user:password@host`)
+ *   - Password from URL userinfo
+ *   - Every query parameter value
+ *   - URL fragment
+ *   - The complete RPC URL if any sensitive component is present
+ *
+ * @param rpcUrl The validated RPC URL string (already validated as https:// or
+ *   permitted plain http:// for localhost/127.0.0.1).
+ */
+function maskRpcUrlSecrets(rpcUrl: string, setSecret: (secret: string) => void): void {
+  const parsed = new URL(rpcUrl);
+  let hasSensitive = false;
+
+  // 1. Username and password from URL userinfo.
+  if (parsed.username !== "") {
+    setSecret(parsed.username);
+    hasSensitive = true;
+  }
+  if (parsed.password !== "") {
+    setSecret(parsed.password);
+    hasSensitive = true;
+  }
+
+  // 2. Every query parameter value.
+  if (parsed.searchParams.size > 0) {
+    for (const [, value] of parsed.searchParams.entries()) {
+      const decodedValue = decodeURIComponent(value);
+      if (decodedValue !== "") {
+        setSecret(decodedValue);
+        hasSensitive = true;
+      }
+    }
+  }
+
+  // 3. URL fragment.
+  if (parsed.hash && parsed.hash.length > 1) {
+    const fragment = parsed.hash.slice(1); // strip leading #
+    if (fragment !== "") {
+      setSecret(fragment);
+      hasSensitive = true;
+    }
+  }
+
+  // 4. The complete RPC URL if any sensitive component is present.
+  if (hasSensitive) {
+    setSecret(rpcUrl);
+  }
+}
+
+/**
+ * Validates the "fixtures-pack-version" input as a published fixture-pack
+ * release tag; `undefined` when unset. Throws {@link InvalidInputError},
+ * naming the input and an accepted example, for anything else.
  * Not forwarded to the CLI, for the same reason as
  * {@link parseFixturesPackVersion}.
  */
@@ -348,6 +515,59 @@ function optional(value: string): string | undefined {
   return value.trim() === "" ? undefined : value.trim();
 }
 
+/**
+ * Validates a scope-affecting string input (#458 `fixture`, `cache-dir`):
+ * trimmed, with empty/whitespace-only meaning *unset* (the same normalization
+ * as every optional string input), and free of control characters once
+ * trimmed — C0 (`U+0000`-`U+001F`), `U+007F`, and C1 (`U+0080`-`U+009F`).
+ *
+ * Nothing beyond control characters is restricted: the engine decides what a
+ * fixture id is, and a cache path legitimately contains spaces, dots, slashes,
+ * and can begin with `-` (forwarded as `--flag=value`, so it can never be
+ * mistaken for another option). A silently ignored value here would run a
+ * different scope than the caller asked for (#458), so a bad value is an
+ * input error, never a downgraded warning.
+ *
+ * Exported for tests: a NUL byte cannot be carried through `process.env`
+ * (the platform rejects it), so the NUL case of this check is only
+ * reachable through the function directly.
+ */
+export function parseScopedFilter(raw: string, inputName: string): string | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (CONTROL_CHARACTERS.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "${inputName}" input: ${JSON.stringify(value)}. ` +
+        "Control characters (C0, DEL, and C1) are not allowed.",
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the `surface` input (#458) as exactly one of the engine's three
+ * lower-case surface names; empty/whitespace-only means unset. The engine
+ * rejects any other value (`invalid value ... [possible values: xdr, rpc,
+ * soroban]`), and a case or spelling mismatch must fail here with an
+ * input-naming message instead of surfacing as an engine failure — or, worse,
+ * as a differently scoped run.
+ */
+function parseSurface(raw: string): SurfaceFilter | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value !== "xdr" && value !== "rpc" && value !== "soroban") {
+    throw new InvalidInputError(
+      `Invalid "surface" input: ${JSON.stringify(value)}. Expected exactly ` +
+        'one of "xdr", "rpc" or "soroban" (lower case).',
+    );
+  }
+  return value;
+}
+
 /** Validates the "protocol" input as an unsigned decimal integer from 1 to
  * 4294967295 inclusive (the engine's `--protocol` is a u32 and rejects 0);
  * undefined when unset. Throws {@link InvalidInputError} for anything else. */
@@ -387,11 +607,112 @@ function parseConfig(raw: string): string | undefined {
   return resolved;
 }
 
+/**
+ * Validates the "working-directory" input (#348) as a path to an existing
+ * directory, resolved against the current working directory; defaults to
+ * `.` (the workspace itself) when unset or whitespace-only, matching the
+ * declared default in `action.yml`.
+ *
+ * Throws {@link InvalidInputError} — naming the input, quoting the value as
+ * written, and including the resolved path — when nothing exists at that
+ * path or when it exists but is not a directory (e.g. a regular file), so
+ * the mistake is caught here rather than surfacing later as an engine exit
+ * code 2 with no actionable path context.
+ *
+ * Returns the *resolved* path rather than the raw input, for the same
+ * reason {@link parseConfig} does: the directory this function validated is
+ * then forwarded to the CLI as `--project-root`, and the two must be the
+ * same path by construction regardless of the working directory the engine
+ * happens to inherit.
+ */
+function parseWorkingDirectory(raw: string): string {
+  const value = optional(raw) ?? ".";
+  const resolved = path.resolve(value);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    throw new InvalidInputError(
+      `Invalid "working-directory" input: ${JSON.stringify(value)}. Expected a path to an existing ` +
+        `directory, but no such path exists (resolved to ${JSON.stringify(resolved)}).`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new InvalidInputError(
+      `Invalid "working-directory" input: ${JSON.stringify(value)}. Expected a path to a directory, ` +
+        `but the path is not a directory (resolved to ${JSON.stringify(resolved)}).`,
+    );
+  }
+  return resolved;
+}
+
+/**
+ * Validates the "fixtures-dir" input against the filesystem (issue #400): the
+ * resolved path must name an existing directory. Called from `run()` after
+ * input parsing and before version resolution or engine installation, so a
+ * mistyped path fails the job in milliseconds instead of after a full
+ * `cargo install`.
+ *
+ * The path is resolved against the current working directory — the same
+ * working directory the CLI reads `--fixtures-dir` from — and stat'ed in
+ * its normalized form, so `..` segments and relative input can never make
+ * the validated path differ from the forwarded one. `fs.statSync` follows
+ * symbolic links, so a dangling symlink is indistinguishable from a missing
+ * path and gets the same, predictable missing-path treatment (the same
+ * convention `parseConfig` uses for `config`).
+ *
+ * A missing directory is fatal by default, with a message naming the input
+ * and the resolved absolute path. With `allow-empty` enabled it degrades to
+ * a `core.warning` and the run continues — `allow-empty` exists precisely to
+ * tolerate a run that executes no checks — and the directory is never
+ * created behind the user's back. A resolved path that exists but is not a
+ * directory (e.g. a regular file) is always rejected, even with
+ * `allow-empty`: that input excuses an empty fixture set, not a mistyped
+ * path.
+ *
+ * Returns the resolved absolute path that was validated. Throws
+ * {@link InvalidInputError} when the path is not an existing directory and
+ * `allowEmpty` is false.
+ */
+export function validateFixturesDir(fixturesDir: string, allowEmpty: boolean): string {
+  const resolved = path.resolve(fixturesDir);
+  let stats: fs.Stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    // statSync throws for a missing path (ENOENT) — including a dangling
+    // symlink, which it follows to a target that does not exist — and for
+    // paths it cannot stat at all. All of them get the missing-path
+    // treatment rather than being forwarded to the engine to fail there
+    // with a less actionable error.
+    if (allowEmpty) {
+      core.warning(
+        `"fixtures-dir" input: the fixtures directory ${resolved} does not exist. ` +
+          "Continuing because \"allow-empty\" is true; Canary will load no fixtures from it.",
+      );
+      return resolved;
+    }
+    throw new InvalidInputError(
+      `Invalid "fixtures-dir" input: the fixtures directory ${resolved} does not exist. ` +
+        "Provide a path to an existing directory, or set \"allow-empty\" to true to run without one.",
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new InvalidInputError(
+      `Invalid "fixtures-dir" input: ${resolved} exists but is not a directory. ` +
+        "\"fixtures-dir\" must point at a directory of fixtures; a regular file is not one.",
+    );
+  }
+  return resolved;
+}
+
 /** Validates the "rpc-url" input as a parseable URL and enforces the scheme
  * allow-list: https:// only, with one deliberate exception — plain http://
  * is accepted for localhost/127.0.0.1 so local development endpoints work.
  * Throws {@link InvalidInputError} for an unparseable URL or any other
- * non-https scheme. */
+ * non-https scheme. The error message never contains the rejected text: a
+ * parseable URL is described with userinfo, query and fragment redacted, and
+ * an unparseable value is described by non-sensitive facts only (#510). */
 function parseRpcUrl(raw: string): string | undefined {
   const value = optional(raw);
   if (value === undefined) {
@@ -402,14 +723,21 @@ function parseRpcUrl(raw: string): string | undefined {
   try {
     parsed = new URL(value);
   } catch {
-    throw new InvalidInputError(`Invalid "rpc-url" input: ${JSON.stringify(value)}. Expected a valid URL.`);
+    // The value is deliberately not echoed, not even a prefix or suffix of it:
+    // an unparseable URL may still carry a credential (#510). Only facts that
+    // cannot reveal one are reported.
+    const facts = [`${String(value.length)} characters`, ...(/\s/.test(value) ? ["contains whitespace"] : [])];
+    throw new InvalidInputError(
+      `Invalid "rpc-url" input: the value could not be parsed as a URL (${facts.join(", ")}) and is not shown ` +
+        "because it may contain credentials. Expected a valid URL.",
+    );
   }
 
   const isLocalHttp =
     parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
   if (parsed.protocol !== "https:" && !isLocalHttp) {
     throw new InvalidInputError(
-      `Invalid "rpc-url" input: ${JSON.stringify(value)}. Must be an https:// URL ` +
+      `Invalid "rpc-url" input: ${describeUrlSafely(parsed)}. Must be an https:// URL ` +
         `(plain http:// is only accepted for localhost/127.0.0.1).`,
     );
   }

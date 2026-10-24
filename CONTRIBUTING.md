@@ -9,15 +9,28 @@ Node 24. The root [`.nvmrc`](.nvmrc) pins it (`nvm use`), matching the
 code and local setup should target 24. npm is the package manager; the
 lockfile (`package-lock.json`) is committed and authoritative.
 
+Three command-line tools must also be on `PATH`: `bash`, `jq`, and
+`python3`. The reusable-workflow conformance tests
+(`tests/unit/reusable-workflow-conformance.test.ts`) execute the shipped
+step scripts with `bash`, parse the GitHub artifacts listing with `jq`,
+and build and unpack the zip fixtures with `python3`. GitHub-hosted
+runners ship all three. When one is missing on a local machine, exactly
+the tests that need it are skipped with a message naming the tool; when
+one is missing in CI (the `CI` environment variable is set), that test
+file fails with a single error naming it instead, so a runner image that
+loses a tool can never silently skip the conformance tests.
+
 ```bash
 npm ci
+npm run audit
+npm run check:licenses
 npm run typecheck
 npm run lint
 npm test
 npm run build
 ```
 
-All four must pass before a change is considered done — this is exactly
+All must pass before a change is considered done — this is exactly
 what `.github/workflows/ci.yml` runs, plus a check that the committed
 `dist/` matches a fresh build (see [Build](#build) below).
 
@@ -55,10 +68,26 @@ npm run typecheck    # tsc --noEmit, strict mode
 npm run lint         # eslint
 npm test             # vitest run (unit + integration, includes workflow-policy.test.ts)
 npm run test:coverage  # vitest run with v8 coverage over src/ (text, HTML, and lcov reports in coverage/)
+npm run audit        # npm audit --omit=dev --audit-level=high
+npm run check:licenses # license allow-list verification for production dependencies
 npm run build         # esbuild bundle to dist/index.js
 actionlint           # static analysis of .github/workflows/
 zizmor .github/workflows # security audit of .github/workflows/
 ```
+
+### Updating job summary goldens
+
+The job summary's exact Markdown output is stored in `tests/golden/` and
+checked by `tests/unit/summary-golden.test.ts`. To intentionally update the
+snapshots, run:
+
+```bash
+UPDATE_GOLDEN=1 npx vitest run tests/unit/summary-golden.test.ts
+```
+
+Review every changed golden file by hand. A pull request that changes a
+golden must explain why the summary format changed; do not update snapshots
+just to make a failing test pass.
 
 ### Trying the Action locally without GitHub
 
@@ -277,16 +306,53 @@ docs: document the fixtures-dir input
 
 Update explicitly (`chore(deps): update @actions/core`), never silently as
 a side effect of another change. Re-run the full test/lint/build sequence
-after any dependency bump, and run `npm audit` — fix or explicitly justify
-any new advisory before merging.
+after any dependency bump, run `npm run audit`, and run `npm run check:licenses` —
+fix or explicitly justify any new advisory before merging.
 
 Dependabot also opens automated update PRs for the npm and
 `github-actions` ecosystems on a weekly schedule (see
 `.github/dependabot.yml`), so some dependency updates arrive without
 anyone hand-writing a `chore(deps):` commit. Those PRs are held to the
 same review expectations as any other change: re-run the full
-test/lint/build sequence and `npm audit` before merging one, and either
-fix or explicitly justify any new advisory in the PR.
+test/lint/build sequence, `npm run audit`, and `npm run check:licenses`
+before merging one, and either fix or explicitly justify any new advisory in the PR.
+
+### Dependency audit and vulnerability handling
+
+CI runs `npm run audit` (`npm audit --omit=dev --audit-level=high`) on every
+pull request and on a weekly schedule to detect high or critical advisories in
+the production dependency tree that bundles into `dist/index.js`.
+
+- **Report only in CI**: Do **not** use `npm audit fix` in CI. Vulnerabilities must
+  be explicitly reviewed and resolved or triaged by maintainers.
+- **When an audit reports a finding with a fix available**: Update the affected
+  direct or transitive dependency (e.g. via `npm update <package>` or explicit
+  package bump), re-run `npm run build`, and commit both `package-lock.json` and
+  updated `dist/`.
+- **When an audit reports a finding with NO fix available yet**:
+  1. **Assess reachability and impact**: Determine whether the vulnerable code path
+     in the transitive dependency is reachable in the context of this Action's bundle
+     and execution model.
+  2. **Check for upstream workarounds**: Check if an override in `package.json`
+     (`overrides` field) can safely pin a patched transitive version without breaking
+     runtime behavior.
+  3. **Document and track**: If no upstream fix or safe override is available and the
+     vulnerability is deemed unexploitable or low risk in the Action's context, open
+     an issue or record the justification in the pull request review referencing the
+     upstream advisory tracking issue. Temporary audit exceptions must be reviewed
+     and approved by repository maintainers.
+
+### License compliance checks
+
+Production dependencies are verified against an allow-list located in
+[`.licenses-allowlist.json`](.licenses-allowlist.json).
+
+- Run `npm run check:licenses` locally to verify production dependencies.
+- Allowed licenses include standard permissive licenses (`MIT`, `Apache-2.0`,
+  `ISC`, `BSD-2-Clause`, `BSD-3-Clause`, `0BSD`, `BlueOak-1.0.0`, etc.).
+- If a legitimate new production dependency or package with dual/custom licensing
+  is added, propose updating `.licenses-allowlist.json` in the same pull request
+  with maintainer review.
 
 ## Updating Canary compatibility
 
@@ -414,6 +480,33 @@ input and always use the recorded SHA. A `fixtures_ref` that does not
 exist fails the job at checkout with the checkout step's own error; that
 is expected and leaves the pin untouched.
 
+## Tracking weekly live failures
+
+A repeated scheduled failure should not open a new issue every Monday. The
+`track-failure` job in `.github/workflows/weekly-live.yml` keeps exactly one
+tracking issue per failure episode, labelled **`weekly-live`**:
+
+- on the **first failing run** it opens a new issue titled
+  "Weekly live canary is failing (Protocol 29)";
+- while the canary stays red it **comments** on that same issue (it never
+  opens a second one, even if several runs fail in a row);
+- once a run goes **fully green** it comments on the open issue and closes
+  it with `--reason completed`; a later failure reopens the cycle by
+  creating a fresh issue.
+
+The label `weekly-live` must exist in the repository. The job checks for it
+with `gh label list` and fails loudly (`::error::`) if it is missing, rather
+than silently skipping the notification. Create the label once when setting
+up the repository:
+
+```bash
+gh label create weekly-live --description "Single open tracking issue for scheduled weekly live failures"
+```
+
+The `track-failure` job is the only job in the workflow granted
+`issues: write`, and it is scoped to that job; every other job stays at the
+workflow default of `contents: read`.
+
 ## Release process
 
 Before creating a release, ensure all metadata values agree. `.github/workflows/release.yml`
@@ -462,4 +555,3 @@ Release checklist:
    ```
    or trigger the **Release** workflow from the Actions tab in GitHub and enter
    the target tag in the `release_tag` input field.
-

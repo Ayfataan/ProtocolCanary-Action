@@ -41,6 +41,7 @@ jobs:
   engine-compat-pinned:
     name: "engine-compat.yml pinned to the issue #439 refs (v0.2.0 / v0.1.1)"
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout Action
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -90,6 +91,7 @@ jobs:
   real-engine-exit-codes:
     name: Exit codes 1/3/4 + skips against ${{ inputs.engine_ref || 'v0.2.0' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout Action (this branch)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -127,6 +129,7 @@ jobs:
   action-consumer:
     name: Action from this branch, version ${{ matrix.version }} vs Fixtures protocol-28
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
