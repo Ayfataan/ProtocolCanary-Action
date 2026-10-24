@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import { ConfigNotFoundError, InvalidInputError } from "./errors";
 import type { Surface } from "./output";
+import { describeUrlSafely } from "./redact";
 
 /** The `surface` input accepts exactly the engine's three surface names. */
 export type SurfaceFilter = Surface;
@@ -709,7 +710,9 @@ export function validateFixturesDir(fixturesDir: string, allowEmpty: boolean): s
  * allow-list: https:// only, with one deliberate exception — plain http://
  * is accepted for localhost/127.0.0.1 so local development endpoints work.
  * Throws {@link InvalidInputError} for an unparseable URL or any other
- * non-https scheme. */
+ * non-https scheme. The error message never contains the rejected text: a
+ * parseable URL is described with userinfo, query and fragment redacted, and
+ * an unparseable value is described by non-sensitive facts only (#510). */
 function parseRpcUrl(raw: string): string | undefined {
   const value = optional(raw);
   if (value === undefined) {
@@ -720,14 +723,21 @@ function parseRpcUrl(raw: string): string | undefined {
   try {
     parsed = new URL(value);
   } catch {
-    throw new InvalidInputError(`Invalid "rpc-url" input: ${JSON.stringify(value)}. Expected a valid URL.`);
+    // The value is deliberately not echoed, not even a prefix or suffix of it:
+    // an unparseable URL may still carry a credential (#510). Only facts that
+    // cannot reveal one are reported.
+    const facts = [`${String(value.length)} characters`, ...(/\s/.test(value) ? ["contains whitespace"] : [])];
+    throw new InvalidInputError(
+      `Invalid "rpc-url" input: the value could not be parsed as a URL (${facts.join(", ")}) and is not shown ` +
+        "because it may contain credentials. Expected a valid URL.",
+    );
   }
 
   const isLocalHttp =
     parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
   if (parsed.protocol !== "https:" && !isLocalHttp) {
     throw new InvalidInputError(
-      `Invalid "rpc-url" input: ${JSON.stringify(value)}. Must be an https:// URL ` +
+      `Invalid "rpc-url" input: ${describeUrlSafely(parsed)}. Must be an https:// URL ` +
         `(plain http:// is only accepted for localhost/127.0.0.1).`,
     );
   }

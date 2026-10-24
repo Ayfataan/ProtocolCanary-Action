@@ -11,6 +11,8 @@ import { CanaryExecutionFailedError, InvalidInputError, TimeoutError } from "../
 import type { ActionInputs } from "../../src/inputs";
 import {
   MAX_STDERR_CAPTURE_BYTES,
+  MAX_STDOUT_CAPTURE_BYTES,
+  SIGKILL_GRACE_MS,
   STDERR_DROPPED_NOTICE,
   FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION,
   assertBaselineProtocol,
@@ -964,5 +966,189 @@ describe("runCheck timeoutMs guard (#456)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("runCheck capture limits at their exact boundaries (#514)", () => {
+  const MIB = 1024 * 1024;
+
+  beforeEach(() => {
+    spawnMock.mockClear();
+  });
+
+  /** Starts runCheck against a fake child and returns both, so a test can feed
+   * the child's streams directly. The spawn mock is consumed by runCheck's
+   * synchronous `spawn` call, so the listeners are attached by the time this
+   * returns. */
+  function start(exitsOnSigterm = true): { child: FakeChild; pending: ReturnType<typeof runCheck> } {
+    const child = new FakeChild(exitsOnSigterm);
+    spawnMock.mockImplementationOnce(() => child as unknown as ChildProcess);
+    return { child, pending: runCheck("fake-canary", ["check"], 60_000) };
+  }
+
+  function emit(stream: PassThrough, text: string, chunkChars = text.length): void {
+    for (let offset = 0; offset < text.length; offset += chunkChars) {
+      stream.emit("data", text.slice(offset, offset + chunkChars));
+    }
+  }
+
+  it("pins the documented limits by value", () => {
+    expect(MAX_STDOUT_CAPTURE_BYTES).toBe(64 * MIB);
+    expect(MAX_STDOUT_CAPTURE_BYTES).toBe(67_108_864);
+    expect(MAX_STDERR_CAPTURE_BYTES).toBe(MIB);
+    expect(MAX_STDERR_CAPTURE_BYTES).toBe(1_048_576);
+    expect(SIGKILL_GRACE_MS).toBe(5000);
+    expect(Buffer.byteLength(STDERR_DROPPED_NOTICE, "utf8")).toBe(33);
+  });
+
+  describe("stderr", () => {
+    it("keeps exactly 1 MiB whole, without the dropped-output notice", async () => {
+      const text = `${"e".repeat(MIB - 4)}LAST`;
+      const { child, pending } = start();
+
+      emit(child.stderr, text, 256 * 1024);
+      child.emit("close", 0, null);
+      const result = await pending;
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr.length).toBe(MIB);
+      expect(result.stderr).toBe(text);
+      expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(false);
+    });
+
+    it("drops the head of 1 MiB plus one byte, keeps the tail and stays within 1 MiB", async () => {
+      const text = `${"e".repeat(MIB - 3)}LAST`;
+      expect(Buffer.byteLength(text, "utf8")).toBe(MIB + 1);
+      const { child, pending } = start();
+
+      emit(child.stderr, text, 256 * 1024);
+      child.emit("close", 0, null);
+      const { stderr } = await pending;
+
+      expect(stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
+      expect(stderr.endsWith("eLAST")).toBe(true);
+      expect(Buffer.byteLength(stderr, "utf8")).toBe(MAX_STDERR_CAPTURE_BYTES);
+      expect(stderr).toBe(
+        `${STDERR_DROPPED_NOTICE}${text.slice(-(MAX_STDERR_CAPTURE_BYTES - Buffer.byteLength(STDERR_DROPPED_NOTICE)))}`,
+      );
+    });
+
+    it("keeps the true tail when many small chunks cross 1.5 times the limit", async () => {
+      // Numbered lines make "the tail" checkable by value, not just by length.
+      let text = "";
+      for (let n = 0; text.length < 1.7 * MIB; n++) {
+        text += `line ${String(n).padStart(7, "0")}\n`;
+      }
+      const { child, pending } = start();
+
+      emit(child.stderr, text, 8 * 1024);
+      child.emit("close", 0, null);
+      const { stderr } = await pending;
+
+      const noticeBytes = Buffer.byteLength(STDERR_DROPPED_NOTICE);
+      expect(Buffer.byteLength(stderr, "utf8")).toBe(MAX_STDERR_CAPTURE_BYTES);
+      expect(stderr).toBe(`${STDERR_DROPPED_NOTICE}${text.slice(-(MAX_STDERR_CAPTURE_BYTES - noticeBytes))}`);
+      expect(stderr.endsWith(text.slice(-20))).toBe(true);
+    });
+  });
+
+  describe("stderr, trim at the very end of the stream", () => {
+    it("keeps a full 1 MiB tail when the mid-stream trim fires on the last chunk", async () => {
+      // 1.5 MiB plus one character: the final chunk is the first one that
+      // pushes the buffer over 1.5 times the limit, so nothing arrives after
+      // the trim to refill it. The retained buffer must still hold enough for
+      // the final notice-plus-tail to be exactly 1 MiB.
+      let text = "";
+      for (let n = 0; text.length < 1.5 * MIB + 1; n++) {
+        text += `line ${String(n).padStart(7, "0")}\n`;
+      }
+      text = text.slice(0, 1.5 * MIB + 1);
+      const { child, pending } = start();
+
+      emit(child.stderr, text, 8 * 1024);
+      child.emit("close", 0, null);
+      const { stderr } = await pending;
+
+      const noticeBytes = Buffer.byteLength(STDERR_DROPPED_NOTICE);
+      expect(Buffer.byteLength(stderr, "utf8")).toBe(MAX_STDERR_CAPTURE_BYTES);
+      expect(stderr).toBe(`${STDERR_DROPPED_NOTICE}${text.slice(-(MAX_STDERR_CAPTURE_BYTES - noticeBytes))}`);
+    });
+  });
+
+  describe("stdout", () => {
+    it("accepts exactly 64 MiB without terminating the child", async () => {
+      // One 1 MiB string, emitted 64 times: the payload is allocated once.
+      const chunk = "a".repeat(MIB);
+      const { child, pending } = start();
+
+      for (let i = 0; i < 64; i++) {
+        child.stdout.emit("data", chunk);
+      }
+      child.emit("close", 0, null);
+      const result = await pending;
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.length).toBe(MAX_STDOUT_CAPTURE_BYTES);
+      expect(child.signals).toEqual([]);
+    });
+
+    it("rejects and terminates the child at 64 MiB plus one byte", async () => {
+      const chunk = "a".repeat(MIB);
+      const { child, pending } = start();
+      const outcome = pending.catch((error: unknown) => error);
+
+      for (let i = 0; i < 64; i++) {
+        child.stdout.emit("data", chunk);
+      }
+      expect(child.signals).toEqual([]);
+      child.stdout.emit("data", "a");
+
+      const error = await outcome;
+      expect(error).toBeInstanceOf(CanaryExecutionFailedError);
+      expect((error as Error).message).toContain("64 MiB");
+      expect(child.signals).toEqual(["SIGTERM"]);
+    });
+
+    it("counts bytes, not characters: 64 MiB of 3-byte characters is over the limit", async () => {
+      const chunk = "\u20AC".repeat(65_536); // 196,608 bytes per chunk
+      const { child, pending } = start();
+      const outcome = pending.catch((error: unknown) => error);
+
+      let sent = 0;
+      while (sent + Buffer.byteLength(chunk) <= MAX_STDOUT_CAPTURE_BYTES) {
+        child.stdout.emit("data", chunk);
+        sent += Buffer.byteLength(chunk);
+      }
+      expect(child.signals).toEqual([]);
+      child.stdout.emit("data", chunk);
+
+      expect(await outcome).toBeInstanceOf(CanaryExecutionFailedError);
+      expect(child.signals).toEqual(["SIGTERM"]);
+    });
+  });
+
+  describe("settling", () => {
+    it("settles once when the child errors and then closes", async () => {
+      const { child, pending } = start();
+
+      child.emit("error", new Error("spawn failed"));
+      child.emit("close", 0, null);
+
+      await expect(pending).rejects.toThrow(CanaryExecutionFailedError);
+      await expect(pending).rejects.toThrow("Failed to start fake-canary: spawn failed");
+    });
+
+    it("keeps the first exit when close is emitted twice", async () => {
+      const { child, pending } = start();
+
+      child.stdout.emit("data", "first");
+      child.emit("close", 3, null);
+      child.stdout.emit("data", "late");
+      child.emit("close", 0, null);
+
+      const result = await pending;
+      expect(result.exitCode).toBe(3);
+      expect(result.stdout).toBe("first");
+    });
   });
 });
