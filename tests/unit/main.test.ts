@@ -575,13 +575,39 @@ describe("run", () => {
 
     await run();
 
-    const receiptPath = path.join(runnerTemp, "stellar-canary-receipt.json");
+    const receiptPath = String(setOutputMock.mock.calls.find(([name]) => name === "receipt-path")?.[1]);
+    expect(path.isAbsolute(receiptPath)).toBe(true);
+    expect(path.dirname(receiptPath)).toBe(runnerTemp);
     expect(fs.existsSync(receiptPath)).toBe(true);
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as { receiptVersion: number; engineVersion: string };
     expect(receipt.receiptVersion).toBe(1);
     expect(receipt.engineVersion).toBe(PASS_REPORT.toolVersion);
     expect(setOutputMock).toHaveBeenCalledWith("receipt-path", receiptPath);
     expect(uploadReceiptMock).toHaveBeenCalledWith(receiptPath);
+  });
+
+  it("preserves distinct receipts across two invocations sharing RUNNER_TEMP (#493)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, generateReceipt: true });
+    uploadReceiptMock.mockResolvedValue({ uploaded: true });
+    const secondReport = { ...PASS_REPORT, toolVersion: "0.9.9" };
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(secondReport), stderr: "" });
+
+    await run();
+    const firstPath = String(setOutputMock.mock.calls.find(([name]) => name === "receipt-path")?.[1]);
+    setOutputMock.mockClear();
+    await run();
+    const secondPath = String(setOutputMock.mock.calls.find(([name]) => name === "receipt-path")?.[1]);
+
+    expect(firstPath).not.toBe(secondPath);
+    for (const receiptPath of [firstPath, secondPath]) {
+      expect(path.isAbsolute(receiptPath)).toBe(true);
+      expect(path.dirname(receiptPath)).toBe(runnerTemp);
+      expect(fs.existsSync(receiptPath)).toBe(true);
+    }
+    expect(fs.readFileSync(firstPath, "utf8")).not.toBe(fs.readFileSync(secondPath, "utf8"));
+    expect(uploadReceiptMock).toHaveBeenCalledWith(firstPath);
+    expect(uploadReceiptMock).toHaveBeenCalledWith(secondPath);
   });
 
   // Negative testing from the issue: a failed receipt upload is auxiliary —
