@@ -622,6 +622,87 @@ describe("ensureCanaryInstalled", () => {
     expect(caughtError!.diagnostic).toContain("[... earlier output truncated ...]");
   });
 
+  describe("install diagnostic limits (#513)", () => {
+    const NOTICE = "[... earlier output truncated ...]\n";
+    const stderrLines = (count: number): string[] =>
+      Array.from({ length: count }, (_, i) => `cargo error line ${String(i + 1).padStart(3, "0")}`);
+
+    async function installFailure(): Promise<InstallationFailedError> {
+      try {
+        await ensureCanaryInstalled(RESOLVED);
+      } catch (error) {
+        expect(error).toBeInstanceOf(InstallationFailedError);
+        return error as InstallationFailedError;
+      }
+      throw new Error("expected the install to fail");
+    }
+
+    it("keeps exactly the last 40 of 100 stderr lines in the message and in the diagnostic", async () => {
+      const lines = stderrLines(100);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", lines.join("\n")) as unknown as ChildProcess }),
+      );
+
+      const error = await installFailure();
+
+      const expectedTail = `${NOTICE}${lines.slice(-40).join("\n")}`;
+      expect(error.diagnostic).toBe(expectedTail);
+      expect(error.message).toBe(
+        `\`cargo install\` exited with code 101 while installing Protocol-Canary ${RESOLVED.version}.\n\n${expectedTail}`,
+      );
+      expect(error.diagnostic).toContain("cargo error line 100");
+      expect(error.diagnostic).toContain("cargo error line 061");
+      expect(error.diagnostic).not.toContain("cargo error line 060");
+    });
+
+    it("does not truncate 40 stderr lines but truncates 41", async () => {
+      const forty = stderrLines(40);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", forty.join("\n")) as unknown as ChildProcess }),
+      );
+      expect((await installFailure()).diagnostic).toBe(forty.join("\n"));
+
+      const fortyOne = stderrLines(41);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", fortyOne.join("\n")) as unknown as ChildProcess }),
+      );
+      expect((await installFailure()).diagnostic).toBe(`${NOTICE}${fortyOne.slice(1).join("\n")}`);
+    });
+
+    it("keeps 8192 bytes of stderr whole and cuts 8193 to exactly 8192 bytes ending with the last character", async () => {
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", "e".repeat(8192)) as unknown as ChildProcess }),
+      );
+      expect((await installFailure()).diagnostic).toBe("e".repeat(8192));
+
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", `${"e".repeat(8192)}Z`) as unknown as ChildProcess }),
+      );
+      const diagnostic = (await installFailure()).diagnostic!;
+      expect(Buffer.byteLength(diagnostic, "utf8")).toBe(8192);
+      expect(diagnostic.startsWith(NOTICE)).toBe(true);
+      expect(diagnostic.endsWith("eZ")).toBe(true);
+    });
+
+    it("applies the same limits when the install times out", async () => {
+      const lines = stderrLines(100);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new HungChild(true, "", lines.join("\n")) as unknown as ChildProcess }),
+      );
+
+      let caught: InstallationFailedError | undefined;
+      try {
+        await ensureCanaryInstalled(RESOLVED, 20);
+      } catch (error) {
+        caught = error as InstallationFailedError;
+      }
+
+      expect(caught).toBeInstanceOf(InstallationFailedError);
+      expect(caught?.message).toContain("timed out");
+      expect(caught?.diagnostic).toBe(`${NOTICE}${lines.slice(-40).join("\n")}`);
+    });
+  });
+
   it("prints nothing new to log groups on successful cargo install", async () => {
     spawnMock.mockImplementation((command: string, args: string[] = []) =>
       routedSpawn(command, args, {
