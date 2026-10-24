@@ -28,8 +28,6 @@ jobs:
         run: npm ci
       - name: Build bundle
         run: npm run build
-      - name: Verify generated bundle
-        run: npm test -- tests/unit/bundle-guard.test.ts
       - name: Commit generated bundle
         run: |
           git config user.name "github-actions[bot]"
@@ -41,3 +39,5 @@ jobs:
             git commit -m "build: regenerate dist for unique receipt paths (#493)"
             git push origin HEAD:docs/493-receipt-path-note
           fi
+      - name: Verify generated bundle
+        run: npm test -- tests/unit/bundle-guard.test.ts
