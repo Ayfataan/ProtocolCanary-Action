@@ -26,6 +26,7 @@ jobs:
   fork-boundary:
     name: Audit least-privilege boundaries
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
