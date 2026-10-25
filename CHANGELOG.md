@@ -85,6 +85,12 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- Each invocation writes its Execution Receipt to its own file under `RUNNER_TEMP`
+  (#493). The path was always `stellar-canary-receipt.json`, so a second Action step in the
+  same job overwrote the first step's receipt and its `receipt-path` output then pointed at
+  the second run's data. The file name now carries a random suffix
+  (`stellar-canary-receipt-<32 hex>.json`); `receipt-path` stays absolute, and nothing changes
+  with `generate-receipt: false`.
 - A rejected `rpc-url` no longer echoes the value it rejected. The error for a
   URL with the wrong scheme now shows the scheme, host, port and path with
   userinfo replaced by `[REDACTED]` and any query string or fragment dropped

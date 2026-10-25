@@ -88,7 +88,7 @@ export function reportFilePath(): string {
  * true (#361 input, #362 export); same temp dir as the report. */
 function receiptFilePath(): string {
   const dir = process.env.RUNNER_TEMP ?? os.tmpdir();
-  return path.join(dir, "stellar-canary-receipt.json");
+  return path.resolve(dir, `stellar-canary-receipt-${crypto.randomBytes(16).toString("hex")}.json`);
 }
 
 /**
