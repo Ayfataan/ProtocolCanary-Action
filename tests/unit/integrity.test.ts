@@ -186,16 +186,33 @@ function requestedUrls(): string[] {
 describe("tamper detection and spoofed redirects (issue #375)", () => {
   let tempCargoHome: string;
   let originalCargoHome: string | undefined;
+  let originalRunnerTemp: string | undefined;
 
   function binaryPath(): string {
-    return path.join(tempCargoHome, "bin", process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary");
+    return path.join(
+      tempCargoHome,
+      "stellar-canary-action",
+      "bin",
+      process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary",
+    );
+  }
+
+  function writeInstalledBinary(contents: string): void {
+    const binary = binaryPath();
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, contents);
+    fs.writeFileSync(path.join(path.dirname(binary), "stellar-canary.sha256"), `${sha256(contents)}\n`, {
+      mode: 0o600,
+    });
   }
 
   beforeEach(() => {
     tempCargoHome = fs.mkdtempSync(path.join(os.tmpdir(), "canary-integrity-"));
     fs.mkdirSync(path.join(tempCargoHome, "bin"), { recursive: true });
     originalCargoHome = process.env.CARGO_HOME;
+    originalRunnerTemp = process.env.RUNNER_TEMP;
     process.env.CARGO_HOME = tempCargoHome;
+    process.env.RUNNER_TEMP = tempCargoHome;
 
     cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(true);
     cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
@@ -229,13 +246,18 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
     } else {
       process.env.CARGO_HOME = originalCargoHome;
     }
+    if (originalRunnerTemp === undefined) {
+      delete process.env.RUNNER_TEMP;
+    } else {
+      process.env.RUNNER_TEMP = originalRunnerTemp;
+    }
     fs.rmSync(tempCargoHome, { recursive: true, force: true });
   });
 
   it("aborts immediately when a single byte of the installed binary differs from the published checksum", async () => {
     // The published manifest describes "binary"; the on-disk file is
     // "binarey" — a one-byte tamper. Verification must refuse the binary.
-    fs.writeFileSync(binaryPath(), "binarey");
+    writeInstalledBinary("binarey");
     httpsGetMock
       .mockImplementationOnce(
         respond(
@@ -287,7 +309,7 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
   });
 
   it("never follows a spoofed redirect to a non-allowlisted domain during checksum lookup", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
     // Release lookup OK; manifest fetch answers 302 -> evil.example.
     httpsGetMock
       .mockImplementationOnce(respond(200, releaseWithAsset("https://example.test/SHA256SUMS")))
@@ -309,7 +331,7 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
   });
 
   it("rejects an unencrypted http:// manifest target unconditionally", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
     httpsGetMock.mockReset().mockImplementation(httpsOnlyTransport());
     // A release whose checksum asset is served over plain http.
     httpsGetMock.mockImplementationOnce(
@@ -329,7 +351,7 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
   });
 
   it("treats a malformed checksum manifest as unverifiable, not as a pass", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
     httpsGetMock
       .mockImplementationOnce(respond(200, releaseWithAsset("https://example.test/SHA256SUMS")))
       .mockImplementationOnce(respond(200, "not-a-digest-at-all  stellar-canary\n"));
@@ -343,16 +365,33 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
 describe("strict-integrity fail-closed policy at the verification boundary (issue #372)", () => {
   let tempCargoHome: string;
   let originalCargoHome: string | undefined;
+  let originalRunnerTemp: string | undefined;
 
   function binaryPath(): string {
-    return path.join(tempCargoHome, "bin", process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary");
+    return path.join(
+      tempCargoHome,
+      "stellar-canary-action",
+      "bin",
+      process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary",
+    );
+  }
+
+  function writeInstalledBinary(contents: string): void {
+    const binary = binaryPath();
+    fs.mkdirSync(path.dirname(binary), { recursive: true });
+    fs.writeFileSync(binary, contents);
+    fs.writeFileSync(path.join(path.dirname(binary), "stellar-canary.sha256"), `${sha256(contents)}\n`, {
+      mode: 0o600,
+    });
   }
 
   beforeEach(() => {
     tempCargoHome = fs.mkdtempSync(path.join(os.tmpdir(), "canary-strict-"));
     fs.mkdirSync(path.join(tempCargoHome, "bin"), { recursive: true });
     originalCargoHome = process.env.CARGO_HOME;
+    originalRunnerTemp = process.env.RUNNER_TEMP;
     process.env.CARGO_HOME = tempCargoHome;
+    process.env.RUNNER_TEMP = tempCargoHome;
 
     cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(false);
     cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
@@ -386,11 +425,16 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
     } else {
       process.env.CARGO_HOME = originalCargoHome;
     }
+    if (originalRunnerTemp === undefined) {
+      delete process.env.RUNNER_TEMP;
+    } else {
+      process.env.RUNNER_TEMP = originalRunnerTemp;
+    }
     fs.rmSync(tempCargoHome, { recursive: true, force: true });
   });
 
   it("aborts immediately when no checksum manifest is published at all", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
 
     await expect(ensureCanaryInstalled(RESOLVED, 60_000, undefined, true)).rejects.toThrow(
       /strict-integrity.*no published checksum manifest/s,
@@ -398,7 +442,7 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
   });
 
   it("aborts when the manifest has no entry for this platform", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
     httpsGetMock
       .mockImplementationOnce(respond(200, releaseWithAsset("https://example.test/SHA256SUMS")))
       .mockImplementationOnce(respond(200, `${"a".repeat(64)}  some-other-tool\n`));
@@ -407,7 +451,7 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
   });
 
   it("aborts when the checksum lookup is redirected (unverifiable under D-11)", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
     httpsGetMock
       .mockImplementationOnce(respond(200, releaseWithAsset("https://example.test/SHA256SUMS")))
       .mockImplementationOnce(respond(302, "", { location: "https://evil.example.com/SHA256SUMS" }));
@@ -419,7 +463,7 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
 
   it("aborts before caching or completing when the checksum does not match", async () => {
     cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-    fs.writeFileSync(binaryPath(), "tampered");
+    writeInstalledBinary("tampered");
     httpsGetMock
       .mockImplementationOnce(respond(200, releaseWithAsset("https://example.test/SHA256SUMS")))
       .mockImplementationOnce(respond(200, `${sha256("pristine")}  stellar-canary\n`));
@@ -429,7 +473,7 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
   });
 
   it("succeeds when the published checksum verifies", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
     httpsGetMock
       .mockImplementationOnce(respond(200, releaseWithAsset("https://example.test/SHA256SUMS")))
       .mockImplementationOnce(respond(200, `${sha256("binary")}  stellar-canary\n`));
@@ -440,7 +484,7 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
   });
 
   it("preserves default (non-strict) behaviour: a missing manifest degrades to commit/tag pinning", async () => {
-    fs.writeFileSync(binaryPath(), "binary");
+    writeInstalledBinary("binary");
 
     const installed = await ensureCanaryInstalled(RESOLVED);
     expect(installed.binaryPath).toBe(binaryPath());

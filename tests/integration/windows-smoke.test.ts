@@ -208,15 +208,14 @@ describe("Action against the Node-copy mock engine (Windows spawn path)", () => 
 
   // Before #521 the version probe ran through @actions/exec, which treats
   // the tool as a command LINE and splits it on whitespace
-  // (argStringToArray), so a CARGO_HOME whose path contains a space could
-  // not be executed on any platform (real engine builds install to
-  // <CARGO_HOME>/bin too) and the step failed with "could not be
-  // executed". The probe now runs through the bounded runner
+  // (argStringToArray), so an Action-owned binary path containing a space
+  // could not be executed on any platform and the step failed with "could
+  // not be executed". The probe now runs through the bounded runner
   // (src/runner.ts), which spawns the path verbatim: the spaceful binary
   // is probed, its version matches, and the run succeeds without ever
   // reaching for cargo.
-  it("a spaceful CARGO_HOME is probed verbatim and the run succeeds", async () => {
-    scenario = setUp("pass", { cargoHomeName: "cargo home with spaces" });
+  it("a spaceful RUNNER_TEMP is probed verbatim and the run succeeds", async () => {
+    scenario = setUp("pass", { runnerTempName: "runner temp with spaces" });
     const { run } = await import("../../src/main");
     await run();
 
