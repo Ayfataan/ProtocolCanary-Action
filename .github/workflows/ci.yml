@@ -4,20 +4,57 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 0 * * 0' # Weekly on Sunday at 00:00 UTC
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: typecheck, lint, test, build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+  workflow-lint:
+    name: actionlint and zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install zizmor
+        run: pip install zizmor==1.31.1
+
+      - name: Install actionlint
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: "1.7.12"
+
+      - name: Run actionlint
+        run: actionlint .github/workflows/*.yml
+
+      - name: Run zizmor
+        run: zizmor .github/workflows
+
+  test:
+    name: typecheck, lint, test, build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        # #347: the whole suite runs on all three hosted platforms so path
+        # separator, executable-name, and line-ending regressions surface on
+        # every pull request, not only on Linux.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
@@ -28,14 +65,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit production dependencies
+        run: npm run audit
+
+      - name: Check production dependency licenses
+        run: npm run check:licenses
+
       - name: Typecheck
         run: npm run typecheck
 
       - name: Lint
         run: npm run lint
 
-      - name: Test
+      - name: Test (Windows)
+        if: matrix.os != 'ubuntu-latest'
         run: npm test
+
+      - name: Test with coverage (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -o pipefail
+          COVERAGE_TMP=$(mktemp)
+          npm run test:coverage -- --reporter=default | tee "$COVERAGE_TMP"
+          EXIT_CODE=$?
+          {
+            echo "### 📊 Code Coverage Summary"
+            echo ""
+            echo '```'
+            cat "$COVERAGE_TMP"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$COVERAGE_TMP"
+          exit $EXIT_CODE
 
       - name: Build
         run: npm run build

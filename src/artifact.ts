@@ -94,8 +94,26 @@ export async function uploadReport(
   reportPath: string,
   differentiator?: string,
   retentionDays?: number,
+  additionalFiles?: readonly string[],
+): Promise<ArtifactUploadOutcome>;
+export async function uploadReport(
+  reportPath: string,
+  differentiator?: string,
+  additionalFiles?: readonly string[],
+  retentionDays?: number,
+): Promise<ArtifactUploadOutcome>;
+export async function uploadReport(
+  reportPath: string,
+  differentiator?: string,
+  arg3?: number | readonly string[],
+  arg4?: readonly string[] | number,
 ): Promise<ArtifactUploadOutcome> {
+  const retentionDays =
+    typeof arg3 === "number" ? arg3 : typeof arg4 === "number" ? arg4 : undefined;
+  const additionalFiles: readonly string[] =
+    Array.isArray(arg3) ? arg3 : Array.isArray(arg4) ? arg4 : [];
   let name = ARTIFACT_NAME;
+  const files = [reportPath, ...additionalFiles];
   try {
     const client = new DefaultArtifactClient();
     const options = retentionDays !== undefined ? { retentionDays } : undefined;
@@ -103,7 +121,7 @@ export async function uploadReport(
     try {
       response = await client.uploadArtifact(
         ARTIFACT_NAME,
-        [reportPath],
+        files,
         path.dirname(reportPath),
         ...(options !== undefined ? [options] : []),
       );
@@ -118,7 +136,7 @@ export async function uploadReport(
       );
       response = await client.uploadArtifact(
         name,
-        [reportPath],
+        files,
         path.dirname(reportPath),
         ...(options !== undefined ? [options] : []),
       );
