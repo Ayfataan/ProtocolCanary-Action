@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DEFAULT_LOG_BLOCK_MAX_BYTES,
+  DEFAULT_LOG_BLOCK_MAX_LINES,
   TRUNCATION_NOTICE,
   formatSafeDiagnosticTail,
   printLogBlock,
@@ -238,5 +239,215 @@ describe("printLogBlock", () => {
 
     expect(body.startsWith(TRUNCATION_NOTICE)).toBe(true);
     expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(DEFAULT_LOG_BLOCK_MAX_BYTES);
+  });
+});
+
+describe("truncateLogTail exact boundaries (#513)", () => {
+  const noticeBytes = Buffer.byteLength(TRUNCATION_NOTICE, "utf8");
+  const bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+  const numbered = (count: number): string[] =>
+    Array.from({ length: count }, (_, index) => `row-${String(index + 1).padStart(3, "0")}`);
+
+  it("pins the notice to 35 bytes, which every byte-limit expectation below depends on", () => {
+    expect(TRUNCATION_NOTICE).toBe("[... earlier output truncated ...]\n");
+    expect(noticeBytes).toBe(35);
+  });
+
+  describe("line limit", () => {
+    it.each([39, 40])("returns %i lines unchanged when maxLines is 40", (count) => {
+      const text = numbered(count).join("\n");
+      expect(truncateLogTail(text, 40, 100_000)).toEqual({ text, truncated: false });
+    });
+
+    it("truncates 41 lines to the last 40, behind the notice", () => {
+      const lines = numbered(41);
+      const result = truncateLogTail(lines.join("\n"), 40, 100_000);
+
+      expect(result.truncated).toBe(true);
+      expect(result.text).toBe(`${TRUNCATION_NOTICE}${lines.slice(1).join("\n")}`);
+      expect(result.text.startsWith(`${TRUNCATION_NOTICE}row-002\n`)).toBe(true);
+      expect(result.text.endsWith("\nrow-041")).toBe(true);
+      expect(result.text).not.toContain("row-001");
+    });
+
+    it("keeps the most recent lines even when the input is far over the limit", () => {
+      const lines = numbered(500);
+      const result = truncateLogTail(lines.join("\n"), 40, 100_000);
+
+      expect(result.text).toBe(`${TRUNCATION_NOTICE}${lines.slice(-40).join("\n")}`);
+    });
+
+    it("counts a trailing newline as one more (empty) line", () => {
+      const text = `${numbered(40).join("\n")}\n`;
+      const result = truncateLogTail(text, 40, 100_000);
+
+      expect(result.truncated).toBe(true);
+      expect(result.text.endsWith("row-040\n")).toBe(true);
+      expect(result.text).not.toContain("row-001");
+    });
+  });
+
+  describe("byte limit", () => {
+    it.each([99, 100])("returns %i ASCII bytes unchanged when maxBytes is 100", (size) => {
+      const text = "a".repeat(size);
+      expect(truncateLogTail(text, 1000, 100)).toEqual({ text, truncated: false });
+    });
+
+    it("truncates 101 ASCII bytes to exactly maxBytes including the notice, keeping the end", () => {
+      const text = `${"a".repeat(60)}${"b".repeat(41)}`;
+      const result = truncateLogTail(text, 1000, 100);
+
+      expect(result.truncated).toBe(true);
+      expect(bytes(result.text)).toBe(100);
+      expect(result.text.startsWith(TRUNCATION_NOTICE)).toBe(true);
+      expect(result.text).toBe(`${TRUNCATION_NOTICE}${"a".repeat(24)}${"b".repeat(41)}`);
+    });
+
+    it("keeps nothing but the notice-sized budget when maxBytes is smaller than the notice", () => {
+      const result = truncateLogTail("a".repeat(500), 1000, 10);
+
+      expect(result.truncated).toBe(true);
+      expect(result.text).toBe(TRUNCATION_NOTICE);
+    });
+  });
+
+  describe("both limits together", () => {
+    it("applies the line limit first and then the byte limit, ending with the last line", () => {
+      const lines = numbered(50);
+      const result = truncateLogTail(lines.join("\n"), 40, 200);
+
+      expect(result.truncated).toBe(true);
+      expect(bytes(result.text)).toBe(200);
+      expect(result.text.startsWith(TRUNCATION_NOTICE)).toBe(true);
+      expect(result.text.endsWith("\nrow-050")).toBe(true);
+      expect(result.text).toBe(`${TRUNCATION_NOTICE}${lines.slice(-40).join("\n").slice(-165)}`);
+    });
+
+    it("cuts further when the kept lines fit alone but not together with the notice", () => {
+      // 41 one-character lines: after the line cut, 40 "x" + 39 "\n" = 79 bytes.
+      const text = Array.from({ length: 41 }, () => "x").join("\n");
+
+      const exactFit = truncateLogTail(text, 40, 79 + noticeBytes);
+      expect(exactFit.truncated).toBe(true);
+      expect(bytes(exactFit.text)).toBe(79 + noticeBytes);
+      expect(exactFit.text).toBe(`${TRUNCATION_NOTICE}${Array.from({ length: 40 }, () => "x").join("\n")}`);
+
+      const oneByteShort = truncateLogTail(text, 40, 79 + noticeBytes - 1);
+      expect(bytes(oneByteShort.text)).toBe(79 + noticeBytes - 1);
+      expect(oneByteShort.text.endsWith("x")).toBe(true);
+      expect(oneByteShort.text.startsWith(`${TRUNCATION_NOTICE}\nx`)).toBe(true);
+    });
+  });
+
+  describe("UTF-8 alignment", () => {
+    it.each([
+      { name: "2-byte", char: "é", width: 2, budgets: [4, 5], kept: 2 },
+      { name: "3-byte", char: "€", width: 3, budgets: [9, 10, 11], kept: 3 },
+      { name: "4-byte", char: "😀", width: 4, budgets: [4, 6, 7], kept: 1 },
+    ])("never starts inside a $name character", ({ char, width, budgets, kept }) => {
+      const text = char.repeat(50);
+      expect(bytes(text)).toBe(50 * width);
+
+      for (const budget of budgets) {
+        const result = truncateLogTail(text, 1000, noticeBytes + budget);
+        expect(result.truncated).toBe(true);
+        expect(result.text).toBe(`${TRUNCATION_NOTICE}${char.repeat(kept)}`);
+        expect(result.text).not.toContain("\uFFFD");
+        expect(bytes(result.text)).toBeLessThanOrEqual(noticeBytes + budget);
+      }
+    });
+
+    it("keeps one more whole character when the budget lands exactly between characters", () => {
+      const result = truncateLogTail("😀".repeat(50), 1000, noticeBytes + 8);
+      expect(result.text).toBe(`${TRUNCATION_NOTICE}${"😀".repeat(2)}`);
+    });
+
+    it("stays valid when a multi-byte character is the very last thing in the input", () => {
+      const text = `${"a".repeat(200)}€`;
+      const result = truncateLogTail(text, 1000, noticeBytes + 5);
+
+      expect(result.text.endsWith("€")).toBe(true);
+      expect(result.text).not.toContain("\uFFFD");
+      expect(bytes(result.text)).toBe(noticeBytes + 5);
+    });
+  });
+});
+
+describe("log tail defaults (#513)", () => {
+  const bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+  const numbered = (count: number): string[] =>
+    Array.from({ length: count }, (_, index) => `line ${String(index + 1).padStart(3, "0")}`);
+
+  beforeEach(() => {
+    coreMocks.infoMock.mockClear();
+  });
+
+  it("pins the documented default limits by value", () => {
+    expect(DEFAULT_LOG_BLOCK_MAX_LINES).toBe(200);
+    expect(DEFAULT_LOG_BLOCK_MAX_BYTES).toBe(64 * 1024);
+    expect(DEFAULT_LOG_BLOCK_MAX_BYTES).toBe(65_536);
+  });
+
+  describe("formatSafeDiagnosticTail with its own defaults (40 lines, 8 KiB)", () => {
+    it("keeps 40 lines whole and truncates 41 to the last 40", () => {
+      const forty = numbered(40).join("\n");
+      expect(formatSafeDiagnosticTail(forty)).toBe(forty);
+
+      const lines = numbered(41);
+      expect(formatSafeDiagnosticTail(lines.join("\n"))).toBe(`${TRUNCATION_NOTICE}${lines.slice(1).join("\n")}`);
+    });
+
+    it("keeps 8192 bytes whole and cuts 8193 to exactly 8192 behind the notice", () => {
+      expect(formatSafeDiagnosticTail("y".repeat(8192))).toBe("y".repeat(8192));
+
+      const cut = formatSafeDiagnosticTail("y".repeat(8193));
+      expect(bytes(cut)).toBe(8192);
+      expect(cut.startsWith(TRUNCATION_NOTICE)).toBe(true);
+      expect(cut).toBe(`${TRUNCATION_NOTICE}${"y".repeat(8192 - 35)}`);
+    });
+
+    it("turns 9000 characters into exactly 8192 bytes", () => {
+      const cut = formatSafeDiagnosticTail("y".repeat(9000));
+      expect(bytes(cut)).toBe(8192);
+      expect(cut.startsWith(TRUNCATION_NOTICE)).toBe(true);
+    });
+
+    it("ends with the last line of the input after redaction", () => {
+      const lines = [...numbered(59), "final: ghp_" + "a1B2".repeat(9)];
+      const tail = formatSafeDiagnosticTail(lines.join("\n"));
+
+      expect(tail.endsWith("final: [REDACTED]")).toBe(true);
+      expect(tail.startsWith(`${TRUNCATION_NOTICE}line 021\n`)).toBe(true);
+    });
+  });
+
+  describe("printLogBlock with its defaults (200 lines, 64 KiB)", () => {
+    const printed = (): string => String(coreMocks.infoMock.mock.calls[1]?.[0]);
+
+    it("prints 200 lines whole and truncates 201 to the last 200", () => {
+      const lines = numbered(201);
+
+      printLogBlock("diagnostics", lines.slice(0, 200).join("\n"));
+      expect(printed()).toBe(lines.slice(0, 200).join("\n"));
+
+      coreMocks.infoMock.mockClear();
+      printLogBlock("diagnostics", lines.join("\n"));
+      expect(printed()).toBe(`${TRUNCATION_NOTICE}${lines.slice(1).join("\n")}`);
+    });
+
+    it("prints 65536 bytes whole and cuts 65537 to exactly 65536", () => {
+      printLogBlock("diagnostics", "z".repeat(65_536));
+      expect(printed()).toBe("z".repeat(65_536));
+
+      coreMocks.infoMock.mockClear();
+      printLogBlock("diagnostics", "z".repeat(65_537));
+      expect(bytes(printed())).toBe(65_536);
+      expect(printed().startsWith(TRUNCATION_NOTICE)).toBe(true);
+    });
+
+    it("lets explicit options override the defaults", () => {
+      printLogBlock("diagnostics", numbered(10).join("\n"), { maxLines: 3, maxBytes: 10_000 });
+      expect(printed()).toBe(`${TRUNCATION_NOTICE}${numbered(10).slice(-3).join("\n")}`);
+    });
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import type { CanaryReport, CanaryResult } from "../../src/output";
-import { SUMMARY_BYTE_LIMIT, TRUNCATION_NOTICE, renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import type { CanaryReport, CanaryResult, CanarySkip } from "../../src/output";
+import { SUMMARY_BYTE_LIMIT, TRUNCATION_NOTICE, protocolMismatchMessage, renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
 import { report, result } from "./helpers";
 
 describe("renderSummaryMarkdown", () => {
@@ -108,6 +108,63 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).toContain("p27-xdr-legacy");
   });
 
+  it("renders a structured skipped-fixtures table grouped by reason code (#341)", () => {
+    const markdown = renderSummaryMarkdown(
+      report({
+        skipped: [
+          {
+            fixtureId: "p28-rpc-missing",
+            surface: "rpc",
+            reason: "project does not declare the rpc capability",
+            code: "MISSING_CAPABILITY",
+          },
+          {
+            fixtureId: "p27-xdr-old",
+            surface: "xdr",
+            reason: "fixture targets protocol 27, this run targets protocol 28",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+          {
+            fixtureId: "p27-rpc-old",
+            surface: "rpc",
+            reason: "fixture targets protocol 27",
+            code: "UNSUPPORTED_PROTOCOL",
+          },
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("| Reason code | Fixture | Surface | Reason |");
+    expect(markdown).toContain("| `UNSUPPORTED_PROTOCOL` — Unsupported protocol |");
+    expect(markdown).toContain("| `MISSING_CAPABILITY` — Missing capability |");
+    // Group order is deterministic: unsupported protocol rows precede the
+    // missing-capability row, and equal codes sort by fixture id.
+    const unsupported = markdown.indexOf("p27-rpc-old");
+    const unsupported2 = markdown.indexOf("p27-xdr-old");
+    const missing = markdown.indexOf("p28-rpc-missing");
+    expect(unsupported).toBeGreaterThanOrEqual(0);
+    expect(unsupported).toBeLessThan(unsupported2);
+    expect(unsupported2).toBeLessThan(missing);
+  });
+
+  it("renders safe UNKNOWN fallbacks when skip codes or fields are missing (#341)", () => {
+    const skipped = [
+      { fixtureId: "unrecorded", surface: "xdr", reason: "older engine wrote no code" },
+      { fixtureId: "future", surface: "rpc", reason: "a newer code", code: "FROM_THE_FUTURE" },
+      { fixtureId: "", surface: "", reason: "", code: "" },
+    ] as unknown as CanarySkip[];
+
+    const markdown = renderSummaryMarkdown(report({ skipped }));
+
+    expect(markdown).toContain("`UNKNOWN` — Unknown reason");
+    expect(markdown).toContain("older engine wrote no code");
+    expect(markdown).toContain("a newer code");
+    expect(markdown).not.toContain("FROM_THE_FUTURE");
+    expect(markdown).toContain("(unknown fixture)");
+    expect(markdown).toContain("unknown surface");
+    expect(markdown).toContain("no reason recorded");
+  });
+
   it("omits the skipped-fixtures section when skipped is an empty array (#264)", () => {
     const markdown = renderSummaryMarkdown(
       report({
@@ -149,6 +206,45 @@ describe("renderSummaryMarkdown", () => {
   it("omits the network line entirely when the report has no network", () => {
     const markdown = renderSummaryMarkdown(report({}));
     expect(markdown).not.toContain("Network:");
+  });
+
+  describe("observed protocol mismatch (#430)", () => {
+    it("renders a warning when the network reported a different protocol than the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({
+          targetProtocol: 28,
+          network: { name: "testnet", observedProtocol: 27 },
+          results: [result({ testId: "a", surface: "rpc", fixtureId: "a" })],
+        }),
+      );
+
+      expect(markdown).toContain("> ⚠️ Protocol mismatch:");
+      // Both numbers and the direction of the mismatch are stated, so a
+      // reader never has to guess which protocol the results describe.
+      expect(markdown).toContain("reported protocol 27");
+      expect(markdown).toContain("targets protocol 28");
+    });
+
+    it("does not warn when the observed protocol matches the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      );
+
+      expect(markdown).toContain("Network: testnet — observed protocol 28");
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no observed protocol to compare", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet" } }),
+      );
+
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no network at all", () => {
+      expect(renderSummaryMarkdown(report({ targetProtocol: 28 }))).not.toContain("Protocol mismatch");
+    });
   });
 
   it("never fabricates a result: an empty results array renders as a trivial pass with no surface rows", () => {
@@ -273,6 +369,42 @@ describe("renderSummaryMarkdown", () => {
     );
     expect(markdown).not.toContain("Replayed from cache");
     expect(markdown).toContain("1/1 applicable checks passed.");
+  });
+
+  it("links the report artifact when an artifact ID is available", () => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    const originalRunId = process.env.GITHUB_RUN_ID;
+    const originalServerUrl = process.env.GITHUB_SERVER_URL;
+    try {
+      process.env.GITHUB_REPOSITORY = "StellarCanary/ProtocolCanary-Action";
+      process.env.GITHUB_RUN_ID = "123456";
+      delete process.env.GITHUB_SERVER_URL;
+
+      const markdown = renderSummaryMarkdown(
+        report({ status: "pass" }),
+        undefined,
+        { id: 9876, name: "stellar-protocol-canary-report" },
+      );
+
+      expect(markdown).toContain(
+        "Report artifact: [stellar-protocol-canary-report](https://github.com/StellarCanary/ProtocolCanary-Action/actions/runs/123456/artifacts/9876)",
+      );
+    } finally {
+      if (originalRepo !== undefined) process.env.GITHUB_REPOSITORY = originalRepo;
+      else delete process.env.GITHUB_REPOSITORY;
+      if (originalRunId !== undefined) process.env.GITHUB_RUN_ID = originalRunId;
+      else delete process.env.GITHUB_RUN_ID;
+      if (originalServerUrl !== undefined) process.env.GITHUB_SERVER_URL = originalServerUrl;
+      else delete process.env.GITHUB_SERVER_URL;
+    }
+  });
+
+  it("omits the artifact link when no artifact or no ID is provided", () => {
+    const markdown1 = renderSummaryMarkdown(report({ status: "pass" }));
+    expect(markdown1).not.toContain("Report artifact:");
+
+    const markdown2 = renderSummaryMarkdown(report({ status: "pass" }), undefined, { name: "stellar-report" });
+    expect(markdown2).not.toContain("Report artifact:");
   });
 });
 
@@ -623,6 +755,34 @@ describe("renderExecutionFailureMarkdown", () => {
     expect(markdown).toContain("(no diagnostic output)");
   });
 
+  it("omits artifact link from execution failure summary when no artifact was uploaded", () => {
+    const markdown = renderExecutionFailureMarkdown("cargo install failed", "error: could not compile");
+    expect(markdown).not.toContain("Report artifact:");
+  });
+
+  it("links the report artifact in execution failure summary when an artifact with ID is provided", () => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    const originalRunId = process.env.GITHUB_RUN_ID;
+    try {
+      process.env.GITHUB_REPOSITORY = "StellarCanary/ProtocolCanary-Action";
+      process.env.GITHUB_RUN_ID = "123456";
+
+      const markdown = renderExecutionFailureMarkdown(
+        "cargo install failed",
+        "error: could not compile",
+        { id: 54321, name: "stellar-protocol-canary-report" },
+      );
+      expect(markdown).toContain(
+        "Report artifact: [stellar-protocol-canary-report](https://github.com/StellarCanary/ProtocolCanary-Action/actions/runs/123456/artifacts/54321)",
+      );
+    } finally {
+      if (originalRepo !== undefined) process.env.GITHUB_REPOSITORY = originalRepo;
+      else delete process.env.GITHUB_REPOSITORY;
+      if (originalRunId !== undefined) process.env.GITHUB_RUN_ID = originalRunId;
+      else delete process.env.GITHUB_RUN_ID;
+    }
+  });
+
   // The diagnostic is raw text from an external process, so it may itself
   // contain ``` (e.g. a compiler or panic message quoting a code block). A
   // fence is only closed by an equally long backtick run at line start, so
@@ -661,7 +821,7 @@ describe("renderExecutionFailureMarkdown", () => {
     }
 
     // The verbatim diagnostic content survives inside the single block.
-    expect(markdown).toContain("```rust");
+    expect(markdown).toContain("\\`\\`\\`rust");
     expect(markdown).toContain("// quoted code from the panic message");
     expect(markdown).toContain("stack backtrace:");
   });
@@ -691,9 +851,50 @@ describe("renderExecutionFailureMarkdown", () => {
   });
 });
 
+describe("protocolMismatchMessage (#430)", () => {
+  it("returns a message naming both protocols when they differ", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 27 } }),
+      ),
+    ).toBe("Protocol mismatch: the network reported protocol 27, but this run targets protocol 28.");
+  });
+
+  it("returns undefined when the protocols agree", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined with no observed protocol, rather than treating it as a mismatch", () => {
+    expect(protocolMismatchMessage(report({ network: { name: "testnet" } }))).toBeUndefined();
+    expect(protocolMismatchMessage(report({}))).toBeUndefined();
+  });
+
+  it("ignores observed values that are not positive integers", () => {
+    for (const observedProtocol of [0, -1, 27.5, Number.NaN]) {
+      expect(
+        protocolMismatchMessage(report({ targetProtocol: 28, network: { name: "testnet", observedProtocol } })),
+      ).toBeUndefined();
+    }
+  });
+});
+
 describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
   const BINARY_SHA = "a".repeat(64);
   const PACK_DIGEST = "b".repeat(64);
+
+  it("renders a report persistence warning callout note when reportWriteError is present (#508)", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      reportWriteError: "EACCES",
+    });
+
+    expect(markdown).toContain("Report persistence warning");
+    expect(markdown).toContain("EACCES");
+    expect(markdown).toContain("report artifact was not uploaded");
+  });
 
   it("renders a provenance table with the binary SHA-256, pack digest, and engine version", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
@@ -739,5 +940,53 @@ describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
   it("handles omitted provenance metadata cleanly without errors", () => {
     expect(() => renderSummaryMarkdown(report({ status: "pass" }), {})).not.toThrow();
     expect(() => renderSummaryMarkdown(report({ status: "fail" }), { engineVersion: "0.2.0" })).not.toThrow();
+  });
+});
+
+describe("renderSummaryMarkdown — reproduction command (#416)", () => {
+  it("renders a collapsed section with the engine version and exact command", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineVersion: "0.2.0",
+      engineArgs: ["check", "--format", "json", "--protocol", "28", "--fixtures-dir", "fixtures"],
+    });
+
+    expect(markdown).toContain("<details><summary>Reproduction command</summary>");
+    expect(markdown).toContain("Engine version: `0.2.0`");
+    expect(markdown).toContain(
+      "```text\nstellar-canary check --format json --protocol 28 --fixtures-dir fixtures\n```",
+    );
+    expect(markdown).toContain("</details>");
+  });
+
+  it("quotes arguments containing spaces and shell metacharacters", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--fixtures-dir", "fixtures dir", "--config", "$WEIRD;value"],
+    });
+
+    expect(markdown).toContain("--fixtures-dir 'fixtures dir'");
+    expect(markdown).toContain("--config '$WEIRD;value'");
+  });
+
+  it("masks credentials in the --rpc-url argument", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      engineArgs: ["check", "--rpc-url", "https://user:pass@example.com/rpc?token=secret"],
+    });
+
+    expect(markdown).toContain("--rpc-url https://[REDACTED]@example.com/rpc[REDACTED]");
+    expect(markdown).not.toContain("user:pass");
+    expect(markdown).not.toContain("token=secret");
+  });
+
+  it("omits the section when no argument array is available", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineVersion: "0.2.0" })).not.toContain(
+      "Reproduction command",
+    );
+    expect(renderSummaryMarkdown(report({ status: "pass" }), { engineArgs: [] })).not.toContain(
+      "Reproduction command",
+    );
+  });
+
+  it("does not render the section for pre-#416 callers that pass no provenance", () => {
+    expect(renderSummaryMarkdown(report({ status: "pass" }))).not.toContain("Reproduction command");
   });
 });

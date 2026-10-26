@@ -39,7 +39,6 @@ const coreMocks = vi.hoisted(() => ({
   warningMock: vi.fn(),
 }));
 
-const { execMock } = vi.hoisted(() => ({ execMock: vi.fn() }));
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 const httpsGetMock = vi.hoisted(() => vi.fn());
 const osMocks = vi.hoisted(() => ({ homedirMock: vi.fn() }));
@@ -56,10 +55,9 @@ vi.mock("@actions/core", () => ({
   warning: coreMocks.warningMock,
 }));
 
-vi.mock("@actions/exec", () => ({
-  exec: execMock,
-}));
-
+// #521: the version probes, `cargo --version` and `tar` all run through the
+// bounded runner (src/runner.ts), which spawns directly — @actions/exec is
+// no longer involved in the install chain.
 vi.mock("node:child_process", () => ({
   spawn: spawnMock,
 }));
@@ -79,14 +77,30 @@ import type { ResolvedVersion } from "../../src/version";
 
 const RESOLVED: ResolvedVersion = { version: "0.1.0", tag: "v0.1.0", commitSha: "abc123" };
 
-/** A spawn result that closes immediately with the given exit code. */
+/** A spawn result that closes immediately with the given exit code,
+ * emitting any captured output first (the bounded runner supervises the
+ * version probes too since #521, so they need stdout to parse). */
 class ImmediateChild extends EventEmitter {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
 
-  constructor(exitCode: number) {
+  constructor(exitCode: number, stdoutText = "", stderrText = "") {
     super();
-    queueMicrotask(() => this.emit("close", exitCode, null));
+    if (stdoutText !== "") {
+      this.stdout.write(stdoutText);
+    }
+    this.stdout.end();
+    if (stderrText !== "") {
+      this.stderr.write(stderrText);
+    }
+    this.stderr.end();
+    // setImmediate, not queueMicrotask: the bounded runner attaches the
+    // stdout `data` listener right after spawn, and the stream schedules
+    // its buffered-data emission as a microtask — queued *after* this
+    // constructor's own microtask. A microtask close would therefore fire
+    // first and the captured stdout would come back empty (#521). A macrotask
+    // always runs after every pending microtask.
+    setImmediate(() => this.emit("close", exitCode, null));
   }
 
   kill(): boolean {
@@ -191,19 +205,19 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
     coreMocks.debugMock.mockReset();
     coreMocks.warningMock.mockReset();
 
-    execMock.mockReset();
-    execMock.mockImplementation(
-      async (command: string, args: string[] = [], options: { listeners?: { stdout?: (d: Buffer) => void } } = {}): Promise<number> => {
-        if (command === "cargo" && args[0] === "--version") {
-          return 0;
-        }
-        options.listeners?.stdout?.(Buffer.from("stellar-canary 0.1.0\n"));
-        return 0;
-      },
-    );
-
     spawnMock.mockReset();
-    spawnMock.mockImplementation(() => new ImmediateChild(0) as unknown as ChildProcess);
+    // Default routed surface (#521): `cargo --version` succeeds, the version
+    // probes report the requested version, and any other spawn (i.e.
+    // `cargo install`) exits immediately and cleanly.
+    spawnMock.mockImplementation((command: string, args: string[] = []) => {
+      if (command === "cargo" && args[0] === "--version") {
+        return new ImmediateChild(0, "cargo 1.0.0\n") as unknown as ChildProcess;
+      }
+      if (args[0] === "version") {
+        return new ImmediateChild(0, "stellar-canary 0.1.0\n") as unknown as ChildProcess;
+      }
+      return new ImmediateChild(0) as unknown as ChildProcess;
+    });
 
     httpsGetMock.mockReset();
     httpsGetMock.mockImplementation(respond(404, ""));
@@ -256,7 +270,13 @@ describe("tamper detection and spoofed redirects (issue #375)", () => {
       .mockImplementationOnce(respond(200, `${sha256(full)}  stellar-canary\n`));
 
     // Install "succeeds" but leaves a truncated file behind.
-    spawnMock.mockImplementation(() => {
+    spawnMock.mockImplementation((command: string, args: string[] = []) => {
+      if (command === "cargo" && args[0] === "--version") {
+        return new ImmediateChild(0, "cargo 1.0.0\n") as unknown as ChildProcess;
+      }
+      if (args[0] === "version") {
+        return new ImmediateChild(0, "stellar-canary 0.1.0\n") as unknown as ChildProcess;
+      }
       fs.writeFileSync(binaryPath(), full.slice(0, 5));
       return new ImmediateChild(0) as unknown as ChildProcess;
     });
@@ -342,19 +362,19 @@ describe("strict-integrity fail-closed policy at the verification boundary (issu
     coreMocks.debugMock.mockReset();
     coreMocks.warningMock.mockReset();
 
-    execMock.mockReset();
-    execMock.mockImplementation(
-      async (command: string, args: string[] = [], options: { listeners?: { stdout?: (d: Buffer) => void } } = {}): Promise<number> => {
-        if (command === "cargo" && args[0] === "--version") {
-          return 0;
-        }
-        options.listeners?.stdout?.(Buffer.from("stellar-canary 0.1.0\n"));
-        return 0;
-      },
-    );
-
     spawnMock.mockReset();
-    spawnMock.mockImplementation(() => new ImmediateChild(0) as unknown as ChildProcess);
+    // Default routed surface (#521): `cargo --version` succeeds, the version
+    // probes report the requested version, and any other spawn (i.e.
+    // `cargo install`) exits immediately and cleanly.
+    spawnMock.mockImplementation((command: string, args: string[] = []) => {
+      if (command === "cargo" && args[0] === "--version") {
+        return new ImmediateChild(0, "cargo 1.0.0\n") as unknown as ChildProcess;
+      }
+      if (args[0] === "version") {
+        return new ImmediateChild(0, "stellar-canary 0.1.0\n") as unknown as ChildProcess;
+      }
+      return new ImmediateChild(0) as unknown as ChildProcess;
+    });
 
     httpsGetMock.mockReset();
     httpsGetMock.mockImplementation(respond(404, ""));

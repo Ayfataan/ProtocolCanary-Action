@@ -1,4 +1,49 @@
+import * as fs from "node:fs";
 import type { CanaryReport, CanaryResult } from "../../src/output";
+
+/**
+ * Tracks temporary directories created during test runs and ensures
+ * they are removed cleanly afterwards with Windows-compatible retry options.
+ */
+export class TempDirTracker {
+  private readonly dirs = new Set<string>();
+
+  /**
+   * Records a temporary directory path to be cleaned up.
+   */
+  track(dirPath: string): string {
+    this.dirs.add(dirPath);
+    return dirPath;
+  }
+
+  /**
+   * Removes all tracked directories.
+   */
+  cleanup(): void {
+    for (const dir of Array.from(this.dirs)) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch {
+        // Ignore errors if directory is already removed
+      }
+      this.dirs.delete(dir);
+    }
+  }
+
+  /**
+   * Checks if a directory is tracked.
+   */
+  has(dirPath: string): boolean {
+    return this.dirs.has(dirPath);
+  }
+
+  /**
+   * Returns the count of tracked directories.
+   */
+  get size(): number {
+    return this.dirs.size;
+  }
+}
 
 /**
  * Shared builders for CanaryReport/CanaryResult test fixtures.

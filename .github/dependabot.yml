@@ -6,13 +6,36 @@ updates:
       interval: "weekly"
     labels:
       - "dependencies"
+    groups:
+      # vitest and its coverage provider move together; a half-applied pair
+      # can break the coverage run.
+      vitest-and-coverage:
+        patterns:
+          - "vitest"
+          - "@vitest/coverage-v8"
+      # The ESLint stack and its peer plugins are configured as a unit.
+      eslint-stack:
+        patterns:
+          - "eslint"
+          - "typescript-eslint"
+          - "@eslint/*"
+      # @actions/* runtime packages shipped with the Action; kept separate
+      # from the development dependencies above.
+      actions-runtime:
+        patterns:
+          - "@actions/*"
 
   # Dependabot's github-actions ecosystem understands SHA-pinned `uses:`
   # references with a trailing `# vX` comment, so it can keep bumping the
-  # pin (and the comment) as upstream releases new versions.
+  # pin (and the comment) as upstream releases new versions. Group them so
+  # a workflow's action pins move together.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     labels:
       - "github_actions"
+    groups:
+      github-actions-ecosystem:
+        patterns:
+          - "*"

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker/master/packages/api/schema/stryker-core.json",
+  "mutator": ["typescript"],
+  "packageManager": "npm",
+  "testRunner": "vitest",
+  "coverageAnalysis": "perTest",
+  "concurrency": 4,
+  "timeoutMs": 300000,
+  "maxConcurrentTestRunners": 4,
+  "testCommand": "npx vitest run tests/unit",
+  "mutate": ["src/**/*.ts"],
+  "reporters": ["progress", "json", "html", "markdown"],
+  "reportDir": "reports/mutation",
+  "reportFileName": "mutation-report",
+  "cleanTempDir": true,
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": 0
+  }
+}
