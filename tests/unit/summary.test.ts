@@ -370,6 +370,42 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).not.toContain("Replayed from cache");
     expect(markdown).toContain("1/1 applicable checks passed.");
   });
+
+  it("links the report artifact when an artifact ID is available", () => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    const originalRunId = process.env.GITHUB_RUN_ID;
+    const originalServerUrl = process.env.GITHUB_SERVER_URL;
+    try {
+      process.env.GITHUB_REPOSITORY = "StellarCanary/ProtocolCanary-Action";
+      process.env.GITHUB_RUN_ID = "123456";
+      delete process.env.GITHUB_SERVER_URL;
+
+      const markdown = renderSummaryMarkdown(
+        report({ status: "pass" }),
+        undefined,
+        { id: 9876, name: "stellar-protocol-canary-report" },
+      );
+
+      expect(markdown).toContain(
+        "Report artifact: [stellar-protocol-canary-report](https://github.com/StellarCanary/ProtocolCanary-Action/actions/runs/123456/artifacts/9876)",
+      );
+    } finally {
+      if (originalRepo !== undefined) process.env.GITHUB_REPOSITORY = originalRepo;
+      else delete process.env.GITHUB_REPOSITORY;
+      if (originalRunId !== undefined) process.env.GITHUB_RUN_ID = originalRunId;
+      else delete process.env.GITHUB_RUN_ID;
+      if (originalServerUrl !== undefined) process.env.GITHUB_SERVER_URL = originalServerUrl;
+      else delete process.env.GITHUB_SERVER_URL;
+    }
+  });
+
+  it("omits the artifact link when no artifact or no ID is provided", () => {
+    const markdown1 = renderSummaryMarkdown(report({ status: "pass" }));
+    expect(markdown1).not.toContain("Report artifact:");
+
+    const markdown2 = renderSummaryMarkdown(report({ status: "pass" }), undefined, { name: "stellar-report" });
+    expect(markdown2).not.toContain("Report artifact:");
+  });
 });
 
 describe("renderExecutionFailureMarkdown", () => {
@@ -383,6 +419,34 @@ describe("renderExecutionFailureMarkdown", () => {
   it("shows a placeholder when there is no diagnostic output", () => {
     const markdown = renderExecutionFailureMarkdown("timed out", "");
     expect(markdown).toContain("(no diagnostic output)");
+  });
+
+  it("omits artifact link from execution failure summary when no artifact was uploaded", () => {
+    const markdown = renderExecutionFailureMarkdown("cargo install failed", "error: could not compile");
+    expect(markdown).not.toContain("Report artifact:");
+  });
+
+  it("links the report artifact in execution failure summary when an artifact with ID is provided", () => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    const originalRunId = process.env.GITHUB_RUN_ID;
+    try {
+      process.env.GITHUB_REPOSITORY = "StellarCanary/ProtocolCanary-Action";
+      process.env.GITHUB_RUN_ID = "123456";
+
+      const markdown = renderExecutionFailureMarkdown(
+        "cargo install failed",
+        "error: could not compile",
+        { id: 54321, name: "stellar-protocol-canary-report" },
+      );
+      expect(markdown).toContain(
+        "Report artifact: [stellar-protocol-canary-report](https://github.com/StellarCanary/ProtocolCanary-Action/actions/runs/123456/artifacts/54321)",
+      );
+    } finally {
+      if (originalRepo !== undefined) process.env.GITHUB_REPOSITORY = originalRepo;
+      else delete process.env.GITHUB_REPOSITORY;
+      if (originalRunId !== undefined) process.env.GITHUB_RUN_ID = originalRunId;
+      else delete process.env.GITHUB_RUN_ID;
+    }
   });
 
   // The diagnostic is raw text from an external process, so it may itself

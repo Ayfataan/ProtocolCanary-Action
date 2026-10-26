@@ -155,6 +155,7 @@ jobs:
 | `cache-dir` | Directory for cached fixture results (`--cache-dir=`), forwarded to the engine **unchanged**: a relative path is resolved by the *engine* against `--project-root` when one is given — not against `GITHUB_WORKSPACE`, `fixtures-dir`, or a future `working-directory` input (#348). Missing directories are created by the engine; a path that is an existing file is rejected by the engine; it may be combined with the engine's cache-disabling flag (the engine accepts both; this Action forwards it through the `no-cache` input). Empty/whitespace means unset; control characters are rejected. Same pre-run engine gate as `fixture`: an unsupported engine fails the run rather than caching results somewhere you did not ask for. | (none) |
 | `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.2.0` |
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
+| `report-retention-days` | Duration in days (integer 1 to 90) to retain the uploaded JSON report artifact. If omitted, the repository's default retention is used. | (repository default) |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
 | `diagnostics` | Opt in to a best-effort redacted diagnostics log bundle when Canary cannot produce a usable report. Strictly opt-in: the artifact is downloadable by anyone who can read the repository, and the process environment is never included. | `false` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
@@ -203,6 +204,8 @@ literals below.
 | `report` | Absolute path to the JSON report file this invocation wrote. The file is uniquely named per invocation (see below), so it is never shared with another Action step. Only set when Canary produced output to parse and the report file was written successfully; empty/unset on report write failure or execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report-canary-check-4b9c1d2e3f4a5b6c.json` |
 | `receipt-path` | Absolute path to the invocation-specific Execution Receipt JSON (each invocation writes a distinct file under `RUNNER_TEMP`, so subsequent steps cannot overwrite it). Set only when `generate-receipt` is `true` and Canary produced a parseable report; unset otherwise, including on an execution failure. | `/home/runner/work/_temp/stellar-canary-receipt-<unique>.json` |
 | `junit-report-path` | Absolute path to the generated JUnit XML file. Only set when `junit-report` is `true` **and** the engine's render succeeded; unset otherwise (input disabled, engine without the command, failed/empty render) and on an execution failure. A failed render is always a warning, never a status change. | `/home/runner/work/_temp/stellar-canary-report.junit.xml` |
+| `artifact-name` | Name of the uploaded report artifact. Reflects the fallback name if a collision occurred. Empty string when upload was disabled or failed, or on an execution failure. | `"stellar-protocol-canary-report"` |
+| `artifact-id` | GitHub artifact ID of the uploaded report artifact. Empty string when upload was disabled or failed, if the client did not return an ID, or on an execution failure. | `"12345678"` |
 | `coverage-state` | How completely the fixture set was exercised: `full` (every discovered fixture ran, none skipped), `partial` (something ran, but fixtures were skipped), or `none` (nothing ran — an empty run or an execution failure). | `"full"` |
 
 `coverage-state` is meant for a job that gates a promotion on *coverage*
@@ -249,7 +252,7 @@ safely read or upload an earlier step's report:
   run: jq .status "${{ steps.canary.outputs.report }}"
 ```
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol`, `pack-protocol`, `pack-version`, and `pack-digest` are set to empty strings `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol`, `pack-protocol`, `pack-version`, and `pack-digest` are set to empty strings `""`, `artifact-name` and `artifact-id` are set to empty strings `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
 > `coverage-state` is set on that path too, always as `none`, so a consumer never has to distinguish "unset" from "no coverage".
 
 ## How failures appear
@@ -517,6 +520,14 @@ per invocation instead of silently dropping every upload after the first.
 Downloading a specific report from a multi-invocation run therefore means
 matching the suffix — either the protocol/network/config it checked, or the
 generated unique suffix when the invocations share the same inputs.
+Workflows can also read `steps.<id>.outputs.artifact-name` to get the exact
+artifact name actually used (including any fallback suffix), and
+`steps.<id>.outputs.artifact-id` to get the artifact ID (which is also linked
+directly in the job summary when available).
+
+Retention of the report artifact can be configured using `report-retention-days`
+(an integer between 1 and 90). When omitted, the repository's default artifact
+retention applies.
 
 ## Installation & integrity
 

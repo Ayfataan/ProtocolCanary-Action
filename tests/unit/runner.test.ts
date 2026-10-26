@@ -106,6 +106,7 @@ const BASE_INPUTS: ActionInputs = {
   baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
+  reportRetentionDays: undefined,
   junitReport: false,
   strictIntegrity: false,
   prComment: false,

@@ -59,6 +59,7 @@ const ENV_KEYS = [
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
+  "INPUT_REPORT-RETENTION-DAYS",
   "INPUT_ALLOW-EMPTY",
 ];
 
@@ -477,6 +478,8 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     // The same file the "report" output advertises is what got uploaded.
     const outputs = readOutputs(fixture.outputPath);
     expect(uploadedReportPath).toBe(outputs.report);
+    expect(outputs["artifact-name"]).toBe("stellar-protocol-canary-report");
+    expect(outputs["artifact-id"]).toBe("1");
 
     // The differentiator built from this scenario's inputs (protocol=28,
     // no config) is the retry name only; the stable name is tried first, so

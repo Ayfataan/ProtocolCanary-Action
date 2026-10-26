@@ -136,6 +136,25 @@ function notablyList(report: CanaryReport, statuses: readonly ("fail" | "error" 
     });
 }
 
+export interface ArtifactSummaryInfo {
+  readonly id?: number | undefined;
+  readonly name?: string | undefined;
+}
+
+/**
+ * Builds the GitHub Actions artifact web URL for a given artifact ID.
+ * Resolves repository and workflow run ID from environment variables when present.
+ */
+export function buildArtifactUrl(artifactId: number): string {
+  const serverUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+  const repo = process.env.GITHUB_REPOSITORY;
+  const runId = process.env.GITHUB_RUN_ID;
+  if (repo && runId) {
+    return `${serverUrl}/${repo}/actions/runs/${runId}/artifacts/${String(artifactId)}`;
+  }
+  return `${serverUrl}/actions/runs/artifacts/${String(artifactId)}`;
+}
+
 /**
  * Provenance metadata for the "Provenance & Trust" summary section
  * (issue #373). Every field is optional because the upstream pipelines
@@ -230,7 +249,11 @@ export function protocolMismatchMessage(report: CanaryReport): string | undefine
  * renders the Provenance & Trust section (issue #373) and the reproduction
  * command (issue #416); omitting it renders no section, keeping every
  * pre-provenance consumer's output identical. */
-export function renderSummaryMarkdown(report: CanaryReport, provenance?: SummaryProvenance): string {
+export function renderSummaryMarkdown(
+  report: CanaryReport,
+  provenance?: SummaryProvenance,
+  artifact?: ArtifactSummaryInfo,
+): string {
   const lines: string[] = [];
   lines.push("## Stellar Protocol Canary", "");
   lines.push(`Protocol: ${escapeInline(String(report.targetProtocol))}`);
@@ -249,7 +272,12 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
   if (mismatch !== undefined) {
     lines.push(`> ⚠️ ${mismatch}`, "");
   }
-  lines.push(`Canary version: ${escapeInline(report.toolVersion)}`, "");
+  lines.push(`Canary version: ${escapeInline(report.toolVersion)}`);
+  if (artifact?.id !== undefined) {
+    const name = artifact.name || "stellar-protocol-canary-report";
+    lines.push(`Report artifact: [${name}](${buildArtifactUrl(artifact.id)})`);
+  }
+  lines.push("");
 
   const rows = SURFACE_ORDER.map((surface) => surfaceRowLabel(report.results, surface)).filter(
     (row): row is string => row !== undefined,
@@ -385,7 +413,11 @@ const MAX_EMBEDDED_FENCE_LENGTH = 20;
  * strategy CommonMark §Fenced code blocks specifies for embedding such
  * content.
  */
-export function renderExecutionFailureMarkdown(reason: string, diagnostic: string): string {
+export function renderExecutionFailureMarkdown(
+  reason: string,
+  diagnostic: string,
+  artifact?: ArtifactSummaryInfo,
+): string {
   const trimmed = formatSafeDiagnosticTail(diagnostic).trim();
   // Longest run of backticks anywhere in the diagnostic, in characters.
   // Also covers the closing fence the diagnostic text may already contain,
@@ -396,7 +428,7 @@ export function renderExecutionFailureMarkdown(reason: string, diagnostic: strin
   // gives nested embedding (a summary quoted inside another code block) room.
   const fenceLength = Math.max(3, longestRun + 1, MAX_EMBEDDED_FENCE_LENGTH);
   const fence = "`".repeat(fenceLength);
-  return [
+  const lines = [
     "## Stellar Protocol Canary",
     "",
     "### Result",
@@ -406,11 +438,13 @@ export function renderExecutionFailureMarkdown(reason: string, diagnostic: strin
     "Protocol Canary could not be executed.",
     "",
     `Reason: ${formatSafeDiagnosticTail(reason)}`,
-    "",
-    fence + "text",
-    trimmed === "" ? "(no diagnostic output)" : trimmed,
-    fence,
-  ].join("\n");
+  ];
+  if (artifact?.id !== undefined) {
+    const name = artifact.name || "stellar-protocol-canary-report";
+    lines.push("", `Report artifact: [${name}](${buildArtifactUrl(artifact.id)})`);
+  }
+  lines.push("", fence + "text", trimmed === "" ? "(no diagnostic output)" : trimmed, fence);
+  return lines.join("\n");
 }
 
 /**
