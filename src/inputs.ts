@@ -70,6 +70,8 @@ export interface ActionInputs {
    * workflow artifact (#362). Parses the documented boolean literals strictly
    * and defaults to `false` when the input is omitted (#361). */
   readonly generateReceipt: boolean;
+  /** Duration in days (integer 1 to 90) to retain the uploaded JSON report artifact. */
+  readonly reportRetentionDays: number | undefined;
   /** Render the parsed JSON report to JUnit XML through the engine's own
    * `report <file> --format junit` command (#423) and expose the file as the
    * `junit-report-path` output (also included in the artifact upload).
@@ -241,6 +243,7 @@ export function getInputs(): ActionInputs {
     core.setSecret(networkPassphrase);
   }
   const generateReceipt = parseBoolean("generate-receipt", core.getInput("generate-receipt") || "false");
+  const reportRetentionDays = parseReportRetentionDays(core.getInput("report-retention-days"));
   const junitReport = parseBoolean("junit-report", core.getInput("junit-report") || "false");
 
   const strictIntegrity = parseBoolean("strict-integrity", core.getInput("strict-integrity") || "false");
@@ -299,6 +302,7 @@ export function getInputs(): ActionInputs {
     baselineReport,
     githubToken,
     generateReceipt,
+    reportRetentionDays,
     junitReport,
     strictIntegrity,
     prComment: parseBoolean("pr-comment", core.getInput("pr-comment") || "false"),
@@ -349,6 +353,30 @@ function parseNetworkPassphrase(raw: string): string | undefined {
     );
   }
   return raw;
+}
+
+/**
+ * Validates the "report-retention-days" input as an integer from 1 to 90;
+ * undefined when unset. Throws {@link InvalidInputError} naming the input
+ * for non-integers or values outside 1 to 90.
+ */
+function parseReportRetentionDays(raw: string): number | undefined {
+  const value = optional(raw);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!PROTOCOL_LIKE.test(value)) {
+    throw new InvalidInputError(
+      `Invalid "report-retention-days" input: ${JSON.stringify(value)}. Expected an integer from 1 to 90.`,
+    );
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (parsed < 1 || parsed > 90) {
+    throw new InvalidInputError(
+      `Invalid "report-retention-days" input: ${JSON.stringify(value)}. Expected an integer from 1 to 90.`,
+    );
+  }
+  return parsed;
 }
 
 /**

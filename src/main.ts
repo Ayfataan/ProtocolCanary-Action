@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { ArtifactUploadOutcome } from "./artifact";
 import { uploadReceipt, uploadReport } from "./artifact";
 import { postPullRequestComment } from "./comment";
 import {
@@ -147,6 +148,8 @@ async function handleExecutionFailure(
   core.setOutput("pack-protocol", "");
   core.setOutput("pack-version", "");
   core.setOutput("pack-digest", "");
+  core.setOutput("artifact-name", "");
+  core.setOutput("artifact-id", "");
 }
 
 /**
@@ -374,6 +377,43 @@ export async function run(): Promise<void> {
     }
   }
 
+  // #423: optional JUnit rendering through the engine's own `report` command,
+  // before the artifact upload so the XML ships with the JSON report. Like
+  // the artifact and the receipt, it is auxiliary: any failure (an engine
+  // release without the command, a non-zero exit, empty output, a missing
+  // report file) is a warning only and can never change `status` or fail the
+  // job.
+  let junitPath: string | undefined;
+  if (inputs.junitReport && reportWritten) {
+    const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
+    if (junit.path !== undefined) {
+      junitPath = junit.path;
+      core.setOutput("junit-report-path", junit.path);
+      core.info(`Wrote JUnit report to ${junit.path}.`);
+    } else {
+      core.warning(
+        `JUnit report not produced: ${junit.reason ?? "unknown reason"}. The compatibility ` +
+          "result and status are unchanged. Rendering requires a Protocol-Canary release whose " +
+          "`report` command supports `--format junit` (Protocol-Canary #434).",
+      );
+    }
+  }
+
+  let uploadOutcome: ArtifactUploadOutcome | undefined;
+  if (inputs.uploadReport && reportWritten) {
+    try {
+      uploadOutcome = await uploadReport(
+        reportPath,
+        artifactDifferentiator(inputs),
+        inputs.reportRetentionDays,
+        junitPath === undefined ? [] : [junitPath],
+      );
+    } catch (error) {
+      core.warning(`Failed to upload artifact: ${describeError(error)}`);
+      uploadOutcome = { uploaded: false, reason: describeError(error) };
+    }
+  }
+
   try {
     // Provenance & Trust section (issue #373): digest of the binary this run
     // actually executed, observed (not verified — decision D-07 bounds that
@@ -389,14 +429,22 @@ export async function run(): Promise<void> {
       // diagnostic; the summary says "unverified" instead of guessing.
       core.debug("Provenance: could not hash the executed binary for the summary.");
     }
-    const summaryMarkdown = renderSummaryMarkdown(report, {
+    const artifactInfo =
+      uploadOutcome?.uploaded && uploadOutcome.id !== undefined
+        ? { id: uploadOutcome.id, name: uploadOutcome.name }
+        : undefined;
+    const summaryMarkdown = renderSummaryMarkdown(
+      report,
+      {
         ...(binarySha256 !== undefined ? { binarySha256 } : {}),
         engineVersion: installed.version,
         // Reproduction command (issue #416): the exact argument array the
         // engine was invoked with, so a reader can rerun the same check.
         engineArgs,
         reportWriteError,
-      });
+      },
+      ...(artifactInfo !== undefined ? [artifactInfo] : []),
+    );
     await writeSummary(summaryMarkdown);
     if (inputs.prComment) {
       let event: { pull_request?: { number?: number; head?: { repo?: { fork?: boolean } } } } = {};
@@ -444,32 +492,14 @@ export async function run(): Promise<void> {
     core.setOutput("report", reportPath);
   }
   core.setOutput("coverage-state", coverageState);
-
-  // #423: optional JUnit rendering through the engine's own `report` command,
-  // before the artifact upload so the XML ships with the JSON report. Like
-  // the artifact and the receipt, it is auxiliary: any failure (an engine
-  // release without the command, a non-zero exit, empty output, a missing
-  // report file) is a warning only and can never change `status` or fail the
-  // job.
-  let junitPath: string | undefined;
-  if (inputs.junitReport && reportWritten) {
-    const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
-    if (junit.path !== undefined) {
-      junitPath = junit.path;
-      core.setOutput("junit-report-path", junit.path);
-      core.info(`Wrote JUnit report to ${junit.path}.`);
-    } else {
-      core.warning(
-        `JUnit report not produced: ${junit.reason ?? "unknown reason"}. The compatibility ` +
-          "result and status are unchanged. Rendering requires a Protocol-Canary release whose " +
-          "`report` command supports `--format junit` (Protocol-Canary #434).",
-      );
-    }
-  }
-
-  if (inputs.uploadReport && reportWritten) {
-    await uploadReport(reportPath, artifactDifferentiator(inputs), junitPath === undefined ? [] : [junitPath]);
-  }
+  core.setOutput(
+    "artifact-name",
+    uploadOutcome?.uploaded && uploadOutcome.name ? uploadOutcome.name : "",
+  );
+  core.setOutput(
+    "artifact-id",
+    uploadOutcome?.uploaded && uploadOutcome.id !== undefined ? String(uploadOutcome.id) : "",
+  );
 
   // #362: strictly opt-in, and auxiliary like the report artifact. A receipt
   // is only produced when Canary actually yielded a report (the
