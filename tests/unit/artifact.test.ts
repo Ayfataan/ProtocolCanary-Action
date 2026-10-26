@@ -8,6 +8,7 @@ vi.mock("@actions/artifact", () => ({
   },
 }));
 
+import type { ArtifactUploadOutcome } from "../../src/artifact";
 import { ARTIFACT_NAME, RECEIPT_ARTIFACT_PREFIX, fallbackArtifactName, isArtifactNameCollision, receiptArtifactName, uploadReceipt, uploadReport } from "../../src/artifact";
 
 const REPORT_PATH = "/tmp/stellar-canary-report.json";
@@ -167,11 +168,42 @@ describe("uploadReport", () => {
     expect(uploadArtifactMock).toHaveBeenCalledTimes(1);
   });
 
-  it("never throws when the fallback upload also fails", async () => {
+  it("never throws when the fallback upload also fails (#494)", async () => {
     uploadArtifactMock.mockRejectedValue(conflictError());
     const outcome = await uploadReport(REPORT_PATH, "protocol-28");
     expect(outcome.uploaded).toBe(false);
-    expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
+    expect(outcome.reason).toContain("(409) Conflict");
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps every report artifact across five consecutive invocations with the same differentiator (#494)", async () => {
+    const usedNames = new Set<string>();
+    uploadArtifactMock.mockImplementation(async (artifactName: string) => {
+      if (usedNames.has(artifactName)) {
+        throw conflictError();
+      }
+      usedNames.add(artifactName);
+      return { id: usedNames.size, size: 100 };
+    });
+
+    const outcomes: ArtifactUploadOutcome[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      outcomes.push(await uploadReport(REPORT_PATH, "protocol-28-config-.stellar-canary.toml"));
+    }
+
+    expect(outcomes.every((o) => o.uploaded)).toBe(true);
+    expect(usedNames.size).toBe(5);
+
+    const names = Array.from(usedNames);
+    // 1. First call uses stable ARTIFACT_NAME
+    expect(names[0]).toBe(ARTIFACT_NAME);
+    // 2. Second call uses readable differentiator name
+    expect(names[1]).toBe(`${ARTIFACT_NAME}-protocol-28-config-.stellar-canary.toml`);
+    // 3. Subsequent calls use distinct valid names
+    for (const name of names) {
+      expect(name).toMatch(/^[A-Za-z0-9._-]+$/);
+    }
+    expect(new Set(names).size).toBe(5);
   });
 
   it("handles a non-Error failure reason when upload fails", async () => {

@@ -3,7 +3,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { TempDirTracker } from "./helpers";
+
+const tracker = new TempDirTracker();
+
+afterEach(() => {
+  tracker.cleanup();
+});
 
 /**
  * #370: CI conformance tests for the maintained reusable workflow.
@@ -136,7 +144,7 @@ interface RunResult {
 }
 
 function runScript(script: string, env: StepEnv, opts?: { stub?: string; cwd?: string }): RunResult {
-  const dir = opts?.cwd ?? fs.mkdtempSync(path.join(os.tmpdir(), "l75-conformance-"));
+  const dir = opts?.cwd ?? tracker.track(fs.mkdtempSync(path.join(os.tmpdir(), "l75-conformance-")));
   const scriptPath = path.join(dir, "step.sh");
   fs.writeFileSync(scriptPath, script);
   // With a stub, run the step inside the shell that also defines it:
@@ -211,7 +219,7 @@ function curlScenarioEnv(scenario: { list: string; zip?: string; failList?: bool
 
 /** Real zip archive containing a Protocol Canary-shaped JSON report. */
 function reportZipFixture(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "l75-zip-"));
+  const dir = tracker.track(fs.mkdtempSync(path.join(os.tmpdir(), "l75-zip-")));
   const reportPath = path.join(dir, "report.json");
   fs.writeFileSync(reportPath, JSON.stringify({ schema: 1, protocol: 28, status: "compatible", results: [] }));
   const zipPath = path.join(dir, "artifact.zip");
@@ -358,7 +366,7 @@ describe("test-reusable-workflow conformance (#370)", () => {
     const script = extractRunScript(workflowSource(), "verify-outputs");
     const zip = reportZipFixture();
     // Stage the unpacked artifact the fetch step would have produced.
-    const work = fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-"));
+    const work = tracker.track(fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-")));
     const unpacked = path.join(work, "unpacked");
     fs.mkdirSync(unpacked);
     fs.copyFileSync(zip, path.join(work, "seed.zip"));
@@ -403,7 +411,7 @@ describe("test-reusable-workflow conformance (#370)", () => {
     "verify-outputs fails when the artifact tree holds no valid report",
     () => {
     const script = extractRunScript(workflowSource(), "verify-outputs");
-    const work = fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-empty-"));
+    const work = tracker.track(fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-empty-")));
     fs.mkdirSync(path.join(work, "unpacked"));
     const result = runScript(script, outputsEnv(), { cwd: work });
     expect(result.status).not.toBe(0);
@@ -418,10 +426,22 @@ describe("test-reusable-workflow conformance (#370)", () => {
       expect(match[2], `scope ${match[1]} must stay read-only`).toBe("read");
     }
   });
+
+  it("cleans up temporary directories so no l75-* directories are left behind (#501)", () => {
+    const zip = reportZipFixture();
+    const parentDir = path.dirname(zip);
+    expect(tracker.has(parentDir)).toBe(true);
+    expect(fs.existsSync(parentDir)).toBe(true);
+
+    tracker.cleanup();
+
+    expect(fs.existsSync(parentDir)).toBe(false);
+    expect(tracker.has(parentDir)).toBe(false);
+  });
 });
 
 function stageUnpackedFixture(): string {
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-"));
+  const work = tracker.track(fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-")));
   const unpacked = path.join(work, "unpacked");
   fs.mkdirSync(unpacked);
   fs.writeFileSync(path.join(unpacked, "report.json"), JSON.stringify({ schema: 1, protocol: 28, status: "compatible" }));
