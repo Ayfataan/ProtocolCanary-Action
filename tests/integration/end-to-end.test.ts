@@ -86,12 +86,15 @@ const ENV_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
+  "INPUT_REPORT-RETENTION-DAYS",
+  "INPUT_ALLOW-EMPTY",
 ];
 
 interface Fixture {
@@ -108,7 +111,7 @@ interface Fixture {
 // shares one persistent summary file instead, truncated between tests.
 const SUMMARY_PATH = path.join(os.tmpdir(), `canary-e2e-summary-${String(process.pid)}.md`);
 
-function setUp(scenario: string): Fixture {
+function setUp(scenario: string, version = "0.1.0", omitVersion = false): Fixture {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-e2e-"));
   const cargoHome = path.join(workDir, "cargo-home");
   fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
@@ -128,10 +131,18 @@ function setUp(scenario: string): Fixture {
   process.env.GITHUB_OUTPUT = outputPath;
   process.env.GITHUB_STEP_SUMMARY = summaryPath;
   process.env.MOCK_CANARY_SCENARIO = scenario;
-  process.env.MOCK_CANARY_VERSION = "0.1.0";
-  process.env.INPUT_VERSION = "0.1.0";
+  process.env.MOCK_CANARY_VERSION = version;
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
+  if (!omitVersion) {
+    process.env.INPUT_VERSION = version;
+  }
   process.env.INPUT_PROTOCOL = "28";
-  process.env["INPUT_FIXTURES-DIR"] = "fixtures";
+  // #400: run() validates fixtures-dir on disk before version resolution
+  // and installation, so the input must point at an existing directory —
+  // an empty one inside the scratch workDir is enough for the mock engine.
+  const fixturesDir = path.join(workDir, "fixtures");
+  fs.mkdirSync(fixturesDir);
+  process.env["INPUT_FIXTURES-DIR"] = fixturesDir;
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env["INPUT_ANNOTATIONS"] = "true";
   process.env["INPUT_TIMEOUT-MINUTES"] = "1";
@@ -150,6 +161,8 @@ function readOutputs(outputPath: string): Record<string, string> {
   const content = fs.readFileSync(outputPath, "utf8");
   const outputs: Record<string, string> = {};
   const lines = content.split("\n");
+  // Output names are written verbatim as the file-command key, so they may
+  // contain `-` (`coverage-state`, `report-path`, …), not just word characters.
   for (let i = 0; i < lines.length; i++) {
     const match = /^([A-Za-z_][A-Za-z0-9_-]*)<<(.+)$/.exec(lines[i] ?? "");
     if (match) {
@@ -184,6 +197,15 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     fs.rmSync(SUMMARY_PATH, { force: true });
   });
 
+  it("uses Protocol-Canary 0.2.0 when the version input is omitted", async () => {
+    fixture = setUp("pass", "0.2.0", true);
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(readOutputs(fixture.outputPath)["engine-version"]).toBe("0.2.0");
+  });
+
   it("pass: succeeds, sets outputs, and writes no annotations", async () => {
     fixture = setUp("pass");
     const { run } = await import("../../src/main");
@@ -195,6 +217,7 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(outputs.status).toBe("pass");
     expect(outputs.passed).toBe("1");
     expect(outputs.failures).toBe("0");
+    expect(outputs["coverage-state"]).toBe("full");
     expect(outputs.total).toBe("1");
     expect(outputs.skipped).toBe("0");
     expect(outputs["engine-version"]).toBe("0.1.0");
@@ -272,6 +295,9 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(outputs["engine-version"]).toBe("0.1.0");
     expect(outputs["observed-protocol"]).toBe("");
     expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain("could not be executed");
+    // #333: an execution failure executed no fixture at all, so coverage-state
+    // is set (not left empty) and says so.
+    expect(outputs["coverage-state"]).toBe("none");
   });
 
   it("pass-network: succeeds, sets observed-protocol, engine-version, total and skipped", async () => {
@@ -344,6 +370,10 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     const outputs = readOutputs(fixture.outputPath);
     expect(outputs.status).toBe("pass");
     expect(outputs.passed).toBe("2");
+    // #333: this scenario's report carries a `skipped[]` entry, so the run is
+    // a `pass` with incomplete coverage — exactly the distinction the output
+    // exists to make.
+    expect(outputs["coverage-state"]).toBe("partial");
   });
 
   it("rpc-error: a per-fixture execution error still produces a real report", async () => {
@@ -482,6 +512,8 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     // The same file the "report" output advertises is what got uploaded.
     const outputs = readOutputs(fixture.outputPath);
     expect(uploadedReportPath).toBe(outputs.report);
+    expect(outputs["artifact-name"]).toBe("stellar-protocol-canary-report");
+    expect(outputs["artifact-id"]).toBe("1");
 
     // The differentiator built from this scenario's inputs (protocol=28,
     // no config) is the retry name only; the stable name is tried first, so
@@ -489,5 +521,126 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
     expect(infoMock.mock.calls.some((call) => String(call[0]).includes("Uploaded stellar-protocol-canary-report artifact."))).toBe(
       true,
     );
+  });
+
+  // #400: fixtures-dir is validated after input parsing and before version
+  // resolution or installation. A missing directory must fail with a clear
+  // error naming the input and its resolved absolute path, reach the
+  // execution-failure annotation and summary, and never reach the engine —
+  // which the empty outputs (no engine-version, no report) prove.
+  it("missing fixtures-dir: fails before installation with an actionable error (#400)", async () => {
+    fixture = setUp("pass");
+    const missing = path.join(fixture.workDir, "no-such-fixtures");
+    process.env["INPUT_FIXTURES-DIR"] = missing;
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const failed = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(failed).toContain('"fixtures-dir"');
+    expect(failed).toContain(path.resolve(missing));
+    expect(failed).toContain("does not exist");
+
+    const outputs = readOutputs(fixture.outputPath);
+    expect(outputs.status).toBe("execution-failed");
+    // No installation happened (no engine version) and no engine ran (no
+    // report file) — both are set whenever the engine was reached.
+    expect(outputs["engine-version"]).toBe("");
+    expect(outputs.report).toBeUndefined();
+
+    // The error also reaches the execution-failure annotation and summary.
+    expect(errorMock).toHaveBeenCalledTimes(1);
+    const annotated = errorMock.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(annotated).toContain('"fixtures-dir"');
+    expect(annotated).toContain(path.resolve(missing));
+    expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain('"fixtures-dir"');
+  });
+
+  // #400, preserved allow-empty exception: a missing directory downgrades to
+  // a warning naming the input and path, and the run continues normally.
+  it("missing fixtures-dir with allow-empty: true warns and the run proceeds (#400)", async () => {
+    fixture = setUp("pass");
+    const missing = path.join(fixture.workDir, "no-such-fixtures");
+    process.env["INPUT_FIXTURES-DIR"] = missing;
+    process.env["INPUT_ALLOW-EMPTY"] = "true";
+    const { run } = await import("../../src/main");
+    await run();
+
+    const warnings = warningMock.mock.calls.map((call) => String(call[0]));
+    expect(
+      warnings.some((message) => message.includes('"fixtures-dir"') && message.includes(path.resolve(missing))),
+    ).toBe(true);
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(readOutputs(fixture.outputPath).status).toBe("pass");
+  });
+
+  // #400: a path that exists but is not a directory is a distinct error,
+  // rejected even with allow-empty — that input excuses an empty fixture
+  // set, not a mistyped path.
+  it("fixtures-dir pointing at a regular file is rejected as not a directory (#400)", async () => {
+    fixture = setUp("pass");
+    const file = path.join(fixture.workDir, "fixtures.toml");
+    fs.writeFileSync(file, "[tests]\n", "utf8");
+    process.env["INPUT_FIXTURES-DIR"] = file;
+    process.env["INPUT_ALLOW-EMPTY"] = "true";
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const failed = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(failed).toContain('"fixtures-dir"');
+    expect(failed).toContain(path.resolve(file));
+    expect(failed).toContain("is not a directory");
+    expect(readOutputs(fixture.outputPath).status).toBe("execution-failed");
+  });
+
+  // #399: the regression this issue exists for — two invocations in one job
+  // (the same RUNNER_TEMP, the same GITHUB_ACTION, the same inputs) used to
+  // write the *same* fixed report file, so the second invocation silently
+  // overwrote the first one's report. Both invocations must now keep their
+  // own file, and every consumer (report output, artifact upload, summary)
+  // must see the correct per-invocation report.
+  it("two invocations in one job write distinct report files that never overwrite each other (#399)", async () => {
+    fixture = setUp("pass");
+    process.env["INPUT_UPLOAD-REPORT"] = "true";
+    const { run } = await import("../../src/main");
+
+    // First invocation: a passing report.
+    await run();
+    const firstReport = readOutputs(fixture.outputPath).report as string;
+    const firstSummary = fs.readFileSync(fixture.summaryPath, "utf8");
+
+    // Second invocation: same environment, different report data.
+    process.env.MOCK_CANARY_SCENARIO = "warning";
+    await run();
+    const secondReport = readOutputs(fixture.outputPath).report as string;
+
+    // Both report paths are absolute, live directly in the shared
+    // RUNNER_TEMP, and are distinct.
+    expect(path.isAbsolute(firstReport)).toBe(true);
+    expect(path.isAbsolute(secondReport)).toBe(true);
+    expect(firstReport).not.toBe(secondReport);
+    expect(path.dirname(firstReport)).toBe(path.join(fixture.workDir, "runner-temp"));
+    expect(path.dirname(secondReport)).toBe(path.dirname(firstReport));
+
+    // Both files exist, and the first file — read *after* the second
+    // invocation — still holds the first invocation's data.
+    expect(fs.existsSync(firstReport)).toBe(true);
+    expect(fs.existsSync(secondReport)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(firstReport, "utf8"))).toMatchObject({ status: "pass" });
+    expect(JSON.parse(fs.readFileSync(secondReport, "utf8"))).toMatchObject({ status: "warning" });
+
+    // The artifact client received the correct per-invocation path.
+    expect(uploadArtifactMock).toHaveBeenCalledTimes(2);
+    const firstUpload = uploadArtifactMock.mock.calls[0] as [string, string[], string];
+    const secondUpload = uploadArtifactMock.mock.calls[1] as [string, string[], string];
+    expect(firstUpload[1]).toEqual([firstReport]);
+    expect(secondUpload[1]).toEqual([secondReport]);
+
+    // The summary reflects each invocation's own report: the first run's
+    // PASS summary is still present (summaries append), and the second
+    // run's summary describes the second run's warning report.
+    expect(firstSummary).toContain("✅ **PASS**");
+    expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain("⚠️ **WARNING**");
   });
 });

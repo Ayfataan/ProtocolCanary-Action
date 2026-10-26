@@ -76,10 +76,11 @@ entry in [Inputs](#inputs) for the full explanation and setup guidance.
 
 This snippet is not runnable on its own: `fixtures-dir` defaults to
 `fixtures`, relative to the job's working directory, and a freshly
-checked-out project normally has no `fixtures/` directory, so there is
-nothing for Canary to check. Either point `fixtures-dir` at your own
-fixtures or check out a fixtures pack first, as
-[`examples/protocol-28.yml`](examples/protocol-28.yml) does.
+checked-out project normally has no `fixtures/` directory — so the step
+now fails fast with a clear `fixtures-dir` error, before the engine is
+installed, instead of installing Canary just to check nothing. Either
+point `fixtures-dir` at your own fixtures or check out a fixtures pack
+first, as [`examples/protocol-28.yml`](examples/protocol-28.yml) does.
 
 See [`examples/`](examples/) for the complete, runnable workflows —
 including that Protocol 28 one, which checks out the real
@@ -140,19 +141,35 @@ jobs:
 
 | Input | Description | Default |
 |---|---|---|
-| `protocol` | Target Stellar protocol version (`--protocol`). | (from `.stellar-canary.toml`, or 28) |
+| `protocol` | Target Stellar protocol version (`--protocol`), a whole number from 1 to 4294967295 (the engine rejects 0). | (from `.stellar-canary.toml`, or 28) |
 | `config` | Path to `.stellar-canary.toml` (`--config`). Fails clearly if the given path does not exist, or is not a regular file (e.g. a directory). | (CLI default lookup) |
+| `working-directory` | Directory to treat as the project root, forwarded as `--project-root` so a monorepo can check one subdirectory or workspace member. Relative paths are resolved against the workspace; a path that does not exist or is not a directory fails the run before Canary is invoked. The default (`.`, the workspace itself) is validated but not forwarded. Requires a Protocol-Canary release whose CLI supports `--project-root`; older releases reject the argument. | `.` |
 | `network` | Network for live RPC/Soroban checks (`--network`). | `testnet` (CLI default) |
+| `network-passphrase` | Expected network identity for RPC verification (`--network-passphrase`). Preserved exactly, must be non-empty and contain no control characters. An explicit value overrides the passphrase associated with `network`. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | (none) |
 | `rpc-url` | Stellar RPC endpoint (`--rpc-url`). Must be `https://`, or `http://localhost`/`127.0.0.1` for local development. | (none) |
-| `fixtures-dir` | Path to a directory of fixtures, e.g. a checkout of `ProtocolCanary-Fixtures` (`--fixtures-dir`). | `fixtures` |
-| `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.1.1` |
+| `rpc-max-retries` | Maximum retries after a failed RPC request (`--rpc-max-retries`). `0` disables retries; accepted range is 0 to 4294967295. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | Engine default (3) |
+| `rpc-retry-delay-ms` | Linear-backoff base delay between RPC retries (`--rpc-retry-delay-ms`), in milliseconds; accepted range is 0 to 9007199254740991. Forwarded with Protocol-Canary `0.3.0` or newer; older engines ignore it with a warning. | Engine default (500) |
+| `fixtures-dir` | Path to a directory of fixtures, e.g. a checkout of `ProtocolCanary-Fixtures` (`--fixtures-dir`). Resolved against the job's working directory and validated **before** the engine version is resolved or installed: it must name an existing directory. A missing directory fails the run immediately with an error naming `fixtures-dir` and the resolved absolute path; with `allow-empty: true` a missing directory only warns (naming the input and path) and the run continues; a path that exists but is not a directory (e.g. a regular file) is always rejected, even with `allow-empty: true`. | `fixtures` |
+| `fixture` | Run only the fixture with this exact id (`--fixture=<id>`) — the usual way to reproduce one failing check in CI. Empty/whitespace means unset; must not contain control characters (no other restrictions — the value is passed as one `--flag=value` argument, so an id beginning with `-` is safe). **Requires an engine release whose `check` accepts `--fixture`:** while no released Protocol-Canary supports it (today's state), setting this fails the run *before* install/run, naming the input and resolved `version` — the Action never silently runs the whole suite instead. | (none) |
+| `surface` | Run only fixtures of this surface (`--surface=`): exactly `xdr`, `rpc`, or `soroban` (lower case, as the engine accepts); anything else fails with an input error naming the accepted values. Same pre-run engine gate as `fixture`: rather than checking every surface, the Action fails before installing or running. | (none) |
+| `cache-dir` | Directory for cached fixture results (`--cache-dir=`), forwarded to the engine **unchanged**: a relative path is resolved by the *engine* against `--project-root` when one is given — not against `GITHUB_WORKSPACE`, `fixtures-dir`, or a future `working-directory` input (#348). Missing directories are created by the engine; a path that is an existing file is rejected by the engine; it may be combined with the engine's cache-disabling flag (the engine accepts both, though this Action does not yet expose `--no-cache` as an input). Empty/whitespace means unset; control characters are rejected. Same pre-run engine gate as `fixture`: an unsupported engine fails the run rather than caching results somewhere you did not ask for. | (none) |
+| `version` | `Protocol-Canary` version to install, without a leading `v`. Pinned — never tracks `main`. | `0.2.0` |
 | `upload-report` | Upload the JSON report as a workflow artifact. | `true` |
+| `report-retention-days` | Duration in days (integer 1 to 90) to retain the uploaded JSON report artifact. If omitted, the repository's default retention is used. | (repository default) |
 | `annotations` | Emit GitHub annotations for failures/warnings/errors. | `true` |
+| `diagnostics` | Opt in to a best-effort redacted diagnostics log bundle when Canary cannot produce a usable report. Strictly opt-in: the artifact is downloadable by anyone who can read the repository, and the process environment is never included. | `false` |
 | `allow-empty` | Let a run that executes no checks pass (`--allow-empty`). Only meaningful with `version: 0.2.0` or newer, which fail such a run by default; older versions already pass it, so the flag is not forwarded to them. | `false` |
-| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
-| `github-token` | GitHub token used to authenticate read-only requests to `api.github.com` for version resolution and checksum discovery, raising GitHub API rate limits. Defaults to `${{ github.token }}`. Pass an empty string (`""`) to disable authenticated requests. Requires only `contents: read` permission and works on fork pull requests. | `${{ github.token }}` |
+| `fail-on-warning` | Treat Protocol Canary warnings as failures (`--fail-on-warning`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
+| `offline` | Skip network-dependent fixtures (`--offline`). Currently ignored with a warning until a Protocol-Canary release supports the flag. | `false` |
+| `junit-report` | Render the JSON report to JUnit XML using the engine's own `stellar-canary report <file> --format junit` command and expose the file as the `junit-report-path` output. Written next to the JSON report and included in the artifact when `upload-report` is `true`. **Minimum engine version:** the release that adds `report --format junit` (Protocol-Canary #434; not in `0.2.0`) — with an older engine nothing is produced and a warning is logged. Any failure (unsupported engine, non-zero exit, empty output, missing report file) is a warning only: it never changes `status` and never fails the job. | `false` |
+| `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
+| `github-token` | Optional token for read-only requests to `api.github.com` for version resolution and checksum discovery. Set it to `${{ github.token }}` to authenticate (requires `contents: read`); otherwise requests are unauthenticated unless `GITHUB_TOKEN` is present in the environment. Pass an empty string (`""`) to disable authentication. | (none) |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
-| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected here, unlike `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
+| `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected, as with `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
+| `baseline-report` | Path to a previous Protocol Canary JSON report. The file must exist and be a schemaVersion 1 report for the same target protocol as this run. **Validated only**: the engine's `diff` command is not released yet (#335), so no regression verdict is produced. A missing, malformed, or protocol-incompatible baseline fails the run with an actionable annotation. | (none) |
+| `generate-receipt` | Generate a machine-readable Execution Receipt (provenance: engine version, engine build commit, fixture-pack digest, target protocol, observed protocol, timestamp) and upload it as the `stellar-canary-receipt-<run-id>` artifact; `receipt-path` carries the file location. | `false` |
+| `strict-integrity` | Fail-closed integrity policy. When `true`, the run aborts whenever binary integrity cannot be proven (no published checksum manifest, no entry for this platform, or a checksum lookup that could not be completed); when `false` it degrades to commit/tag pinning with a debug note. A checksum mismatch aborts the run in either mode. A checksum verifies data integrity, not the release author's identity. See [`docs/security-model.md`](docs/security-model.md). | `false` |
+| `pr-comment` | Opt in to a bounded pull request summary comment. Requires `pull-requests: write` on same-repository `pull_request` workflows; fork PRs and other events are skipped, and permission failures are warnings, not failed checks. | `false` |
 
 There is deliberately no `format` input: the Action always requests
 `--format json` from the CLI (the only way it can build the summary and
@@ -177,7 +194,27 @@ literals below.
 | `replayed-count` | Number of checks whose results were replayed from Protocol Canary's result cache instead of being executed in this run. Engines whose reports predate the cache always report `0`. Explicitly set to `0` on an execution failure, like the other counts. | `"3"` |
 | `engine-version` | Protocol Canary engine version that produced the result, read from the installed binary. On an execution failure, set to the resolved version if installation succeeded, or an empty string if installation failed. | `"0.1.1"` |
 | `observed-protocol` | Stellar protocol version reported by the network during live checks (`network.observedProtocol`), or an empty string when the report has no network object. Explicitly set to an empty string on an execution failure. | `"28"` |
-| `report` | Absolute path to the generated JSON report file. Only set when Canary produced output to parse; empty/unset on an execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report.json` |
+| `pack-protocol` | Protocol version of the resolved fixture pack, from `fixturePack.protocol` in the report or the `fixtures-pack-protocol` input. Empty when no pack identity is recorded. | `"28"` |
+| `pack-version` | Release tag/version of the resolved fixture pack, from `fixturePack.version`/`tag` or the `fixtures-pack-version` input. Empty when no pack identity is recorded. | `"v1.2.0"` |
+| `pack-digest` | Canonical content digest of the resolved fixture pack, formatted as `sha256:<64 lowercase hex>`, when the report records one. Empty when no digest is recorded or the recorded value is malformed; the Action never fabricates a digest. | `"sha256:…"` |
+| `report` | Absolute path to the JSON report file this invocation wrote. The file is uniquely named per invocation (see below), so it is never shared with another Action step. Only set when Canary produced output to parse and the report file was written successfully; empty/unset on report write failure or execution failure (`status` `execution-failed`). | `/home/runner/work/_temp/stellar-canary-report-canary-check-4b9c1d2e3f4a5b6c.json` |
+| `receipt-path` | Absolute path to the invocation-specific Execution Receipt JSON (each invocation writes a distinct file under `RUNNER_TEMP`, so subsequent steps cannot overwrite it). Set only when `generate-receipt` is `true` and Canary produced a parseable report; unset otherwise, including on an execution failure. | `/home/runner/work/_temp/stellar-canary-receipt-<unique>.json` |
+| `junit-report-path` | Absolute path to the generated JUnit XML file. Only set when `junit-report` is `true` **and** the engine's render succeeded; unset otherwise (input disabled, engine without the command, failed/empty render) and on an execution failure. A failed render is always a warning, never a status change. | `/home/runner/work/_temp/stellar-canary-report.junit.xml` |
+| `artifact-name` | Name of the uploaded report artifact. Reflects the fallback name if a collision occurred. Empty string when upload was disabled or failed, or on an execution failure. | `"stellar-protocol-canary-report"` |
+| `artifact-id` | GitHub artifact ID of the uploaded report artifact. Empty string when upload was disabled or failed, if the client did not return an ID, or on an execution failure. | `"12345678"` |
+| `coverage-state` | How completely the fixture set was exercised: `full` (every discovered fixture ran, none skipped), `partial` (something ran, but fixtures were skipped), or `none` (nothing ran — an empty run or an execution failure). | `"full"` |
+
+`coverage-state` is meant for a job that gates a promotion on *coverage*
+rather than on the verdict alone — a `pass` with `coverage-state: partial`
+means Canary only exercised part of the fixture set:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  id: canary
+- name: Require full fixture coverage before promoting
+  if: steps.canary.outputs.coverage-state != 'full'
+  run: echo "Coverage was ${{ steps.canary.outputs.coverage-state }}, not full — see the JSON report artifact."
+```
 
 A concrete consumer, using the outputs to gate a follow-up step:
 
@@ -191,7 +228,28 @@ A concrete consumer, using the outputs to gate a follow-up step:
   run: echo "${{ steps.canary.outputs.failures }} check(s) failed"
 ```
 
-> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol` is set to an empty string `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+Every Action invocation writes its report to its own uniquely named JSON
+file, directly inside the runner's temporary directory (`RUNNER_TEMP`,
+falling back to the system temp directory). The filename is
+`stellar-canary-report-<step>-<random>.json`, where `<step>` is the
+current step's `GITHUB_ACTION` identifier sanitized to ASCII letters,
+digits, `-`, and `_`, and `<random>` is a short cryptographically random
+suffix. Multiple Action steps in the same job therefore never overwrite
+each other's reports, and the `report` output always contains the
+absolute path of the file *that* invocation wrote — so a later step can
+safely read or upload an earlier step's report:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  id: canary
+  with:
+    protocol: "28"
+- name: Read the report from a later step
+  run: jq .status "${{ steps.canary.outputs.report }}"
+```
+
+> **Note:** When `status` is `execution-failed`, the numeric outputs (`passed`, `warnings`, `failures`, `errors`, `total`, `skipped`, `replayed-count`) are all explicitly set to the string `"0"`, `observed-protocol`, `pack-protocol`, `pack-version`, and `pack-digest` are set to empty strings `""`, `artifact-name` and `artifact-id` are set to empty strings `""`, and `engine-version` is set to the resolved version if installation succeeded or `""` if installation failed. They do **not** represent a real count of zero compatibility issues — they indicate that Canary never produced a report at all. Always check `status` first before relying on the counts.
+> `coverage-state` is set on that path too, always as `none`, so a consumer never has to distinguish "unset" from "no coverage".
 
 ## How failures appear
 
@@ -253,7 +311,9 @@ Canary version: 0.1.1
 
 <details><summary>Skipped fixtures</summary>
 
-- `p27-xdr-legacy` (xdr) — fixture targets protocol 27, this run targets protocol 28
+| Reason code | Fixture | Surface | Reason |
+|---|---|---|---|
+| `UNSUPPORTED_PROTOCOL` — Unsupported protocol | `p27-xdr-legacy` | xdr | fixture targets protocol 27, this run targets protocol 28 |
 
 </details>
 ```
@@ -351,10 +411,13 @@ what to do about each.
 | `Canary produced no output to parse as a JSON report.` / `Canary's output could not be parsed as JSON: …` | Canary exited without emitting a valid JSON report on stdout — killed mid-run, crashed, or a release this Action cannot parse. | Re-run the job. The step log shows the exact command the Action ran; run it locally to see Canary's stderr. Check that `version` is one of the releases in the [supported versions table](#supported-canary-versions) — older releases' reports predate the `counts` field this Action accepts. |
 | `Unsupported report schemaVersion N (this Action supports schemaVersion 1).` | The installed Canary release emits a newer report schema than this Action understands. | Pin `version` to a release from the supported versions table, or wait for a release of this Action that declares support for the new schema (schema changes are called out in [Versioning](#versioning)). |
 | `Configuration file not found: <path>` | The `config` input names a file that does not exist. | Fix the path (it is resolved against the job's working directory) or check out the file before this step. |
+| `The "fixture" input is set, but Canary X cannot honour it: …` (also `"surface"`, `"cache-dir"`) | You set one of the scope/cache inputs, but the resolved `version` cannot accept it — today **no released Protocol-Canary supports these flags** (they exist only on the engine's `main`), so the Action fails before installing or running anything. Unlike `allow-empty` (ignored with a note, because it only relaxes a check), silently dropping a filter would report success for a *different* scope than you asked for, so this fails closed. | Remove the input, or set `version` to a release that supports the flag once a maintainer names one on [#458](https://github.com/StellarCanary/ProtocolCanary-Action/issues/458). The message names the input, the resolved version, and the minimum supporting release (or that none exists yet). |
+| ``Invalid "fixtures-dir" input: the fixtures directory <path> does not exist.`` | The `fixtures-dir` input (default `fixtures`) names a directory that is not there. The check runs after input parsing and before version resolution or installation, so no engine was installed or run and there are no engine diagnostics. | Point `fixtures-dir` at an existing directory (resolved against the job's working directory) — typically by checking out `ProtocolCanary-Fixtures` first — or set `allow-empty: true` to downgrade a missing directory to a warning. If the path exists but is a regular file, the message says it "is not a directory" instead. |
 | `Failed to publish Canary summary.` | The GitHub job summary could not be written — an infrastructure problem, distinct from both failure kinds above. | Re-run the job; if it reproduces on a GitHub-hosted runner, file a bug with the run link. |
 
-`Invalid "…" input` messages (`protocol`, `config`, `rpc-url`, `version`,
-`timeout-minutes`, and the boolean inputs) state the expected format in
+`Invalid "…" input` messages (`protocol`, `config`, `rpc-url`, `fixtures-dir`, `surface`,
+`fixture`, `cache-dir`, `version`, `timeout-minutes`, and the boolean
+inputs) state the expected format in
 the message itself; see [Inputs](#inputs) for each input's accepted
 values.
 
@@ -376,10 +439,23 @@ in GitHub Actions collapsed log groups:
   disabled via `::stop-commands::` using fresh random tokens to prevent command
   injection.
 
+- **Credential masking:** When an `rpc-url` input contains credentials in userinfo
+  (`user:password@host`), query parameter values, or a fragment, the Action registers
+  these sensitive values with the GitHub Actions runner via `core.setSecret()`. The
+  complete credential-bearing URL is also registered when sensitive components are
+  present. Plain RPC URLs without userinfo, query parameters, or a fragment are
+  unaffected. GitHub Actions runner masking is best effort — very short values may
+  not be masked due to runner limitations. Users should continue using GitHub Actions
+  secrets for RPC credentials and avoid intentionally printing sensitive values.
+
 ## Timeouts
 
 The `timeout-minutes` input bounds the time this Action spends on the two
-long-running operations it controls:
+long-running operations it controls. It must be a whole number from 1 to
+35791 minutes: the value is multiplied by 60,000 and handed to Node's
+`setTimeout`, which clamps any delay above 2,147,483,647 ms and would fire
+the timer after 1 ms, ending the run almost immediately — so values above
+35791 are rejected up front. The default is 15.
 
 - **The Canary process** (`stellar-canary check`): terminated when it runs
   longer than `timeout-minutes`.
@@ -440,6 +516,14 @@ per invocation instead of silently dropping every upload after the first.
 Downloading a specific report from a multi-invocation run therefore means
 matching the suffix — either the protocol/network/config it checked, or the
 generated unique suffix when the invocations share the same inputs.
+Workflows can also read `steps.<id>.outputs.artifact-name` to get the exact
+artifact name actually used (including any fallback suffix), and
+`steps.<id>.outputs.artifact-id` to get the artifact ID (which is also linked
+directly in the job summary when available).
+
+Retention of the report artifact can be configured using `report-retention-days`
+(an integer between 1 and 90). When omitted, the repository's default artifact
+retention applies.
 
 ## Installation & integrity
 
@@ -490,18 +574,23 @@ Prefer `@v1` to receive fixes automatically within `v1`; pin to an exact
 tag like `@v1.2.3` when you need full reproducibility (consistent with the
 `version` input, which is pinned and never tracks `main`).
 
-### Supported Canary versions
+### Engine defaults and compatibility status
 
-| Action | Protocol-Canary |
-|---|---|
-| v1 | `0.1.1` (default; `0.1.0` also installable, but predates the `ContractExecutable` XDR type two current Protocol 28 fixtures require, and its report predates the `counts` field) |
+| Action line | Engine default | Compatibility status |
+|---|---|---|
+| v1 | `0.1.1` | Legacy default. `0.1.0` is installable but predates the `ContractExecutable` XDR type required by current Protocol 28 fixtures and its report predates `counts`. |
+| v2 (prepared) | `0.2.0` | Migration target; end-to-end consumer verification is pending. |
 
-The dated evidence behind each row — the runs, engine tags and fixture
-pack that were executed — lives in
-[`docs/releases.md`](docs/releases.md); no version is added to this table
-before a consumer run with that engine version has actually passed there.
-(`0.2.0` is released upstream but not yet verified end to end from a
-consumer run by this Action; see [`docs/releases.md`](docs/releases.md).)
+The dated evidence behind compatibility claims — the runs, engine tags and
+fixture pack that were executed — lives in [`docs/releases.md`](docs/releases.md).
+The offline engine suites passed for `0.1.1` and `0.2.0`, but neither consumer
+workflow passed its action-load/install path as of the recorded runs; the
+versions above are defaults, not a claim of end-to-end consumer verification.
+The v2 line changes the default engine and must be released under the `v2`
+major tag; do not retarget the floating `v1` tag. See the [v2 migration
+guide](docs/migrating-to-v2.md) before opting into it. Consumer-style checks
+have not yet passed with either engine version; the recorded 2026-10-20 runs
+and their loader error are in [`docs/releases.md`](docs/releases.md).
 
 This table will grow as `Protocol-Canary` cuts new releases; a
 `schemaVersion` change to its JSON report is a breaking change for this
@@ -559,9 +648,17 @@ comparison, fixture releases, project roots) are specified in
 Repositories that want a single-declaration compatibility check can call the
 maintained reusable workflow; its inputs, outputs, and matrix, monorepo, and
 PR-gating examples are documented in
-[`docs/reusable-workflow.md`](docs/reusable-workflow.md).
+[`docs/reusable-workflow.md`](docs/reusable-workflow.md), together with
+[what your pin of that workflow guarantees](docs/reusable-workflow.md#what-your-pin-guarantees-457)
+— release stamping keeps the workflow's internal Action reference aligned
+with the release you pinned (#457).
 The Action's integrity guarantees, trust boundaries, and `strict-integrity` fail-closed policy are documented in [`docs/integrity-model.md`](docs/integrity-model.md).
 
 ## License
 
 [Apache-2.0](LICENSE)
+
+
+### Optional pull request comment (experimental)
+
+Set `pr-comment: "true"` to request a bounded copy of the existing escaped job summary as a pull request comment. The default is `false`. Same-repository `pull_request` jobs require `pull-requests: write`; fork PRs and non-PR events do not post comments. Missing permissions cause a warning without failing the check. The comment is capped at 60,000 characters and updates an existing bot-authored comment for the workflow/job where found. This feature is pending maintainer security approval and is not ready for production use.

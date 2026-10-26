@@ -30,6 +30,57 @@ const WORKFLOW_PATH = path.join(REPO_ROOT, ".github", "workflows", "test-reusabl
 const REUSABLE_PATH = path.join(REPO_ROOT, ".github", "workflows", "reusable-canary-check.yml");
 const SAMPLE_ROOT = path.join(REPO_ROOT, "tests", "fixtures", "conformance-project");
 
+/**
+ * #522: prerequisites the scripts under test need on PATH. `bash` runs the
+ * extracted step scripts, `jq` parses the GitHub artifacts listing inside
+ * `fetch-report-artifact`, and `python3` builds and unpacks the zip
+ * fixtures. GitHub-hosted runners ship all three, so CI is unaffected; on
+ * a local machine without one of them these tests used to fail with a
+ * misleading assertion ("the artifacts listing is not valid JSON") that
+ * pointed at the fixture rather than the missing tool.
+ *
+ * A missing tool therefore skips exactly the tests that need it, with the
+ * reason in the test title — unless `CI` is set, in which case the whole
+ * file fails with one clear error naming the tool, so a runner image that
+ * loses `jq` can never silently skip the conformance tests.
+ */
+const REQUIRED_TOOLS = ["bash", "jq", "python3"] as const;
+
+type RequiredTool = (typeof REQUIRED_TOOLS)[number];
+
+function detectMissingTools(): RequiredTool[] {
+  const missing: RequiredTool[] = [];
+  for (const tool of REQUIRED_TOOLS) {
+    const probe = spawnSync(tool, ["--version"], { encoding: "utf8" });
+    if (probe.error !== undefined || (probe.status ?? 1) !== 0) {
+      missing.push(tool);
+    }
+  }
+  return missing;
+}
+
+const MISSING_TOOLS = detectMissingTools();
+
+if (MISSING_TOOLS.length > 0 && process.env.CI) {
+  throw new Error(
+    `The reusable-workflow conformance tests require ${REQUIRED_TOOLS.join(", ")} on PATH, but ` +
+      `${MISSING_TOOLS.join(", ")} ${MISSING_TOOLS.length > 1 ? "are" : "is"} missing on this runner. ` +
+      "GitHub-hosted runners include all of them; install the missing tool(s) so the conformance " +
+      "tests cannot be silently skipped in CI.",
+  );
+}
+
+/** Declares an `it` that is skipped — with the missing tool named in the
+ * test title — when any tool in `tools` is absent and `CI` is not set. */
+function itNeeds(tools: readonly RequiredTool[], title: string, fn: () => Promise<void> | void): void {
+  const absent = tools.filter((tool) => MISSING_TOOLS.includes(tool));
+  const label =
+    absent.length === 0
+      ? title
+      : `${title} [skipped: ${absent.join(", ")} not on PATH; install ${absent.join(", ")} to run this test]`;
+  it.skipIf(absent.length > 0)(label, fn);
+}
+
 function workflowSource(): string {
   if (!fs.existsSync(WORKFLOW_PATH)) {
     throw new Error(`Missing shipped workflow: ${WORKFLOW_PATH}`);
@@ -239,7 +290,10 @@ describe("test-reusable-workflow conformance (#370)", () => {
     }
   });
 
-  it("fetch-report-artifact unpacks the shipped JSON report from a real run artifact", () => {
+  itNeeds(
+    ["bash", "jq", "python3"],
+    "fetch-report-artifact unpacks the shipped JSON report from a real run artifact",
+    () => {
     const script = extractRunScript(workflowSource(), "fetch-report-artifact");
     const zip = reportZipFixture();
     const result = runScript(
@@ -252,7 +306,10 @@ describe("test-reusable-workflow conformance (#370)", () => {
     expect(result.status).toBe(0);
   });
 
-  it("fetch-report-artifact fails closed when the run produced no report artifact", () => {
+  itNeeds(
+    ["bash", "jq"],
+    "fetch-report-artifact fails closed when the run produced no report artifact",
+    () => {
     const script = extractRunScript(workflowSource(), "fetch-report-artifact");
     const empty = JSON.stringify({ total_count: 0, artifacts: [] });
     const result = runScript(
@@ -265,7 +322,10 @@ describe("test-reusable-workflow conformance (#370)", () => {
     expect(result.stdout + result.stderr).toContain("stellar-protocol-canary-report");
   });
 
-  it("fetch-report-artifact ignores artifacts from other workflow runs", () => {
+  itNeeds(
+    ["bash", "jq"],
+    "fetch-report-artifact ignores artifacts from other workflow runs",
+    () => {
     const script = extractRunScript(workflowSource(), "fetch-report-artifact");
     const otherRun = JSON.stringify({ total_count: 1, artifacts: [{ id: 1, name: "stellar-protocol-canary-report", workflow_run: { id: 7 } }] });
     const result = runScript(
@@ -277,7 +337,10 @@ describe("test-reusable-workflow conformance (#370)", () => {
     expect(result.stdout + result.stderr).toContain("::error::");
   });
 
-  it("fetch-report-artifact fails when the API itself is unreachable", () => {
+  itNeeds(
+    ["bash"],
+    "fetch-report-artifact fails when the API itself is unreachable",
+    () => {
     const script = extractRunScript(workflowSource(), "fetch-report-artifact");
     const result = runScript(
       script,
@@ -288,7 +351,10 @@ describe("test-reusable-workflow conformance (#370)", () => {
     expect(result.stdout + result.stderr).toContain("::error::");
   });
 
-  it("verify-outputs accepts a documented-conformant successful run", () => {
+  itNeeds(
+    ["bash", "python3"],
+    "verify-outputs accepts a documented-conformant successful run",
+    () => {
     const script = extractRunScript(workflowSource(), "verify-outputs");
     const zip = reportZipFixture();
     // Stage the unpacked artifact the fetch step would have produced.
@@ -303,14 +369,20 @@ describe("test-reusable-workflow conformance (#370)", () => {
     expect(result.stdout).toContain("conformance");
   });
 
-  it("verify-outputs fails closed on a simulated runner failure", () => {
+  itNeeds(
+    ["bash"],
+    "verify-outputs fails closed on a simulated runner failure",
+    () => {
     const script = extractRunScript(workflowSource(), "verify-outputs");
     const result = runScript(script, outputsEnv({ CANARY_OUTCOME: "failure", CANARY_EXIT_CODE: "1" }));
     expect(result.status).not.toBe(0);
     expect(result.stdout + result.stderr).toContain("::error::");
   });
 
-  it("verify-outputs rejects off-contract outputs", () => {
+  itNeeds(
+    ["bash"],
+    "verify-outputs rejects off-contract outputs",
+    () => {
     const script = extractRunScript(workflowSource(), "verify-outputs");
     const cases: StepEnv[] = [
       { CANARY_EXIT_CODE: "7" },
@@ -326,7 +398,10 @@ describe("test-reusable-workflow conformance (#370)", () => {
     }
   });
 
-  it("verify-outputs fails when the artifact tree holds no valid report", () => {
+  itNeeds(
+    ["bash"],
+    "verify-outputs fails when the artifact tree holds no valid report",
+    () => {
     const script = extractRunScript(workflowSource(), "verify-outputs");
     const work = fs.mkdtempSync(path.join(os.tmpdir(), "l75-verify-empty-"));
     fs.mkdirSync(path.join(work, "unpacked"));

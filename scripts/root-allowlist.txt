@@ -10,6 +10,7 @@
 
 .gitattributes
 .gitignore
+.licenses-allowlist.json
 .nvmrc
 action.yml
 CHANGELOG.md
@@ -21,5 +22,6 @@ package-lock.json
 package.json
 README.md
 SECURITY.md
+stryker.config.json
 tsconfig.json
 vitest.config.ts

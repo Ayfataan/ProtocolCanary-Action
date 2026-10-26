@@ -53,7 +53,6 @@ function makeReceipt(overrides: Record<string, unknown> = {}) {
 function verdictOf(result: ReturnType<typeof verifyReceipt>, field: string) {
   const entry = result.fields.find((f) => f.field === field);
   expect(entry).toBeDefined();
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
   return entry!;
 }
 

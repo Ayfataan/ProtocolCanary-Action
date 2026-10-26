@@ -25,6 +25,7 @@ jobs:
   real-engine:
     name: Action against Protocol-Canary ${{ inputs.engine_ref }} and ${{ inputs.legacy_ref }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
