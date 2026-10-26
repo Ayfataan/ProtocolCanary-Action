@@ -655,21 +655,27 @@ interface ExitCodeInfo {
  * Canary's actual pass/fail decision.
  */
 const EXIT_CODES: Readonly<Record<number, ExitCodeInfo>> = {
-  0: { category: "pass", description: "Compatibility checks passed." },
+  0: { category: "pass", description: "Every applicable check passed." },
   1: {
     category: "compatibility_failure",
-    description: "Test failures detected: a compatibility assertion failed.",
+    description: "At least one fixture's compatibility assertion failed — a real incompatibility was found.",
   },
   2: {
     category: "configuration_error",
-    description: "Regression gate triggered or Canary configuration is invalid.",
+    description: "The invocation was unusable or no check applied, so no checks ran.",
   },
   3: {
     category: "execution_error",
-    description: "Unexpected runtime crash: execution or RPC communication failed.",
+    description: "At least one check could not complete — it was executed but hit an XDR, RPC, or Soroban execution problem.",
   },
-  4: { category: "invalid_fixture", description: "One or more fixtures are invalid." },
-  5: { category: "internal_error", description: "Canary encountered an internal error." },
+  4: {
+    category: "invalid_fixture",
+    description: "A fixture file failed to load or validate, so the run never started.",
+  },
+  5: {
+    category: "internal_error",
+    description: "An internal error unrelated to configuration, fixtures, or the three compatibility surfaces.",
+  },
 };
 
 /**

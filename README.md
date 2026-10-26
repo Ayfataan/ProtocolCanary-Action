@@ -507,8 +507,10 @@ handles this automatically: **the first invocation keeps the stable name
 `stellar-protocol-canary-report`**, and a later invocation whose upload is
 rejected because that name is taken retries under a suffixed name derived
 from the inputs that distinguish it, for example
-`stellar-protocol-canary-report-protocol-28-network-testnet`. (When no
-inputs distinguish the invocation, a short unique suffix is used instead.)
+`stellar-protocol-canary-report-protocol-28-network-testnet`. If multiple
+invocations share the same differentiator, subsequent collisions append a
+short unique suffix so no report is dropped. (When no inputs distinguish
+the invocation, a short unique suffix is used instead.)
 
 This means existing single-step workflows keep the exact artifact name
 they have always had, while multi-invocation workflows collect one report
