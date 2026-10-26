@@ -32,10 +32,43 @@ jobs:
       fixtures-version: v1.2.0
 ```
 
-Pin the `uses:` ref to a tag (`@v1`) or commit SHA. A reusable workflow
+Pin the `uses:` ref to a tag (`@v1`), an exact release tag (`@v1.2.3`),
+or a commit SHA. A reusable workflow
 cannot be called with `uses: ./...` from another repository, and a caller's
 `permissions` can only narrow, never widen, the workflow's own
 `contents: read`.
+
+### What your pin guarantees (#457)
+
+The Action reference *inside* `reusable-canary-check.yml` is fixed text — a
+`uses:` value cannot contain an expression — so on `main` it reads
+`uses: StellarCanary/ProtocolCanary-Action@v1`, the **stamp template**. The
+release workflow stamps it: for every release tag it creates a **stamped
+commit** whose workflow file refers to the Action at that release's own
+commit SHA (a literal 40-hex value, marked `# release-stamp: <tag>`), then
+moves the release tag — and the floating `v1` tag — to that stamped commit.
+
+| You call the workflow at | The Action that runs |
+|---|---|
+| an exact release tag (`@v1.2.3`) | the commit that release shipped: the stamped workflow file contains that release's SHA as literal text, so the guarantee is readable off the ref you pinned |
+| the stamped commit's own SHA | the same, read directly from the workflow file at that SHA |
+| `@v1` (floating) | whatever release `v1` points at when the job runs — reproducible only if you pin to an exact tag or SHA |
+| a branch (`main`) | the `@v1` template: the Action floats with `v1` |
+
+Notes on the model:
+
+- Nothing in any `uses:` value is computed from a context, and no local
+  `uses: ./...` path is used without checking out this repository at a known
+  ref.
+- The stamped commit is not on `main`'s branch history — only the release
+  tags point at it. The workflow file changes there and nothing else, so the
+  stamped commit runs the exact code the release verified.
+- Re-running a release is idempotent: a workflow already carrying its
+  `# release-stamp:` marker is never stamped again, so moving the tag cannot
+  loop.
+- Stamping happens only in the release job, which holds `contents: write`
+  for exactly that tag push. The reusable workflow itself — and every caller
+  of it — keeps `permissions: contents: read`.
 
 Reusable workflows do not accept `runs-on`, `environment`, or job-level
 `timeout-minutes` overrides from the caller. The job runs on
@@ -51,7 +84,7 @@ single-step Action (see the README's
 | `protocol` | number | `28` | Target Stellar protocol version, forwarded as the Action's `protocol` input. |
 | `fixtures-version` | string | `""` | Fixture-pack release tag, e.g. `v1.2.0`. Validated by the Action, but **not forwarded to the engine**: `stellar-canary` has no fixture-pack flag, so the run still reads `<project-root>/fixtures`. Check that pack out into `fixtures-dir` to pin it. |
 | `fail-on-warning` | boolean | `false` | Promote a `warning` result to a failed calling job. |
-| `baseline-report` | string | `""` | Path to a previous report. Accepted for forward compatibility; the engine's diff command is not released, so a supplied baseline leaves `diff-verdict` as `unavailable` and the run is not compared. |
+| `baseline-report` | string | `""` | Path to a previous report. The Action validates that the file exists and is a schemaVersion 1 report for the same target protocol; the engine's diff command is not released, so a supplied baseline leaves `diff-verdict` as `unavailable` and the run is not compared. |
 
 `config` is not an input: the workflow passes `<project-root>/.stellar-canary.toml`
 only when that file exists, so a project without a configuration file keeps
@@ -92,9 +125,11 @@ jobs:
 
 ## Limitations
 
-- `baseline-report` and `fixtures-version` are declared and validated, but
-  the current engine release has no `diff` or fixture-pack command to forward
-  them to. The workflow warns rather than silently pretending they applied.
+- `baseline-report` is validated by the Action (existence, report shape, and
+  target protocol), but the current engine release has no `diff` command, so
+  no regression verdict is produced. `fixtures-version` is validated but has
+  no fixture-pack command to forward to. The workflow warns rather than
+  silently pretending they applied.
 - `project-root` currently scopes configuration and fixture discovery only;
   the Action has no `working-directory` input yet (issue #348). A project
   whose `.stellar-canary.toml` and fixtures live outside those paths needs

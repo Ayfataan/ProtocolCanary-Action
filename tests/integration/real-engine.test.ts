@@ -66,6 +66,7 @@ const ENV_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
@@ -95,12 +96,16 @@ function engineVersion(binary: string): string {
   return match[1] as string;
 }
 
-function setUp(binary: string, version: string, inputs: Record<string, string>): Run {
+function setUp(binary: string, version: string, inputs: Record<string, string>, omitVersion = false): Run {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-real-"));
   const cargoHome = path.join(workDir, "cargo-home");
   fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
-  fs.copyFileSync(binary, path.join(cargoHome, "bin", "stellar-canary"));
-  fs.chmodSync(path.join(cargoHome, "bin", "stellar-canary"), 0o755);
+  const exeName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
+  const destPath = path.join(cargoHome, "bin", exeName);
+  fs.copyFileSync(binary, destPath);
+  if (process.platform !== "win32") {
+    fs.chmodSync(destPath, 0o755);
+  }
 
   const runnerTemp = path.join(workDir, "runner-temp");
   fs.mkdirSync(runnerTemp, { recursive: true });
@@ -111,11 +116,14 @@ function setUp(binary: string, version: string, inputs: Record<string, string>):
   fs.writeFileSync(SUMMARY_PATH, "");
 
   for (const key of ENV_KEYS) delete process.env[key];
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   process.env.CARGO_HOME = cargoHome;
   process.env.RUNNER_TEMP = runnerTemp;
   process.env.GITHUB_OUTPUT = outputPath;
   process.env.GITHUB_STEP_SUMMARY = SUMMARY_PATH;
-  process.env.INPUT_VERSION = version;
+  if (!omitVersion) {
+    process.env.INPUT_VERSION = version;
+  }
   process.env.INPUT_PROTOCOL = "28";
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env.INPUT_ANNOTATIONS = "true";
@@ -131,11 +139,14 @@ function setUp(binary: string, version: string, inputs: Record<string, string>):
   warningMock.mockClear();
   infoMock.mockClear();
 
-  return { workDir, outputPath, reportPath: () => path.join(runnerTemp, "stellar-canary-report.json"), emptyDir };
+  // #399: the report filename is unique per invocation, so the path is read
+  // back from the run's "report" output instead of being reconstructed.
+  return { workDir, outputPath, reportPath: () => readOutputs(outputPath).report as string, emptyDir };
 }
 
 function readOutputs(outputPath: string): Record<string, string> {
-  const lines = fs.readFileSync(outputPath, "utf8").split("\n");
+  const content = fs.readFileSync(outputPath, "utf8").replace(/\r\n/g, "\n");
+  const lines = content.split("\n");
   const outputs: Record<string, string> = {};
   for (let i = 0; i < lines.length; i++) {
     const match = /^([A-Za-z_][A-Za-z0-9_]*)<<(.+)$/.exec(lines[i] ?? "");
@@ -153,24 +164,50 @@ function readOutputs(outputPath: string): Record<string, string> {
   return outputs;
 }
 
+function resolveBinary(envName: string): string | undefined {
+  const raw = process.env[envName];
+  if (!raw || raw.trim() === "") {
+    return undefined;
+  }
+  let candidate = raw.trim();
+  if (process.platform === "win32" && /^\/[a-zA-Z]\//.test(candidate)) {
+    candidate = `${candidate[1]}:${candidate.slice(2)}`;
+  }
+  if (fs.existsSync(candidate)) {
+    return candidate;
+  }
+  if (process.platform === "win32" && !candidate.toLowerCase().endsWith(".exe") && fs.existsSync(`${candidate}.exe`)) {
+    return `${candidate}.exe`;
+  }
+  return undefined;
+}
+
 function suite(label: string, envName: string): void {
-  const binary = process.env[envName];
-  const enabled = binary !== undefined && binary !== "" && process.platform !== "win32";
+  const rawBinary = process.env[envName];
+  const binary = resolveBinary(envName);
+  const enabled = binary !== undefined;
+  const skipReason = !enabled
+    ? rawBinary && rawBinary.trim() !== ""
+      ? `binary at ${rawBinary} is absent`
+      : `${envName} is not set`
+    : "";
   const version = enabled ? engineVersion(binary) : "0.0.0";
   const modern = engineSupportsAllowEmpty(version);
 
-  describe.skipIf(!enabled)(`Action against a real engine: ${label} (${version})`, () => {
-    let current: Run | undefined;
+  describe.skipIf(!enabled)(
+    `Action against a real engine: ${label}${enabled ? ` (${version})` : ` (skipped: ${skipReason})`}`,
+    () => {
+      let current: Run | undefined;
 
-    afterEach(() => {
-      if (current) fs.rmSync(current.workDir, { recursive: true, force: true });
-      current = undefined;
-      for (const key of ENV_KEYS) delete process.env[key];
-    });
+      afterEach(() => {
+        if (current) fs.rmSync(current.workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+        current = undefined;
+        for (const key of ENV_KEYS) delete process.env[key];
+      });
 
-    afterAll(() => {
-      fs.rmSync(SUMMARY_PATH, { force: true });
-    });
+      afterAll(() => {
+        fs.rmSync(SUMMARY_PATH, { force: true, maxRetries: 5, retryDelay: 100 });
+      });
 
     // The engine writes .stellar-canary-cache/ in the project root (the current
     // directory), so every run happens in the scratch directory, never in the
@@ -205,6 +242,16 @@ function suite(label: string, envName: string): void {
       expect(report.toolVersion).toBe(version);
       expect(report.counts.total).toBe(1);
     });
+
+    if (version === "0.2.0") {
+      it("uses the v2 default engine version when version is omitted", async () => {
+        current = setUp(binary as string, version, {}, true);
+        await runAction();
+
+        expect(setFailedMock).not.toHaveBeenCalled();
+        expect(readOutputs(current.outputPath)["engine-version"]).toBe("0.2.0");
+      });
+    }
 
     it("allow-empty: true passes an empty run on this engine, whether or not it knows the flag", async () => {
       current = setUp(binary as string, version, { "fixtures-dir": "$EMPTY", "allow-empty": "true" });

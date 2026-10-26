@@ -1,3 +1,4 @@
+import { MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES, MAX_RELEASE_ASSET_BYTES } from "../../src/http-response";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as crypto from "node:crypto";
@@ -8,14 +9,15 @@ import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+});
+
 const cacheMocks = vi.hoisted(() => ({
   isFeatureAvailableMock: vi.fn(),
   restoreCacheMock: vi.fn(),
   saveCacheMock: vi.fn(),
-}));
-
-const toolCacheMocks = vi.hoisted(() => ({
-  findMock: vi.fn(),
 }));
 
 const coreMocks = vi.hoisted(() => ({
@@ -26,8 +28,6 @@ const coreMocks = vi.hoisted(() => ({
   endGroupMock: vi.fn(),
   addPathMock: vi.fn(),
 }));
-
-const { execMock } = vi.hoisted(() => ({ execMock: vi.fn() }));
 
 const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
 
@@ -40,18 +40,14 @@ const httpsGetMock = vi.hoisted(() => vi.fn());
 // sentinel instead of the runner's real home, which varies by machine.
 const osMocks = vi.hoisted(() => ({ homedirMock: vi.fn() }));
 
-// `@actions/cache`, `@actions/exec`, and `@actions/core` are all mocked so
-// every test in this file is offline and deterministic: no GitHub cache
-// service, no Rust toolchain, and no real `stellar-canary` binary is ever
-// needed (see the issue's "fully mocked" requirement).
+// `@actions/cache` and `@actions/core` are also mocked so every test in
+// this file is offline and deterministic: no GitHub cache service, no Rust
+// toolchain, and no real `stellar-canary` binary is ever needed (see the
+// issue's "fully mocked" requirement).
 vi.mock("@actions/cache", () => ({
   isFeatureAvailable: cacheMocks.isFeatureAvailableMock,
   restoreCache: cacheMocks.restoreCacheMock,
   saveCache: cacheMocks.saveCacheMock,
-}));
-
-vi.mock("@actions/tool-cache", () => ({
-  find: toolCacheMocks.findMock,
 }));
 
 vi.mock("@actions/core", () => ({
@@ -63,15 +59,13 @@ vi.mock("@actions/core", () => ({
   addPath: coreMocks.addPathMock,
 }));
 
-vi.mock("@actions/exec", () => ({
-  exec: execMock,
-}));
-
-// `cargo install` runs through the bounded `runCheck` runner, which spawns
-// the process directly. The spawn is mocked here: the real-process timeout
-// behavior of `runCheck` is covered by runner.test.ts against the
-// mock-canary fixture; these tests only assert what `ensureCanaryInstalled`
-// passes to it and how it interprets the outcome.
+// Every child process the install chain supervises — the version probes,
+// `cargo --version`, `tar`, and `cargo install` — runs through the bounded
+// `runCheck` runner, which spawns directly (#521). The spawn is mocked
+// here: the real-process timeout behavior of `runCheck` is covered by
+// runner.test.ts against the mock-canary fixture; these tests only assert
+// what `ensureCanaryInstalled` passes to it and how it interprets the
+// outcome.
 vi.mock("node:child_process", () => ({
   spawn: spawnMock,
 }));
@@ -85,24 +79,21 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: osMocks.homedirMock };
 });
 
-import { cargoInstallTimeoutMs, ensureCanaryInstalled, prebuiltTargetTriple } from "../../src/canary";
+import {
+  httpsGetText,
+  httpsGetFile,
+  installPrebuiltRelease,
+  cargoInstallTimeoutMs,
+  ensureCanaryInstalled,
+  ensureVerifiedPack,
+  packCacheKey,
+  prebuiltTargetTriple,
+} from "../../src/canary";
 import { CARGO_INSTALL_TIMEOUT_FLOOR_MS } from "../../src/runner";
-import { CanaryNotFoundError, InstallationFailedError } from "../../src/errors";
+import { CanaryNotFoundError, InstallationFailedError, InvalidInputError } from "../../src/errors";
 import { REDACTED } from "../../src/redact";
 import type { ResolvedVersion } from "../../src/version";
 import { CANARY_API_REPO_URL, CANARY_REPO_URL } from "../../src/version";
-
-interface ExecCallOptions {
-  readonly ignoreReturnCode?: boolean;
-  readonly silent?: boolean;
-  readonly listeners?: { readonly stdout?: (data: Buffer) => void };
-}
-
-interface ExecCall {
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly options: ExecCallOptions;
-}
 
 const RESOLVED: ResolvedVersion = { version: "0.1.0", tag: "v0.1.0", commitSha: "abc123" };
 
@@ -158,6 +149,56 @@ class HungChild extends EventEmitter {
   }
 }
 
+/** A spawn result that fails to start, as when the binary is missing or
+ * not executable (`spawn` emits `error` instead of `close`). */
+class SpawnErrorChild extends EventEmitter {
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+
+  constructor(message: string) {
+    super();
+    setImmediate(() => this.emit("error", new Error(message)));
+  }
+
+  kill(): boolean {
+    return true;
+  }
+}
+
+/** Routes one mocked spawn call to the stand-in child for the command the
+ * bounded runner supervises (#521): `cargo --version`, `tar`, the
+ * `<binary> version` probe, and `cargo install`. Handlers are optional;
+ * unset commands fall back to a promptly-exiting success child. */
+function routedSpawn(
+  command: string,
+  args: readonly string[],
+  handlers: {
+    cargoVersion?: () => ChildProcess;
+    tar?: (tarArgs: readonly string[]) => ChildProcess;
+    version?: () => ChildProcess;
+    install?: () => ChildProcess;
+  },
+): ChildProcess {
+  if (command === "cargo" && args[0] === "--version") {
+    return handlers.cargoVersion?.() ?? (new ImmediateChild(0, "cargo 1.0.0\n") as unknown as ChildProcess);
+  }
+  if (command === "tar") {
+    return handlers.tar?.(args) ?? (new ImmediateChild(0) as unknown as ChildProcess);
+  }
+  if (args[0] === "version") {
+    return handlers.version?.() ?? (new ImmediateChild(0, "stellar-canary 0.1.0\n") as unknown as ChildProcess);
+  }
+  return handlers.install?.() ?? (new ImmediateChild(0) as unknown as ChildProcess);
+}
+
+/** Whether any mocked spawn call ran `cargo install` (as opposed to a
+ * probe or extraction the bounded runner also supervises). */
+function cargoInstallSpawned(): boolean {
+  return spawnMock.mock.calls.some(
+    (call) => call[0] === "cargo" && Array.isArray(call[1]) && (call[1] as string[])[0] === "install",
+  );
+}
+
 describe("cargoInstallTimeoutMs", () => {
   it("derives the bound from timeout-minutes", () => {
     expect(cargoInstallTimeoutMs(15)).toBe(15 * 60_000);
@@ -204,6 +245,8 @@ async function withPlatform<T>(platform: NodeJS.Platform, run: () => Promise<T> 
 }
 
 class FakeResponse extends EventEmitter {
+  destroy(): void { this.emit("close"); }
+  pause(): void {}
   statusCode: number;
   headers: Record<string, string> = {};
   constructor(statusCode: number) {
@@ -265,23 +308,9 @@ function sha256(filePath: string): string {
   return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
-function writeExecutable(filePath: string, contents = "binary", mode = 0o755): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  if (process.platform !== "win32") {
-    fs.chmodSync(path.dirname(filePath), 0o755);
-  }
-  fs.writeFileSync(filePath, contents, { mode });
-  if (process.platform !== "win32") {
-    fs.chmodSync(filePath, mode);
-  }
-}
-
 describe("ensureCanaryInstalled", () => {
   let tempCargoHome: string;
   let originalCargoHome: string | undefined;
-  let originalPath: string | undefined;
-  let originalToolCache: string | undefined;
-  let execCalls: ExecCall[];
   let versionProbeResults: string[];
   let versionProbeExitCode: number;
   let cargoVersionFails: boolean;
@@ -306,11 +335,7 @@ describe("ensureCanaryInstalled", () => {
     fs.mkdirSync(path.join(tempCargoHome, "bin"), { recursive: true });
     originalCargoHome = process.env.CARGO_HOME;
     process.env.CARGO_HOME = tempCargoHome;
-    originalPath = process.env.PATH;
-    process.env.PATH = "";
-    originalToolCache = process.env.RUNNER_TOOL_CACHE;
 
-    execCalls = [];
     versionProbeResults = [];
     versionProbeExitCode = 0;
     cargoVersionFails = false;
@@ -318,7 +343,6 @@ describe("ensureCanaryInstalled", () => {
     cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(false);
     cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
     cacheMocks.saveCacheMock.mockReset().mockResolvedValue(undefined);
-    toolCacheMocks.findMock.mockReset().mockReturnValue("");
     // No test in this file depends on the runner's real home directory:
     // anything reaching the homedir fallback without overriding the mock
     // sees a sentinel that must not leak into a CARGO_HOME-based path.
@@ -331,32 +355,25 @@ describe("ensureCanaryInstalled", () => {
     httpsGetMock.mockReset();
     httpsGetMock.mockImplementation(respond(404, ""));
 
-    execMock.mockReset();
-    execMock.mockImplementation(
-      async (command: string, args: string[] = [], options: ExecCallOptions = {}): Promise<number> => {
-        execCalls.push({ command, args: [...args], options });
-
-        if (command === "cargo" && args[0] === "--version") {
-          if (cargoVersionFails) {
-            throw new Error("cargo: command not found");
-          }
-          return 0;
-        }
-
-        // The version probe runs the candidate binary.
-        const version = versionProbeResults.shift() ?? "0.1.0";
-        options.listeners?.stdout?.(Buffer.from(`stellar-canary ${version}\n`));
-        return versionProbeExitCode;
-      },
-    );
-
     spawnMock.mockReset();
-    // Default: a successful, immediately-exiting install process.
-    spawnMock.mockImplementation(() => {
-      const cargoHome = process.env.CARGO_HOME ?? path.join(FAKE_HOME, ".cargo");
-      writeExecutable(path.join(cargoHome, "bin", platformBinaryName()));
-      return new ImmediateChild(0) as unknown as ChildProcess;
-    });
+    // Default routed surface (#521): `cargo --version` succeeds (or fails
+    // on demand), version probes answer from `versionProbeResults`, and any
+    // other spawn — i.e. `cargo install` — exits immediately and cleanly.
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        cargoVersion: () => {
+          if (cargoVersionFails) {
+            return new SpawnErrorChild("cargo: command not found") as unknown as ChildProcess;
+          }
+          return new ImmediateChild(0, "cargo 1.0.0\n") as unknown as ChildProcess;
+        },
+        version: () =>
+          new ImmediateChild(
+            versionProbeExitCode,
+            `stellar-canary ${versionProbeResults.shift() ?? "0.1.0"}\n`,
+          ) as unknown as ChildProcess,
+      }),
+    );
   });
 
   afterEach(() => {
@@ -366,34 +383,41 @@ describe("ensureCanaryInstalled", () => {
     } else {
       process.env.CARGO_HOME = originalCargoHome;
     }
-    if (originalPath === undefined) {
-      delete process.env.PATH;
-    } else {
-      process.env.PATH = originalPath;
-    }
-    if (originalToolCache === undefined) {
-      delete process.env.RUNNER_TOOL_CACHE;
-    } else {
-      process.env.RUNNER_TOOL_CACHE = originalToolCache;
-    }
     fs.rmSync(tempCargoHome, { recursive: true, force: true });
   });
 
   it("uses an already-installed binary when its version matches, without installing anything", async () => {
-    writeExecutable(binaryPath());
-    mockPublishedChecksums(`${sha256(binaryPath())}  stellar-canary\n`);
+    fs.writeFileSync(binaryPath(), "binary");
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed).toEqual({ binaryPath: binaryPath(), version: "0.1.0" });
-    expect(execCalls).toContainEqual(expect.objectContaining({ command: binaryPath(), args: ["version"] }));
-    expect(spawnMock).not.toHaveBeenCalled();
+    // Only the bounded version probe runs; nothing is installed.
+    expect(cargoInstallSpawned()).toBe(false);
     expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
   });
 
+  it("emits a deprecation warning for an engine strictly older than 0.1.0 (#374)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    versionProbeResults = ["0.0.9"];
+
+    await ensureCanaryInstalled({ version: "0.0.9", tag: "v0.0.9", commitSha: "abc123" });
+
+    expect(coreMocks.warningMock).toHaveBeenCalledTimes(1);
+    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("older than 0.1.0"));
+  });
+
+  it("does not warn about the default engine version 0.1.1 (#374)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    versionProbeResults = ["0.1.1"];
+
+    await ensureCanaryInstalled({ version: "0.1.1", tag: "v0.1.1", commitSha: "abc123" });
+
+    expect(coreMocks.warningMock).not.toHaveBeenCalled();
+  });
+
   it("does not reuse an already-installed binary with a different version", async () => {
-    writeExecutable(binaryPath());
-    mockPublishedChecksums(`${sha256(binaryPath())}  stellar-canary\n`);
+    fs.writeFileSync(binaryPath(), "binary");
     // The first version probe (the already-installed binary) reports a
     // stale version; after reinstalling, the probe reports the requested one.
     versionProbeResults = ["0.0.9", "0.1.0"];
@@ -404,137 +428,7 @@ describe("ensureCanaryInstalled", () => {
     expect(installArgs()[0]).toBe("install");
   });
 
-  it("discovers a checksum-verified binary in PATH", async () => {
-    const pathDirectory = path.join(tempCargoHome, "path-bin");
-    const candidatePath = path.join(pathDirectory, platformBinaryName());
-    writeExecutable(candidatePath);
-    process.env.PATH = pathDirectory;
-    mockPublishedChecksums(`${sha256(candidatePath)}  stellar-canary\n`);
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed).toEqual({ binaryPath: candidatePath, version: RESOLVED.version });
-    expect(execCalls).toContainEqual(expect.objectContaining({ command: candidatePath, args: ["version"] }));
-    expect(spawnMock).not.toHaveBeenCalled();
-  });
-
-  it("discovers a checksum-verified binary from the actions tool cache", async () => {
-    const cacheDirectory = path.join(tempCargoHome, "tool-cache", RESOLVED.version, process.arch);
-    const candidatePath = path.join(cacheDirectory, platformBinaryName());
-    writeExecutable(candidatePath);
-    toolCacheMocks.findMock.mockReturnValue(cacheDirectory);
-    process.env.RUNNER_TOOL_CACHE = tempCargoHome;
-    mockPublishedChecksums(`${sha256(candidatePath)}  stellar-canary\n`);
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(toolCacheMocks.findMock).toHaveBeenCalledWith("stellar-canary", RESOLVED.version, process.arch);
-    expect(installed).toEqual({ binaryPath: candidatePath, version: RESOLVED.version });
-    expect(execCalls).toContainEqual(expect.objectContaining({ command: candidatePath, args: ["version"] }));
-    expect(spawnMock).not.toHaveBeenCalled();
-  });
-
-  it("does not execute a PATH binary whose version mismatches the request", async () => {
-    const pathDirectory = path.join(tempCargoHome, "path-bin");
-    const candidatePath = path.join(pathDirectory, platformBinaryName());
-    writeExecutable(candidatePath);
-    process.env.PATH = pathDirectory;
-    mockPublishedChecksums(`${sha256(candidatePath)}  stellar-canary\n`);
-    versionProbeResults = ["0.0.9", RESOLVED.version];
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(execCalls).toContainEqual(expect.objectContaining({ command: candidatePath, args: ["version"] }));
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("0.0.9"));
-    expect(installArgs()[0]).toBe("install");
-  });
-
-  it("does not execute a checksum-mismatched PATH binary", async () => {
-    const pathDirectory = path.join(tempCargoHome, "path-bin");
-    const candidatePath = path.join(pathDirectory, platformBinaryName());
-    writeExecutable(candidatePath);
-    process.env.PATH = pathDirectory;
-    mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n`);
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(execCalls).not.toContainEqual(expect.objectContaining({ command: candidatePath }));
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("checksum does not match"));
-    expect(installArgs()[0]).toBe("install");
-  });
-
-  it("rejects a non-executable PATH candidate before starting a version probe", async () => {
-    if (process.platform === "win32") {
-      return;
-    }
-    const pathDirectory = path.join(tempCargoHome, "path-bin");
-    const candidatePath = path.join(pathDirectory, platformBinaryName());
-    writeExecutable(candidatePath, "binary", 0o644);
-    process.env.PATH = pathDirectory;
-    mockPublishedChecksums(`${sha256(candidatePath)}  stellar-canary\n`);
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(execCalls).not.toContainEqual(expect.objectContaining({ command: candidatePath }));
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("untrusted"));
-  });
-
-  it("rejects a PATH candidate from a group- or world-writable directory", async () => {
-    if (process.platform === "win32") {
-      return;
-    }
-    const pathDirectory = path.join(tempCargoHome, "path-bin");
-    const candidatePath = path.join(pathDirectory, platformBinaryName());
-    writeExecutable(candidatePath);
-    fs.chmodSync(pathDirectory, 0o777);
-    process.env.PATH = pathDirectory;
-    mockPublishedChecksums(`${sha256(candidatePath)}  stellar-canary\n`);
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(execCalls).not.toContainEqual(expect.objectContaining({ command: candidatePath }));
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("untrusted"));
-  });
-
-  it("rejects a symlinked PATH candidate before starting a version probe", async () => {
-    if (process.platform === "win32") {
-      return;
-    }
-    const pathDirectory = path.join(tempCargoHome, "path-bin");
-    const targetPath = path.join(tempCargoHome, "trusted-target");
-    const candidatePath = path.join(pathDirectory, platformBinaryName());
-    writeExecutable(targetPath);
-    fs.mkdirSync(pathDirectory, { recursive: true });
-    fs.chmodSync(pathDirectory, 0o755);
-    fs.symlinkSync(targetPath, candidatePath);
-    process.env.PATH = pathDirectory;
-    mockPublishedChecksums(`${sha256(targetPath)}  stellar-canary\n`);
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(execCalls).not.toContainEqual(expect.objectContaining({ command: candidatePath }));
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("untrusted"));
-  });
-
-  it("warns and safely falls back when PATH contains a relative entry", async () => {
-    process.env.PATH = `relative-entry${path.delimiter}${path.join(tempCargoHome, "missing")}`;
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(execCalls).not.toContainEqual(
-      expect.objectContaining({ command: path.join("relative-entry", platformBinaryName()) }),
-    );
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("invalid PATH entry"));
-    expect(installArgs()[0]).toBe("install");
-  });
-
-  it("installs via a spawned `cargo install` rather than @actions/exec", async () => {
+  it("installs via a spawned `cargo install` through the bounded runner", async () => {
     await ensureCanaryInstalled(RESOLVED);
 
     expect(installArgs()).toEqual([
@@ -546,9 +440,8 @@ describe("ensureCanaryInstalled", () => {
       "abc123",
       "canary-cli",
     ]);
-    // The install must go through the bounded runner; @actions/exec has no
-    // timeout support and is used only for the quick version probes.
-    expect(execCalls.some((call) => call.args[0] === "install")).toBe(false);
+    // The install goes through the bounded runner, which spawns it directly
+    // (no shell); every other helper process does too (#521).
     expect(coreMocks.warningMock).not.toHaveBeenCalled();
   });
 
@@ -606,21 +499,12 @@ describe("ensureCanaryInstalled", () => {
 
   it("ignores a cache hit whose binary has the wrong version", async () => {
     cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-    cacheMocks.restoreCacheMock.mockImplementationOnce(async (paths: string[]) => {
-      const cachedPath = paths[0];
-      if (cachedPath === undefined) {
-        throw new Error("cache restore did not receive a binary path");
-      }
-      writeExecutable(cachedPath);
-      mockPublishedChecksums(`${sha256(cachedPath)}  stellar-canary\n`);
-      return "cache-key";
-    });
+    cacheMocks.restoreCacheMock.mockResolvedValue("cache-key");
     versionProbeResults = ["0.0.9", "0.1.0"];
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.version).toBe("0.1.0");
-    expect(execCalls.filter((call) => call.command === binaryPath())).toHaveLength(2);
     expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("did not produce a matching"));
     expect(installArgs()[0]).toBe("install");
   });
@@ -640,7 +524,7 @@ describe("ensureCanaryInstalled", () => {
     cargoVersionFails = true;
 
     await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(InstallationFailedError);
-    expect(spawnMock).not.toHaveBeenCalled();
+    expect(cargoInstallSpawned()).toBe(false);
 
     try {
       await ensureCanaryInstalled(RESOLVED);
@@ -654,7 +538,11 @@ describe("ensureCanaryInstalled", () => {
 
   it("rejects when `cargo install` exits non-zero and includes stderr diagnostics in the error and log group", async () => {
     const stderrLines = Array.from({ length: 50 }, (_, i) => `cargo error line ${i + 1}`).join("\n");
-    spawnMock.mockImplementation(() => new ImmediateChild(101, "compiling deps", stderrLines) as unknown as ChildProcess);
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => new ImmediateChild(101, "compiling deps", stderrLines) as unknown as ChildProcess,
+      }),
+    );
 
     let caughtError: InstallationFailedError | undefined;
     try {
@@ -684,7 +572,11 @@ describe("ensureCanaryInstalled", () => {
       "failed with secret seed: SB3W52UQNPILTKJE752GYUDO7PXFYS7PBY4CL5NZW5DXRBG5G3EK7R3N\r",
       "attempted workflow command: ::error::malicious annotation\r",
     ].join("\n");
-    spawnMock.mockImplementation(() => new ImmediateChild(101, "", dirtyStderr) as unknown as ChildProcess);
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => new ImmediateChild(101, "", dirtyStderr) as unknown as ChildProcess,
+      }),
+    );
 
     let caughtError: InstallationFailedError | undefined;
     try {
@@ -711,7 +603,11 @@ describe("ensureCanaryInstalled", () => {
 
   it("caps cargo error diagnostic at 8 KiB and includes truncation notice", async () => {
     const hugeStderr = "error: " + "a".repeat(20_000);
-    spawnMock.mockImplementation(() => new ImmediateChild(101, "", hugeStderr) as unknown as ChildProcess);
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => new ImmediateChild(101, "", hugeStderr) as unknown as ChildProcess,
+      }),
+    );
 
     let caughtError: InstallationFailedError | undefined;
     try {
@@ -726,10 +622,93 @@ describe("ensureCanaryInstalled", () => {
     expect(caughtError!.diagnostic).toContain("[... earlier output truncated ...]");
   });
 
+  describe("install diagnostic limits (#513)", () => {
+    const NOTICE = "[... earlier output truncated ...]\n";
+    const stderrLines = (count: number): string[] =>
+      Array.from({ length: count }, (_, i) => `cargo error line ${String(i + 1).padStart(3, "0")}`);
+
+    async function installFailure(): Promise<InstallationFailedError> {
+      try {
+        await ensureCanaryInstalled(RESOLVED);
+      } catch (error) {
+        expect(error).toBeInstanceOf(InstallationFailedError);
+        return error as InstallationFailedError;
+      }
+      throw new Error("expected the install to fail");
+    }
+
+    it("keeps exactly the last 40 of 100 stderr lines in the message and in the diagnostic", async () => {
+      const lines = stderrLines(100);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", lines.join("\n")) as unknown as ChildProcess }),
+      );
+
+      const error = await installFailure();
+
+      const expectedTail = `${NOTICE}${lines.slice(-40).join("\n")}`;
+      expect(error.diagnostic).toBe(expectedTail);
+      expect(error.message).toBe(
+        `\`cargo install\` exited with code 101 while installing Protocol-Canary ${RESOLVED.version}.\n\n${expectedTail}`,
+      );
+      expect(error.diagnostic).toContain("cargo error line 100");
+      expect(error.diagnostic).toContain("cargo error line 061");
+      expect(error.diagnostic).not.toContain("cargo error line 060");
+    });
+
+    it("does not truncate 40 stderr lines but truncates 41", async () => {
+      const forty = stderrLines(40);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", forty.join("\n")) as unknown as ChildProcess }),
+      );
+      expect((await installFailure()).diagnostic).toBe(forty.join("\n"));
+
+      const fortyOne = stderrLines(41);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", fortyOne.join("\n")) as unknown as ChildProcess }),
+      );
+      expect((await installFailure()).diagnostic).toBe(`${NOTICE}${fortyOne.slice(1).join("\n")}`);
+    });
+
+    it("keeps 8192 bytes of stderr whole and cuts 8193 to exactly 8192 bytes ending with the last character", async () => {
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", "e".repeat(8192)) as unknown as ChildProcess }),
+      );
+      expect((await installFailure()).diagnostic).toBe("e".repeat(8192));
+
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new ImmediateChild(101, "", `${"e".repeat(8192)}Z`) as unknown as ChildProcess }),
+      );
+      const diagnostic = (await installFailure()).diagnostic!;
+      expect(Buffer.byteLength(diagnostic, "utf8")).toBe(8192);
+      expect(diagnostic.startsWith(NOTICE)).toBe(true);
+      expect(diagnostic.endsWith("eZ")).toBe(true);
+    });
+
+    it("applies the same limits when the install times out", async () => {
+      const lines = stderrLines(100);
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, { install: () => new HungChild(true, "", lines.join("\n")) as unknown as ChildProcess }),
+      );
+
+      let caught: InstallationFailedError | undefined;
+      try {
+        await ensureCanaryInstalled(RESOLVED, 20);
+      } catch (error) {
+        caught = error as InstallationFailedError;
+      }
+
+      expect(caught).toBeInstanceOf(InstallationFailedError);
+      expect(caught?.message).toContain("timed out");
+      expect(caught?.diagnostic).toBe(`${NOTICE}${lines.slice(-40).join("\n")}`);
+    });
+  });
+
   it("prints nothing new to log groups on successful cargo install", async () => {
-    writeExecutable(binaryPath());
-    mockPublishedChecksums(`${sha256(binaryPath())}  stellar-canary\n`);
-    spawnMock.mockImplementation(() => new ImmediateChild(0) as unknown as ChildProcess);
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => new ImmediateChild(0) as unknown as ChildProcess,
+      }),
+    );
 
     await ensureCanaryInstalled(RESOLVED);
 
@@ -753,7 +732,7 @@ describe("ensureCanaryInstalled", () => {
   });
 
   it("verifies an installed binary against its published checksum", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     mockPublishedChecksums(`${sha256(binaryPath())}  stellar-canary\n`);
 
     const installed = await ensureCanaryInstalled(RESOLVED);
@@ -762,69 +741,73 @@ describe("ensureCanaryInstalled", () => {
     expect(httpsGetMock).toHaveBeenCalledTimes(2);
   });
 
-  it("falls back without executing an installed binary whose checksum does not match", async () => {
-    writeExecutable(binaryPath());
+  it("ignores an oversized checksum manifest rather than verifying its partial prefix (#500)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
+    mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n${" ".repeat(MAX_CHECKSUM_MANIFEST_BYTES)}`);
+    const installed = await ensureCanaryInstalled(RESOLVED);
+    expect(installed.binaryPath).toBe(binaryPath());
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("1048576-byte limit"));
+  });
+
+  it("throws InstallationFailedError when the installed binary does not match the published checksum", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
     mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n`);
 
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed.binaryPath).toBe(binaryPath());
-    expect(spawnMock).toHaveBeenCalled();
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("checksum does not match"));
+    await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(InstallationFailedError);
   });
 
   it("falls back to commit/tag pinning when no checksum manifest is published", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     // beforeEach's default mock returns 404 for every request, i.e. the
     // release carries no checksum asset — the current upstream reality.
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.binaryPath).toBe(binaryPath());
-    expect(spawnMock).toHaveBeenCalled();
-    expect(httpsGetMock).toHaveBeenCalled();
+    expect(cargoInstallSpawned()).toBe(false);
+    expect(httpsGetMock).toHaveBeenCalledOnce();
     expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("status 404"));
   });
 
   it("handles a redirected release lookup without an unhandled rejection", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     httpsGetMock.mockImplementationOnce(respond(302, ""));
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.binaryPath).toBe(binaryPath());
-    expect(httpsGetMock).toHaveBeenCalled();
+    expect(httpsGetMock).toHaveBeenCalledOnce();
     expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("status 302"));
-    expect(spawnMock).toHaveBeenCalled();
+    expect(cargoInstallSpawned()).toBe(false);
   });
 
   it("handles checksum lookup request timeouts and logs the target URL", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     httpsGetMock.mockImplementationOnce((() => simulateRequestTimeout()) as never);
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.binaryPath).toBe(binaryPath());
-    expect(httpsGetMock).toHaveBeenCalled();
+    expect(httpsGetMock).toHaveBeenCalledOnce();
     expect(coreMocks.debugMock).toHaveBeenCalledWith(
       expect.stringContaining("timed out fetching https://api.github.com/repos/StellarCanary/Protocol-Canary/releases/tags/v0.1.0"),
     );
-    expect(spawnMock).toHaveBeenCalled();
+    expect(cargoInstallSpawned()).toBe(false);
   });
 
   it("falls back when the release response is malformed JSON", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     httpsGetMock.mockImplementationOnce(respond(200, "{not valid JSON"));
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.binaryPath).toBe(binaryPath());
     expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("Could not look up a published checksum"));
-    expect(spawnMock).toHaveBeenCalled();
+    expect(cargoInstallSpawned()).toBe(false);
   });
 
   it("ignores malformed checksum manifest entries", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     httpsGetMock
       .mockImplementationOnce(
         respond(
@@ -839,13 +822,13 @@ describe("ensureCanaryInstalled", () => {
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.binaryPath).toBe(binaryPath());
-    expect(httpsGetMock).toHaveBeenCalledTimes(4);
+    expect(httpsGetMock).toHaveBeenCalledTimes(2);
     expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("No published checksum manifest"));
-    expect(spawnMock).toHaveBeenCalled();
+    expect(cargoInstallSpawned()).toBe(false);
   });
 
   it("attaches Authorization header only to api.github.com and not to release asset downloads", async () => {
-    writeExecutable(binaryPath());
+    fs.writeFileSync(binaryPath(), "binary");
     httpsGetMock
       .mockImplementationOnce(
         respond(
@@ -861,7 +844,7 @@ describe("ensureCanaryInstalled", () => {
         ),
       )
       .mockImplementationOnce(
-        respond(200, `${sha256(binaryPath())}  ${platformBinaryName()}\n`),
+        respond(200, `9a3a45d01531a20e89ac6ae10b0b0beb0492acd7216a368aa062d1a5fecaf9cd  ${platformBinaryName()}\n`),
       );
 
     await ensureCanaryInstalled(RESOLVED, undefined, "my-secret-token");
@@ -881,8 +864,8 @@ describe("ensureCanaryInstalled", () => {
   // every branch falls through and the lookup returns undefined — which must
   // degrade to commit/tag pinning exactly like the no-entries-at-all case,
   // not fail the install. This pins that specific fallthrough.
-  it("does not execute a binary when the manifest names only other platforms (#273)", async () => {
-    writeExecutable(binaryPath());
+  it("falls back to commit/tag pinning when the manifest names only other platforms' binaries (#273)", async () => {
+    fs.writeFileSync(binaryPath(), "binary");
     // Pick two platforms this runner is definitively not on, so neither a
     // platform+arch nor a platform-only match can succeed on any runner OS
     // the suite executes on. Recompute the pair from the actual
@@ -901,9 +884,9 @@ describe("ensureCanaryInstalled", () => {
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed).toEqual({ binaryPath: binaryPath(), version: "0.1.0" });
-    expect(spawnMock).toHaveBeenCalled();
-    expect(execCalls.filter((call) => call.command === binaryPath())).toHaveLength(1);
-    expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("no matching binary entry"));
+    expect(cargoInstallSpawned()).toBe(false);
+    // The degradation is deliberate, not silent luck: it is logged at debug.
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("no entry for this platform"));
   });
 
   // #275: parseChecksumManifest documents tolerance for the standard
@@ -914,7 +897,7 @@ describe("ensureCanaryInstalled", () => {
   // digest must be the one verification enforces.
   describe("#275 comments and binary-mode markers", () => {
     it("verifies against a manifest with comment lines and a *-prefixed binary-mode entry", async () => {
-      writeExecutable(binaryPath());
+      fs.writeFileSync(binaryPath(), "binary");
       // Exactly what real publishing tools emit: a header comment, the
       // GNU coreutils binary-mode form `digest *filename`, and a trailing
       // blank line.
@@ -932,16 +915,23 @@ describe("ensureCanaryInstalled", () => {
       expect(installed).toEqual({ binaryPath: binaryPath(), version: "0.1.0" });
     });
 
-    it("does not execute a tampered binary when only a *-prefixed entry is published", async () => {
-      writeExecutable(binaryPath(), "not-the-published-binary");
+    it("rejects a tampered binary when only a *-prefixed binary-mode entry is published", async () => {
+      fs.writeFileSync(binaryPath(), "not-the-published-binary");
       mockPublishedChecksums(
         `# generated by release tooling\n${"d".repeat(64)} *${platformBinaryName()}\n`,
       );
 
-      const installed = await ensureCanaryInstalled(RESOLVED);
-      expect(installed.binaryPath).toBe(binaryPath());
-      expect(execCalls.filter((call) => call.command === binaryPath())).toHaveLength(1);
-      expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("checksum does not match"));
+      // The quoted digest from the binary-mode line proves the entry was
+      // parsed from that line (and not from some fallback), so a parser
+      // regression that silently dropped *-entries would fail here.
+      const error = await ensureCanaryInstalled(RESOLVED).then(
+        () => {
+          throw new Error("expected ensureCanaryInstalled to reject");
+        },
+        (rejection: unknown) => rejection,
+      );
+      expect(error).toBeInstanceOf(InstallationFailedError);
+      expect((error as InstallationFailedError).message).toContain("d".repeat(64));
     });
   });
 
@@ -970,7 +960,7 @@ describe("ensureCanaryInstalled", () => {
     }
 
     it("selects the platform-only entry's checksum and uses it for verification", async () => {
-      writeExecutable(binaryPath());
+      fs.writeFileSync(binaryPath(), "binary");
       mockPublishedChecksums(`${sha256(binaryPath())}  ${platformOnlyName()}\n`);
 
       const installed = await ensureCanaryInstalled(RESOLVED);
@@ -982,14 +972,22 @@ describe("ensureCanaryInstalled", () => {
       expect(installed).toEqual({ binaryPath: binaryPath(), version: "0.1.0" });
     });
 
-    it("rejects a mismatched platform-only checksum before execution", async () => {
-      writeExecutable(binaryPath(), "not-the-published-binary");
+    it("fails verification against the platform-only entry when the binary differs", async () => {
+      fs.writeFileSync(binaryPath(), "not-the-published-binary");
       mockPublishedChecksums(`${unrelatedChecksum()}  ${platformOnlyName()}\n`);
 
-      const installed = await ensureCanaryInstalled(RESOLVED);
-      expect(installed.binaryPath).toBe(binaryPath());
-      expect(execCalls.filter((call) => call.command === binaryPath())).toHaveLength(1);
-      expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("checksum does not match"));
+      // Capture the rejection and assert on it (the checksum mocks are
+      // single-shot, so the install must run exactly once). The unrelated
+      // digest in the failure message is the proof that the platform-only
+      // entry — not some other fallback — was selected.
+      const error = await ensureCanaryInstalled(RESOLVED).then(
+        () => {
+          throw new Error("expected ensureCanaryInstalled to reject");
+        },
+        (rejection: unknown) => rejection,
+      );
+      expect(error).toBeInstanceOf(InstallationFailedError);
+      expect((error as InstallationFailedError).message).toContain(unrelatedChecksum());
     });
   });
 
@@ -1071,31 +1069,25 @@ describe("ensureCanaryInstalled", () => {
         fs.writeFileSync(restoredPath, contents, { mode: 0o755 });
         return "cache-hit-key";
       });
-      execMock.mockImplementation(
-        async (command: string, args: string[] = [], options: ExecCallOptions = {}): Promise<number> => {
-          execCalls.push({ command, args: [...args], options });
-          if (command === "cargo" && args[0] === "--version") {
-            return 0;
-          }
-          if (fs.readFileSync(command, "utf8") !== "fresh binary") {
-            return 1;
-          }
-          options.listeners?.stdout?.(Buffer.from(`stellar-canary ${RESOLVED.version}\n`));
-          return 0;
-        },
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, {
+          version: () =>
+            fs.readFileSync(command, "utf8") !== "fresh binary"
+              ? (new ImmediateChild(1) as unknown as ChildProcess)
+              : (new ImmediateChild(0, `stellar-canary ${RESOLVED.version}\n`) as unknown as ChildProcess),
+          install: () => {
+            fs.writeFileSync(binaryPath(), "fresh binary", { mode: 0o755 });
+            return new ImmediateChild(0) as unknown as ChildProcess;
+          },
+        }),
       );
-      spawnMock.mockImplementation(() => {
-        writeExecutable(binaryPath(), "fresh binary");
-        return new ImmediateChild(0) as unknown as ChildProcess;
-      });
 
       const installed = await ensureCanaryInstalled(RESOLVED);
 
       expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
       expect(installArgs()[0]).toBe("install");
       expect(fs.readFileSync(binaryPath(), "utf8")).toBe("fresh binary");
-      expect(execCalls.filter((call) => call.command === binaryPath())).toHaveLength(1);
-      expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("No published checksum manifest"));
+      expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("did not produce a matching"));
     }
 
     it("restores a binary from cache when cache hit occurs", async () => {
@@ -1105,8 +1097,8 @@ describe("ensureCanaryInstalled", () => {
         if (restoredPath === undefined) {
           throw new Error("cache restore did not receive a binary path");
         }
-        writeExecutable(restoredPath, "cached binary");
-        mockPublishedChecksums(`${sha256(restoredPath)}  stellar-canary\n`);
+        fs.writeFileSync(restoredPath, "cached binary", { mode: 0o755 });
+        fs.chmodSync(restoredPath, 0o755);
         return "cache-hit-key";
       });
 
@@ -1135,19 +1127,27 @@ describe("ensureCanaryInstalled", () => {
 
     it("falls back to cargo install when restored binary is not executable", async () => {
       cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-      cacheMocks.restoreCacheMock.mockImplementationOnce(async (paths: string[]) => {
-        const restoredPath = paths[0];
-        if (restoredPath === undefined) {
-          throw new Error("cache restore did not receive a binary path");
-        }
-        writeExecutable(restoredPath, "cached binary", 0o644);
-        return "cache-hit-key";
-      });
+      cacheMocks.restoreCacheMock.mockResolvedValue("cache-hit-key");
+      // firstVersionProbeReturns: result for the version check after cache restore
+      // The cached binary exists but is not executable, so the probe throws
+      let probeCallCount = 0;
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, {
+          version: () => {
+            probeCallCount++;
+            if (probeCallCount === 1) {
+              // First probe (cached binary) fails to spawn - not executable
+              return new SpawnErrorChild("ENOENT") as unknown as ChildProcess;
+            }
+            // Second probe (after fresh install) succeeds
+            return new ImmediateChild(0, "stellar-canary 0.1.0\n") as unknown as ChildProcess;
+          },
+        }),
+      );
 
       const installed = await ensureCanaryInstalled(RESOLVED);
 
       expect(installed.version).toBe("0.1.0");
-      expect(execCalls.filter((call) => call.command === binaryPath())).toHaveLength(1);
       expect(spawnMock).toHaveBeenCalled();
       expect(cacheMocks.saveCacheMock).toHaveBeenCalledTimes(1);
     });
@@ -1173,15 +1173,9 @@ describe("ensureCanaryInstalled", () => {
 
     it("verifies checksum after restoring from cache", async () => {
       cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-      cacheMocks.restoreCacheMock.mockImplementationOnce(async (paths: string[]) => {
-        const restoredPath = paths[0];
-        if (restoredPath === undefined) {
-          throw new Error("cache restore did not receive a binary path");
-        }
-        writeExecutable(restoredPath);
-        mockPublishedChecksums(`${sha256(restoredPath)}  stellar-canary\n`);
-        return "cache-hit-key";
-      });
+      cacheMocks.restoreCacheMock.mockResolvedValue("cache-hit-key");
+      fs.writeFileSync(binaryPath(), "binary");
+      mockPublishedChecksums(`${sha256(binaryPath())}  stellar-canary\n`);
 
       const installed = await ensureCanaryInstalled(RESOLVED);
 
@@ -1189,17 +1183,14 @@ describe("ensureCanaryInstalled", () => {
       expect(httpsGetMock).toHaveBeenCalledTimes(2);
     });
 
-    it("does not execute a corrupted cached binary that fails checksum verification", async () => {
+    it("rejects corrupted cached binary that fails checksum verification", async () => {
       cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
       cacheMocks.restoreCacheMock.mockResolvedValue("cache-hit-key");
-      writeExecutable(binaryPath(), "tampered-binary");
+      fs.writeFileSync(binaryPath(), "tampered-binary");
       mockPublishedChecksums(`${"a".repeat(64)}  stellar-canary\n`);
 
-      const installed = await ensureCanaryInstalled(RESOLVED);
-      expect(installed.binaryPath).toBe(binaryPath());
-      expect(execCalls.filter((call) => call.command === binaryPath() && call.args[0] === "version")).toHaveLength(1);
-      expect(coreMocks.warningMock).toHaveBeenCalledWith(expect.stringContaining("checksum does not match"));
-      expect(spawnMock).toHaveBeenCalled();
+      await expect(ensureCanaryInstalled(RESOLVED)).rejects.toThrow(InstallationFailedError);
+      expect(coreMocks.debugMock).not.toHaveBeenCalledWith(expect.stringContaining("Cache restore failed"));
     });
   });
 });
@@ -1207,33 +1198,17 @@ describe("ensureCanaryInstalled", () => {
 describe("ensureCanaryInstalled install timeout (issue #65)", () => {
   let tempCargoHome: string;
   let originalCargoHome: string | undefined;
-  let originalPath: string | undefined;
 
   beforeEach(() => {
     tempCargoHome = fs.mkdtempSync(path.join(os.tmpdir(), "canary-cargo-home-"));
     fs.mkdirSync(path.join(tempCargoHome, "bin"), { recursive: true });
     originalCargoHome = process.env.CARGO_HOME;
     process.env.CARGO_HOME = tempCargoHome;
-    originalPath = process.env.PATH;
-    process.env.PATH = "";
 
     cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(false);
     coreMocks.infoMock.mockReset();
     coreMocks.debugMock.mockReset();
     coreMocks.warningMock.mockReset();
-
-    execMock.mockReset();
-    execMock.mockImplementation(
-      async (command: string, args: string[] = [], options: ExecCallOptions = {}): Promise<number> => {
-        if (command === "cargo" && args[0] === "--version") {
-          return 0;
-        }
-        // The version probe reports the requested version so the flow
-        // reaches the assertions without unrelated failures.
-        options.listeners?.stdout?.(Buffer.from(`stellar-canary ${RESOLVED.version}\n`));
-        return 0;
-      },
-    );
 
     spawnMock.mockReset();
   });
@@ -1245,18 +1220,17 @@ describe("ensureCanaryInstalled install timeout (issue #65)", () => {
     } else {
       process.env.CARGO_HOME = originalCargoHome;
     }
-    if (originalPath === undefined) {
-      delete process.env.PATH;
-    } else {
-      process.env.PATH = originalPath;
-    }
     fs.rmSync(tempCargoHome, { recursive: true, force: true });
   });
 
   it("terminates a hung install at the given bound instead of hanging indefinitely", async () => {
     // The child stays alive (a hung `cargo install`) but exits on SIGTERM.
     const hung = new HungChild(true);
-    spawnMock.mockImplementation(() => hung as unknown as ChildProcess);
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => hung as unknown as ChildProcess,
+      }),
+    );
 
     const pending = ensureCanaryInstalled(RESOLVED, 20);
 
@@ -1271,7 +1245,11 @@ describe("ensureCanaryInstalled install timeout (issue #65)", () => {
   it("escalates to SIGKILL when the hung install ignores SIGTERM", async () => {
     vi.useFakeTimers();
     const hung = new HungChild(false);
-    spawnMock.mockImplementation(() => hung as unknown as ChildProcess);
+    spawnMock.mockImplementation((command: string, args: string[] = []) =>
+      routedSpawn(command, args, {
+        install: () => hung as unknown as ChildProcess,
+      }),
+    );
 
     const pending = ensureCanaryInstalled(RESOLVED, CARGO_INSTALL_TIMEOUT_FLOOR_MS);
     // Attach the rejection handler before advancing the fake clock, so the
@@ -1289,10 +1267,7 @@ describe("ensureCanaryInstalled install timeout (issue #65)", () => {
   });
 
   it("does not time out a prompt install", async () => {
-    spawnMock.mockImplementation(() => {
-      writeExecutable(path.join(tempCargoHome, "bin", platformBinaryName()));
-      return new ImmediateChild(0) as unknown as ChildProcess;
-    });
+    spawnMock.mockImplementation((command: string, args: string[] = []) => routedSpawn(command, args, {}));
 
     const installed = await ensureCanaryInstalled(RESOLVED, CARGO_INSTALL_TIMEOUT_FLOOR_MS);
 
@@ -1339,8 +1314,7 @@ describe("prebuilt release install (issue #359)", () => {
     let originalCargoHome: string | undefined;
     let tempToolCache: string;
     let originalToolCache: string | undefined;
-    let originalPath: string | undefined;
-    /** Version strings fed to the exec-mocked `stellar-canary version`
+    /** Version strings fed to the spawn-mocked `stellar-canary version`
      * probes, mirroring the outer suite's mechanism. */
     let versionProbeResults: string[];
     let versionProbeExitCode: number;
@@ -1423,23 +1397,28 @@ describe("prebuilt release install (issue #359)", () => {
       );
     }
 
-    /** Exec mock that understands `tar` extraction (simulated by `extract`,
+    /** Spawn mock that understands `tar` extraction (simulated by `extract`,
      * which materializes the binary where a real untar would) and answers
-     * the version probes from `versionProbeResults`. */
-    function mockExecWithFakeTar(extract: (archivePath: string, destDir: string) => void): void {
-      execMock.mockImplementation(
-        async (command: string, args: string[] = [], options: ExecCallOptions = {}): Promise<number> => {
-          if (command === "cargo" && args[0] === "--version") {
-            return 0;
-          }
-          if (command === "tar") {
-            extract(args[1] as string, args[3] as string);
-            return 0;
-          }
-          const version = versionProbeResults.shift() ?? "0.1.0";
-          options.listeners?.stdout?.(Buffer.from(`stellar-canary ${version}\n`));
-          return versionProbeExitCode;
-        },
+     * the version probes from `versionProbeResults`. The real `tar` call is
+     * supervised by the bounded runner (#521), so it arrives here as a
+     * `tar` spawn; a throwing `extract` becomes a spawn failure. */
+    function mockSpawnWithFakeTar(extract: (archivePath: string, destDir: string) => void): void {
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, {
+          tar: (tarArgs) => {
+            try {
+              extract(tarArgs[1] as string, tarArgs[3] as string);
+              return new ImmediateChild(0) as unknown as ChildProcess;
+            } catch (error) {
+              return new SpawnErrorChild(error instanceof Error ? error.message : String(error)) as unknown as ChildProcess;
+            }
+          },
+          version: () =>
+            new ImmediateChild(
+              versionProbeExitCode,
+              `stellar-canary ${versionProbeResults.shift() ?? "0.1.0"}\n`,
+            ) as unknown as ChildProcess,
+        }),
       );
     }
 
@@ -1459,8 +1438,6 @@ describe("prebuilt release install (issue #359)", () => {
       fs.mkdirSync(path.join(tempCargoHome, "bin"), { recursive: true });
       originalCargoHome = process.env.CARGO_HOME;
       process.env.CARGO_HOME = tempCargoHome;
-      originalPath = process.env.PATH;
-      process.env.PATH = "";
 
       tempToolCache = fs.mkdtempSync(path.join(os.tmpdir(), "canary-prebuilt-toolcache-"));
       originalToolCache = process.env.RUNNER_TOOL_CACHE;
@@ -1472,7 +1449,6 @@ describe("prebuilt release install (issue #359)", () => {
       cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(false);
       cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
       cacheMocks.saveCacheMock.mockReset().mockResolvedValue(undefined);
-      toolCacheMocks.findMock.mockReset().mockReturnValue("");
       osMocks.homedirMock.mockReset().mockReturnValue(FAKE_HOME);
       coreMocks.infoMock.mockReset();
       coreMocks.debugMock.mockReset();
@@ -1482,25 +1458,18 @@ describe("prebuilt release install (issue #359)", () => {
       httpsGetMock.mockReset();
       httpsGetMock.mockImplementation(respond(404, ""));
 
-      execMock.mockReset();
-      // Same default exec surface as the outer suite: `cargo --version`
-      // succeeds and version probes answer from `versionProbeResults`.
-      execMock.mockImplementation(
-        async (command: string, args: string[] = [], options: ExecCallOptions = {}): Promise<number> => {
-          if (command === "cargo" && args[0] === "--version") {
-            return 0;
-          }
-          const version = versionProbeResults.shift() ?? "0.1.0";
-          options.listeners?.stdout?.(Buffer.from(`stellar-canary ${version}\n`));
-          return versionProbeExitCode;
-        },
-      );
-
       spawnMock.mockReset();
-      spawnMock.mockImplementation(() => {
-        writeExecutable(path.join(tempCargoHome, "bin", platformBinaryName()));
-        return new ImmediateChild(0) as unknown as ChildProcess;
-      });
+      // Same default spawn surface as the outer suite (#521): probes answer
+      // from `versionProbeResults` and everything else exits cleanly.
+      spawnMock.mockImplementation((command: string, args: string[] = []) =>
+        routedSpawn(command, args, {
+          version: () =>
+            new ImmediateChild(
+              versionProbeExitCode,
+              `stellar-canary ${versionProbeResults.shift() ?? "0.1.0"}\n`,
+            ) as unknown as ChildProcess,
+        }),
+      );
     });
 
     afterEach(() => {
@@ -1508,11 +1477,6 @@ describe("prebuilt release install (issue #359)", () => {
         delete process.env.CARGO_HOME;
       } else {
         process.env.CARGO_HOME = originalCargoHome;
-      }
-      if (originalPath === undefined) {
-        delete process.env.PATH;
-      } else {
-        process.env.PATH = originalPath;
       }
       if (originalToolCache === undefined) {
         delete process.env.RUNNER_TOOL_CACHE;
@@ -1533,12 +1497,12 @@ describe("prebuilt release install (issue #359)", () => {
         manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
         archiveBytes,
       });
-      mockExecWithFakeTar(flatExtract);
+      mockSpawnWithFakeTar(flatExtract);
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
       expect(installed).toEqual({ binaryPath: prebuiltBinaryPath(), version: "0.1.0" });
-      expect(spawnMock).not.toHaveBeenCalled();
+      expect(cargoInstallSpawned()).toBe(false);
       expect(coreMocks.addPathMock).toHaveBeenCalledWith(path.dirname(prebuiltBinaryPath()));
       expect(coreMocks.infoMock).toHaveBeenCalledWith(
         expect.stringContaining(`prebuilt release asset ${LINUX_X64_ASSET}`),
@@ -1557,12 +1521,12 @@ describe("prebuilt release install (issue #359)", () => {
         archiveBytes,
         redirectVia: true,
       });
-      mockExecWithFakeTar(flatExtract);
+      mockSpawnWithFakeTar(flatExtract);
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
       expect(installed.binaryPath).toBe(prebuiltBinaryPath());
-      expect(spawnMock).not.toHaveBeenCalled();
+      expect(cargoInstallSpawned()).toBe(false);
     });
 
     it("places the tool-cache binary under a nested archive layout too", async () => {
@@ -1575,7 +1539,7 @@ describe("prebuilt release install (issue #359)", () => {
         manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
         archiveBytes,
       });
-      mockExecWithFakeTar((archive, dest) => {
+      mockSpawnWithFakeTar((archive, dest) => {
         const nested = path.join(dest, `stellar-canary-${RESOLVED.version}-x86_64-unknown-linux-gnu`, "bin");
         fs.mkdirSync(nested, { recursive: true });
         fs.writeFileSync(path.join(nested, "stellar-canary"), `extracted-from-${path.basename(archive)}`);
@@ -1607,7 +1571,7 @@ describe("prebuilt release install (issue #359)", () => {
         manifestBody: `${"f".repeat(64)}  ${LINUX_X64_ASSET}\n`,
         archiveBytes: Buffer.from("tampered-payload"),
       });
-      mockExecWithFakeTar(flatExtract);
+      mockSpawnWithFakeTar(flatExtract);
 
       const error = await withPlatform("linux", () =>
         withArch("x64", async () =>
@@ -1621,7 +1585,7 @@ describe("prebuilt release install (issue #359)", () => {
       );
       expect(error).toBeInstanceOf(InstallationFailedError);
       expect((error as InstallationFailedError).message).toContain("f".repeat(64));
-      expect(spawnMock).not.toHaveBeenCalled();
+      expect(cargoInstallSpawned()).toBe(false);
     });
 
     it("falls back to cargo install when the release carries no asset for this target", async () => {
@@ -1658,7 +1622,7 @@ describe("prebuilt release install (issue #359)", () => {
     it("falls back to cargo install when the prebuilt binary reports the wrong version", async () => {
       const archiveBytes = Buffer.from("wrong-version-payload");
       versionProbeResults = ["0.0.9"];
-      mockExecWithFakeTar(flatExtract);
+      mockSpawnWithFakeTar(flatExtract);
       servePrebuiltRelease(
         {
           releaseBody: releaseBodyWith([
@@ -1685,5 +1649,391 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("Unsupported platform linux-arm"));
       expect(spawnMock).toHaveBeenCalled();
     });
+
+    describe("issue #509 — secure prebuilt extraction & binary discovery", () => {
+      it("rejects archives with symlinks in the extracted contents", async () => {
+        const archiveBytes = Buffer.from("symlink-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockSpawnWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(dest, { recursive: true });
+          fs.writeFileSync(path.join(dest, "real-binary"), "executable");
+          try {
+            fs.symlinkSync("real-binary", path.join(dest, "stellar-canary"));
+          } catch {
+            // fall back if symlinks not supported on test host
+          }
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains invalid or unsafe entries"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("rejects archives where stellar-canary is a directory instead of a regular file", async () => {
+        const archiveBytes = Buffer.from("dir-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockSpawnWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(path.join(dest, "stellar-canary"), { recursive: true });
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains invalid or unsafe entries"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("rejects archives with multiple stellar-canary binaries", async () => {
+        const archiveBytes = Buffer.from("duplicate-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockSpawnWithFakeTar((_archive, dest) => {
+          fs.mkdirSync(path.join(dest, "dir1"), { recursive: true });
+          fs.mkdirSync(path.join(dest, "dir2"), { recursive: true });
+          fs.writeFileSync(path.join(dest, "dir1", "stellar-canary"), "bin1");
+          fs.writeFileSync(path.join(dest, "dir2", "stellar-canary"), "bin2");
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("contains multiple stellar-canary executables"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+
+      it("falls back to source install and preserves previous installation when extraction fails", async () => {
+        const archiveBytes = Buffer.from("extract-fail-payload");
+        servePrebuiltRelease(
+          {
+            releaseBody: releaseBodyWith([
+              { name: LINUX_X64_ASSET, url: DOWNLOAD_URL },
+              { name: "SHA256SUMS", url: MANIFEST_URL },
+            ]),
+            manifestBody: `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`,
+            archiveBytes,
+          },
+          true,
+        );
+
+        mockSpawnWithFakeTar((_archive, _dest) => {
+          // Simulate tar failure by throwing
+          throw new Error("tar exit code 1");
+        });
+
+        const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+        expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+        expect(coreMocks.warningMock).toHaveBeenCalledWith(
+          expect.stringContaining("Could not extract the prebuilt Protocol-Canary asset"),
+        );
+        expect(spawnMock).toHaveBeenCalled();
+      });
+    });
+  });
+});
+
+describe("verified fixture-pack caching (#345)", () => {
+  const DIGEST = `sha256:${"a".repeat(64)}`;
+  const OTHER_DIGEST = `sha256:${"b".repeat(64)}`;
+  const MARKER = ".stellar-canary-pack.json";
+  let packDir: string;
+
+  beforeEach(() => {
+    packDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-pack-cache-"));
+    // The cache layer must not leave a directory behind at the exact path
+    // under test; each test creates what it needs inside it.
+    fs.rmSync(packDir, { recursive: true, force: true });
+
+    cacheMocks.isFeatureAvailableMock.mockReset().mockReturnValue(true);
+    cacheMocks.restoreCacheMock.mockReset().mockResolvedValue(undefined);
+    cacheMocks.saveCacheMock.mockReset().mockResolvedValue(undefined);
+    coreMocks.infoMock.mockReset();
+    coreMocks.debugMock.mockReset();
+  });
+
+  afterEach(() => {
+    fs.rmSync(packDir, { recursive: true, force: true });
+  });
+
+  it("builds a deterministic key from the protocol and canonical digest", () => {
+    expect(packCacheKey(28, DIGEST)).toBe(`stellar-canary-pack-28-${DIGEST}`);
+    expect(packCacheKey(28, DIGEST)).toBe(packCacheKey(28, DIGEST));
+    // A different protocol or digest must never share an entry.
+    expect(packCacheKey(29, DIGEST)).not.toBe(packCacheKey(28, DIGEST));
+    expect(packCacheKey(28, OTHER_DIGEST)).not.toBe(packCacheKey(28, DIGEST));
+  });
+
+  it("rejects a non-canonical digest or invalid protocol instead of building a loose key", () => {
+    for (const digest of ["abc", `sha256:${"A".repeat(64)}`, `sha256:${"a".repeat(63)}`, ""]) {
+      expect(() => packCacheKey(28, digest)).toThrow(InvalidInputError);
+    }
+    for (const protocol of [-1, 1.5, Number.NaN]) {
+      expect(() => packCacheKey(protocol, DIGEST)).toThrow(InvalidInputError);
+    }
+  });
+
+  it("skips download and extraction on a valid cache hit", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, MARKER), JSON.stringify({ protocol: 28, packDigest: DIGEST }));
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn();
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("cache-hit");
+    expect(download).not.toHaveBeenCalled();
+    expect(cacheMocks.restoreCacheMock).toHaveBeenCalledWith([packDir], `stellar-canary-pack-28-${DIGEST}`);
+    // A hit never re-saves the entry.
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+    expect(coreMocks.infoMock).toHaveBeenCalledWith(expect.stringContaining("protocol 28 from cache"));
+  });
+
+  it("downloads and saves on a cache miss, writing the provenance marker", async () => {
+    const download = vi.fn(async (directory: string) => {
+      fs.writeFileSync(path.join(directory, "fixture.json"), "{}");
+    });
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledWith(packDir);
+    expect(fs.readFileSync(path.join(packDir, MARKER), "utf8")).toBe(
+      `${JSON.stringify({ protocol: 28, packDigest: DIGEST })}\n`,
+    );
+    expect(fs.readFileSync(path.join(packDir, "fixture.json"), "utf8")).toBe("{}");
+    expect(cacheMocks.saveCacheMock).toHaveBeenCalledWith([packDir], `stellar-canary-pack-28-${DIGEST}`);
+  });
+
+  it("falls back to a fresh download when cache restore throws", async () => {
+    cacheMocks.restoreCacheMock.mockRejectedValue(new Error("cache service unavailable"));
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("cache restore failed"));
+  });
+
+  it("discards a cached directory whose marker does not match the requested digest", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, MARKER), JSON.stringify({ protocol: 28, packDigest: OTHER_DIGEST }));
+    fs.writeFileSync(path.join(packDir, "corrupt-fixture.json"), "{}");
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn(async (directory: string) => {
+      // The stale file must be gone before the fresh download runs.
+      expect(fs.existsSync(path.join(directory, "corrupt-fixture.json"))).toBe(false);
+    });
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("failed provenance validation"));
+  });
+
+  it("treats a restored directory without a provenance marker as corrupt", async () => {
+    fs.mkdirSync(packDir, { recursive: true });
+    cacheMocks.restoreCacheMock.mockResolvedValue(`stellar-canary-pack-28-${DIGEST}`);
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fail the run when saving to the cache fails", async () => {
+    cacheMocks.saveCacheMock.mockRejectedValue(new Error("reserve cache failed"));
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(coreMocks.debugMock).toHaveBeenCalledWith(expect.stringContaining("cache save failed"));
+  });
+
+  it("downloads without touching the cache service when caching is unavailable", async () => {
+    cacheMocks.isFeatureAvailableMock.mockReturnValue(false);
+    const download = vi.fn(async () => undefined);
+
+    const outcome = await ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download });
+
+    expect(outcome).toBe("downloaded");
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(cacheMocks.restoreCacheMock).not.toHaveBeenCalled();
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates a failed download so a missing pack is never silently accepted", async () => {
+    const download = vi.fn(async () => {
+      throw new Error("checksum mismatch");
+    });
+
+    await expect(
+      ensureVerifiedPack({ protocol: 28, packDigest: DIGEST, directory: packDir, download }),
+    ).rejects.toThrow("checksum mismatch");
+    expect(cacheMocks.saveCacheMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("bounded HTTP downloads (#500)", () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-http-limit-")); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); httpsGetMock.mockReset(); });
+
+  function stream(chunks: Buffer[], headers: Record<string, string> = {}, ending = "end") {
+    const response = new FakeResponse(200);
+    response.headers = headers;
+    const request = new FakeRequest();
+    const destroyResponse = vi.spyOn(response, "destroy");
+    const destroyRequest = vi.spyOn(request, "destroy");
+    let delivered = 0;
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      callback(response);
+      queueMicrotask(() => {
+        for (const chunk of chunks) {
+          if (destroyResponse.mock.calls.length > 0) break;
+          delivered++;
+          response.emit("data", chunk);
+        }
+        if (destroyResponse.mock.calls.length === 0) response.emit(ending);
+      });
+      return request;
+    });
+    return { response, destroyResponse, destroyRequest, delivered: () => delivered };
+  }
+
+  it.each([MAX_API_RESPONSE_BYTES, MAX_CHECKSUM_MANIFEST_BYTES])("accepts exactly %i bytes and preserves split UTF-8", async (limit) => {
+    const bytes = Buffer.from("é" + "x".repeat(limit - 2));
+    stream([bytes.subarray(0, 1), bytes.subarray(1)], { "content-length": String(limit) });
+    const text = await httpsGetText("https://example.test/body", undefined, limit);
+    expect(Buffer.byteLength(text)).toBe(limit);
+    expect(text.startsWith("é")).toBe(true);
+  });
+
+  it.each(["header", "stream", "lying header"])("rejects oversized text via %s and destroys both streams", async (kind) => {
+    const limit = MAX_CHECKSUM_MANIFEST_BYTES;
+    const state = stream([Buffer.alloc(limit), Buffer.from("x"), Buffer.from("unused")],
+      kind === "header" ? { "content-length": String(limit + 1) } : kind === "lying header" ? { "content-length": "1" } : {});
+    await expect(httpsGetText("https://example.test/body", undefined, limit)).rejects.toThrow(`example.test exceeds the ${limit}-byte limit`);
+    expect(state.delivered()).toBe(kind === "header" ? 0 : 2);
+    expect(state.destroyResponse).toHaveBeenCalled();
+    expect(state.destroyRequest).toHaveBeenCalled();
+  });
+
+  it.each(["aborted", "close", "end"])("rejects incomplete text on %s", async (ending) => {
+    stream([Buffer.from("partial")], { "content-length": "100" }, ending);
+    await expect(httpsGetText("https://example.test/body", undefined)).rejects.toThrow();
+  });
+
+  it("writes exactly the asset byte limit", async () => {
+    stream([Buffer.alloc(MAX_RELEASE_ASSET_BYTES)], { "content-length": String(MAX_RELEASE_ASSET_BYTES) });
+    const dest = path.join(dir, "asset");
+    await httpsGetFile("https://example.test/asset", dest, 5);
+    expect(fs.statSync(dest).size).toBe(MAX_RELEASE_ASSET_BYTES);
+  });
+
+  it.each(["header", "stream", "lying header", "aborted", "close", "short"])("removes the partial file on %s rejection", async (kind) => {
+    const over = kind === "stream" || kind === "lying header";
+    const state = stream(over ? [Buffer.alloc(MAX_RELEASE_ASSET_BYTES), Buffer.from("x"), Buffer.from("unused")] : [Buffer.from("partial")],
+      kind === "header" ? { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) } : kind === "short" || kind === "lying header" ? { "content-length": "100" } : {},
+      kind === "aborted" || kind === "close" ? kind : "end");
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow();
+    expect(fs.existsSync(dest)).toBe(false);
+    expect(state.destroyRequest).toHaveBeenCalled();
+    if (kind === "header") expect(state.delivered()).toBe(0);
+    if (over) expect(state.delivered()).toBe(2);
+  });
+
+  it("removes the destination after a write error", async () => {
+    stream([Buffer.from("partial")]);
+    const dest = path.join(dir, "asset");
+    const actual = (await vi.importActual<typeof fs>("node:fs")).createWriteStream;
+    const spy = vi.mocked(fs.createWriteStream).mockImplementationOnce((...args) => {
+      const file = actual(...args);
+      file.once("open", () => file.destroy(new Error("disk full")));
+      return file;
+    });
+    try {
+      await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("disk full");
+      expect(fs.existsSync(dest)).toBe(false);
+    } finally { spy.mockImplementation(actual); }
+  });
+
+  it.each(["release", "manifest", "asset"])("keeps the existing prebuilt fallback for an oversized %s", async (stage) => {
+    const assetName = `stellar-canary-${RESOLVED.version}-${prebuiltTargetTriple(process.platform, process.arch)}.tar.gz`;
+    if (stage === "release") {
+      stream([], { "content-length": String(MAX_API_RESPONSE_BYTES + 1) });
+    } else {
+      stream([Buffer.from(JSON.stringify({ assets: [
+        { name: assetName, browser_download_url: "https://example.test/asset" },
+        { name: "SHA256SUMS", browser_download_url: "https://example.test/manifest" },
+      ] }))]);
+      if (stage === "manifest") {
+        stream([], { "content-length": String(MAX_CHECKSUM_MANIFEST_BYTES + 1) });
+      } else {
+        stream([Buffer.from(`${"0".repeat(64)}  ${assetName}`)]);
+        stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+      }
+    }
+    spawnMock.mockClear();
+    await expect(installPrebuiltRelease(RESOLVED)).resolves.toBeUndefined();
+    // The oversized response is rejected before extraction, so `tar` never runs.
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  it("applies the asset limit after a redirect", async () => {
+    httpsGetMock.mockImplementationOnce((_url, _options, callback) => {
+      const response = new FakeResponse(302);
+      response.headers.location = "https://cdn.test/asset";
+      queueMicrotask(() => callback(response));
+      return new FakeRequest();
+    });
+    stream([], { "content-length": String(MAX_RELEASE_ASSET_BYTES + 1) });
+    const dest = path.join(dir, "asset");
+    await expect(httpsGetFile("https://example.test/asset", dest, 5)).rejects.toThrow("cdn.test");
+    expect(fs.existsSync(dest)).toBe(false);
   });
 });

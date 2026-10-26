@@ -11,11 +11,13 @@ import type { ActionInputs } from "../../src/inputs";
 import type * as inputsModule from "../../src/inputs";
 import type * as runnerModule from "../../src/runner";
 import type * as summaryModule from "../../src/summary";
+import type * as versionModule from "../../src/version";
 import { report, result } from "./helpers";
 
 const {
   getInputsMock,
   ensureCanaryInstalledMock,
+  resolveVersionMock,
   runCheckMock,
   writeSummaryMock,
   renderSummaryMarkdownMock,
@@ -29,9 +31,12 @@ const {
   startGroupMock,
   endGroupMock,
   uploadReceiptMock,
+  uploadReportMock,
+  renderJUnitReportMock,
 } = vi.hoisted(() => ({
   getInputsMock: vi.fn<() => ActionInputs>(),
   ensureCanaryInstalledMock: vi.fn(),
+  resolveVersionMock: vi.fn(),
   runCheckMock: vi.fn(),
   writeSummaryMock: vi.fn(),
   renderSummaryMarkdownMock: vi.fn(),
@@ -45,6 +50,8 @@ const {
   startGroupMock: vi.fn(),
   endGroupMock: vi.fn(),
   uploadReceiptMock: vi.fn(),
+  uploadReportMock: vi.fn(),
+  renderJUnitReportMock: vi.fn(),
 }));
 
 vi.mock("@actions/core", async (importOriginal) => {
@@ -81,8 +88,22 @@ vi.mock("../../src/canary", async (importOriginal) => {
 vi.mock("../../src/runner", async (importOriginal) => {
   const actual = await importOriginal<typeof runnerModule>();
   // buildCheckArgs stays real: it is pure, and asserting run() forwards its
-  // result to runCheck pins that wiring too.
-  return { ...actual, runCheck: runCheckMock };
+  // result to runCheck pins that wiring too. renderJUnitReport is replaced
+  // because it calls the module-local (unmocked) runCheck internally — the
+  // real one would spawn the fake BINARY_PATH; its own behaviour is covered
+  // by runner.test.ts against the mock engine.
+  return { ...actual, runCheck: runCheckMock, renderJUnitReport: renderJUnitReportMock };
+});
+
+// Only `resolveVersion` is replaced (#400): the tests that spy on the
+// execution order need "was version resolution reached?" to be observable,
+// and a mocked resolver must not reach the GitHub API either. Its default
+// implementation mirrors the real one's offline fallback shape
+// (version + `v`-prefixed tag, no commit SHA), so every downstream
+// assertion behaves as before.
+vi.mock("../../src/version", async (importOriginal) => {
+  const actual = await importOriginal<typeof versionModule>();
+  return { ...actual, resolveVersion: resolveVersionMock };
 });
 
 vi.mock("../../src/summary", async (importOriginal) => {
@@ -95,12 +116,15 @@ vi.mock("../../src/summary", async (importOriginal) => {
   };
 });
 
-// #362: only `uploadReceipt` is replaced — receipt tests assert the gate
+// #362, #415: artifact uploads are replaced — receipt tests assert the gate
 // (upload when generate-receipt is true, skip when false) without ever
-// touching the artifact service.
+// touching the artifact service. `uploadReport` is mocked for the same
+// reason (#399, #415): tests assert which file the upload receives and
+// retention/output wiring without contacting the artifact service; artifact
+// *naming* itself is covered by tests/unit/artifact.test.ts.
 vi.mock("../../src/artifact", async (importOriginal) => {
   const actual = await importOriginal<typeof artifactModule>();
-  return { ...actual, uploadReceipt: uploadReceiptMock };
+  return { ...actual, uploadReceipt: uploadReceiptMock, uploadReport: uploadReportMock };
 });
 
 import { run } from "../../src/main";
@@ -111,18 +135,36 @@ const INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
   network: "testnet",
+  networkPassphrase: undefined,
   rpcUrl: undefined,
-  fixturesDir: "fixtures",
+  rpcMaxRetries: undefined,
+  rpcRetryDelayMs: undefined,
+  // #400: run() validates this directory on disk before version resolution
+  // and installation, so the shared fixture must be an existing directory —
+  // the repository's own tests/fixtures is stable from every CI checkout.
+  fixturesDir: path.join(__dirname, "..", "fixtures"),
+  fixture: undefined,
+  surface: undefined,
+  cacheDir: undefined,
   version: "0.1.0",
   uploadReport: false,
   annotations: true,
+  diagnostics: false,
   timeoutMinutes: 1,
   allowEmpty: false,
+  failOnWarning: false,
+  offline: false,
   fixturesPackVersion: undefined,
   fixturesPackProtocol: undefined,
+  baselineReport: undefined,
   githubToken: undefined,
   generateReceipt: false,
-};
+  reportRetentionDays: undefined,
+  junitReport: false,
+  strictIntegrity: false,
+  prComment: false,
+  workingDirectory: path.resolve("."),
+} as ActionInputs;
 
 const PASS_REPORT = report({
   status: "pass",
@@ -138,13 +180,26 @@ const PASS_REPORT = report({
   ],
 });
 
+/** The path the last run() advertised through its "report" output
+ * (#399: unique per invocation, so tests read it from the output instead
+ * of reconstructing a fixed filename). */
+function reportOutputPath(): string {
+  const call = setOutputMock.mock.calls.find((c) => c[0] === "report");
+  expect(call, "expected the run to set a \"report\" output").toBeDefined();
+  return String(call?.[1]);
+}
+
 describe("run", () => {
   let runnerTemp: string;
 
   beforeEach(() => {
     getInputsMock.mockReset().mockReturnValue(INPUTS);
     ensureCanaryInstalledMock.mockReset().mockResolvedValue({ binaryPath: BINARY_PATH, version: "0.1.0" });
+    resolveVersionMock
+      .mockReset()
+      .mockImplementation(async (version: string) => ({ version, tag: `v${version}`, commitSha: undefined }));
     runCheckMock.mockReset();
+    renderJUnitReportMock.mockReset();
     writeSummaryMock.mockReset().mockResolvedValue(undefined);
     renderSummaryMarkdownMock.mockReset().mockReturnValue("## Stellar Protocol Canary (rendered summary)");
     renderExecutionFailureMarkdownMock.mockReset().mockReturnValue("## Stellar Protocol Canary (execution failure)");
@@ -157,6 +212,12 @@ describe("run", () => {
     startGroupMock.mockReset();
     endGroupMock.mockReset();
     uploadReceiptMock.mockReset();
+    uploadReportMock.mockReset().mockResolvedValue({
+      uploaded: true,
+      name: "stellar-protocol-canary-report",
+      id: 100,
+    });
+    delete process.env.GITHUB_ACTION;
 
     // The success path writes the report under RUNNER_TEMP; give each test a
     // private directory (as the integration suite does) so it neither leaks
@@ -168,6 +229,34 @@ describe("run", () => {
   afterEach(() => {
     fs.rmSync(runnerTemp, { recursive: true, force: true });
     delete process.env.RUNNER_TEMP;
+  });
+
+  it.each(["timeout", "signal", "parse"])("sanitizes %s failure annotations, reasons and the published summary", async (kind) => {
+    const actual = await vi.importActual<typeof summaryModule>("../../src/summary");
+    renderExecutionFailureMarkdownMock.mockImplementation(actual.renderExecutionFailureMarkdown);
+    const token = "ghp_" + "a".repeat(36);
+    const dirty = `fatal \x1b[31m${token}\x1b[0m\0\x85 https://host/?api_key=private-query\n::error::injected`;
+    if (kind === "timeout") {
+      runCheckMock.mockRejectedValueOnce(new TimeoutError("timed out", "", dirty));
+    } else {
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: kind === "signal" ? null : 1,
+        signal: kind === "signal" ? "SIGTERM" : null,
+        stdout: dirty,
+        stderr: dirty,
+      });
+    }
+    await run();
+    const outputs = [...errorMock.mock.calls, ...setFailedMock.mock.calls, ...writeSummaryMock.mock.calls];
+    expect(errorMock).toHaveBeenCalled();
+    expect(writeSummaryMock).toHaveBeenCalled();
+    for (const [value] of outputs) {
+      const text = String(value);
+      expect(text.includes(token)).toBe(false);
+      expect(text).not.toContain("private-query");
+      expect(text).not.toContain("::");
+      expect(text).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+    }
   });
 
   it("forwards the installed binary, the built args, and the millisecond timeout to runCheck", async () => {
@@ -194,6 +283,37 @@ describe("run", () => {
     expect(infoMock).toHaveBeenCalledWith(expect.stringContaining('"allow-empty" has no effect with Canary 0.1.1'));
   });
 
+  it("warns about each new setting ignored by an older engine without exposing the passphrase", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      version: "0.2.0",
+      networkPassphrase: "Private Network ; secret value",
+      rpcMaxRetries: 0,
+      rpcRetryDelayMs: 250,
+    });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining('"network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"'),
+    );
+    expect(warningMock.mock.calls.flat().join(" ")).not.toContain("secret value");
+    expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--network-passphrase");
+  });
+
+  it("does not warn about new settings when the resolved engine supports them", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    getInputsMock.mockReturnValue({ ...INPUTS, version: "0.3.0", rpcMaxRetries: 0 });
+
+    await run();
+
+    expect(warningMock).not.toHaveBeenCalledWith(expect.stringContaining("rpc-max-retries"));
+    expect(runCheckMock.mock.calls[0]?.[1]).toEqual(
+      expect.arrayContaining(["--rpc-max-retries", "0"]),
+    );
+  });
+
   // #65: run() derives the install bound from timeout-minutes and hands it to
   // ensureCanaryInstalled, so a hung `cargo install` is terminated by this
   // Action's own timeout path instead of blocking until GitHub's job-level
@@ -204,7 +324,7 @@ describe("run", () => {
     await run();
 
     expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
-    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined);
+    expect(ensureCanaryInstalledMock).toHaveBeenCalledWith(expect.anything(), 60_000, undefined, false);
   });
 
   // #271, branch 1: a child killed by a signal closes with a null exit code,
@@ -225,6 +345,9 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("failures", "0");
     // No report was produced, so no "report" output is set.
     expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+    // #333: coverage-state is still set, and explicitly to `none` — a run that
+    // produced no report cannot claim to have executed any fixture.
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "none");
 
     // The diagnostic (stderr) is carried into the execution-failure summary,
     // which is still written despite the abnormal termination.
@@ -235,6 +358,8 @@ describe("run", () => {
     expect(errorMock).toHaveBeenCalledTimes(1);
     // No report existed at all, so nothing was replayed (#350).
     expect(setOutputMock).toHaveBeenCalledWith("replayed-count", "0");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
   });
 
   // #350: the replayed-count output mirrors how many results the engine
@@ -279,8 +404,33 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("status", "fail");
     const messages = errorMock.mock.calls.map((call) => String(call[0]));
     expect(messages.some((message) => message.includes("exit code 1"))).toBe(true);
-    expect(messages.some((message) => message.includes("Test failures detected"))).toBe(true);
+    expect(
+      messages.some((message) =>
+        message.includes("At least one fixture's compatibility assertion failed"),
+      ),
+    ).toBe(true);
     expect(messages.some((message) => message.includes("assertion failed at byte 12"))).toBe(true);
+  });
+
+  it.each(["stderr", "report"])("sanitizes the exit-failure diagnostic from %s", async (source) => {
+    const token = "ghp_" + "f".repeat(36);
+    const dirty = `fatal \x1b[31m${token}\x1b[0m\0\x85 https://host/?api_key=private-query\n::error::injected`;
+    const failing = report({
+      status: "fail",
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 0 },
+      results: [result({ status: "fail", summary: source === "report" ? dirty : "failed" })],
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 1, signal: null, stdout: JSON.stringify(failing),
+      stderr: source === "stderr" ? dirty : "",
+    });
+    await run();
+    const message = String(errorMock.mock.calls.find(([value]) => String(value).includes("exit code 1"))?.[0]);
+    expect(message).toContain("Engine diagnostic:");
+    expect(message.includes(token)).toBe(false);
+    expect(message).not.toContain("private-query");
+    expect(message).not.toContain("::");
+    expect(message).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
   });
 
   // #271, branch 2: writeSummary rejecting on the otherwise-successful path
@@ -305,13 +455,32 @@ describe("run", () => {
 
     // The report was still written next to the (failed) summary, and its
     // path is what the "report" output advertises.
-    const reportPath = path.join(runnerTemp, "stellar-canary-report.json");
+    const reportPath = reportOutputPath();
+    expect(path.isAbsolute(reportPath)).toBe(true);
     expect(fs.existsSync(reportPath)).toBe(true);
-    expect(setOutputMock).toHaveBeenCalledWith("report", reportPath);
 
     // The success-path summary rendering was attempted exactly once, and a
-    // passing report emits no annotations.
-    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT);
+    // passing report emits no annotations. The second argument is the
+    // provenance metadata plumbed into the summary: the mocked binary path
+    // does not exist, so only the engine version and the reproduction
+    // command's argument array are reported (#373, #416).
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(PASS_REPORT, {
+      engineVersion: "0.1.0",
+      engineArgs: [
+        "check",
+        "--format",
+        "json",
+        "--protocol",
+        "28",
+        "--network",
+        "testnet",
+        "--fixtures-dir",
+        // #400: `INPUTS.fixturesDir` is an absolute path (the shared
+        // fixture must be an existing directory), and the engine arguments
+        // forward it verbatim.
+        INPUTS.fixturesDir,
+      ],
+    });
     expect(writeSummaryMock).toHaveBeenCalledTimes(1);
     expect(errorMock).not.toHaveBeenCalled();
     expect(warningMock).not.toHaveBeenCalled();
@@ -394,6 +563,7 @@ describe("run", () => {
       expect.anything(),
       60_000,
       "ghp_custom123",
+      false,
     );
   });
 
@@ -416,13 +586,39 @@ describe("run", () => {
 
     await run();
 
-    const receiptPath = path.join(runnerTemp, "stellar-canary-receipt.json");
+    const receiptPath = String(setOutputMock.mock.calls.find(([name]) => name === "receipt-path")?.[1]);
+    expect(path.isAbsolute(receiptPath)).toBe(true);
+    expect(path.dirname(receiptPath)).toBe(runnerTemp);
     expect(fs.existsSync(receiptPath)).toBe(true);
     const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as { receiptVersion: number; engineVersion: string };
     expect(receipt.receiptVersion).toBe(1);
     expect(receipt.engineVersion).toBe(PASS_REPORT.toolVersion);
     expect(setOutputMock).toHaveBeenCalledWith("receipt-path", receiptPath);
     expect(uploadReceiptMock).toHaveBeenCalledWith(receiptPath);
+  });
+
+  it("preserves distinct receipts across two invocations sharing RUNNER_TEMP (#493)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, generateReceipt: true });
+    uploadReceiptMock.mockResolvedValue({ uploaded: true });
+    const secondReport = { ...PASS_REPORT, toolVersion: "0.9.9" };
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(secondReport), stderr: "" });
+
+    await run();
+    const firstPath = String(setOutputMock.mock.calls.find(([name]) => name === "receipt-path")?.[1]);
+    setOutputMock.mockClear();
+    await run();
+    const secondPath = String(setOutputMock.mock.calls.find(([name]) => name === "receipt-path")?.[1]);
+
+    expect(firstPath).not.toBe(secondPath);
+    for (const receiptPath of [firstPath, secondPath]) {
+      expect(path.isAbsolute(receiptPath)).toBe(true);
+      expect(path.dirname(receiptPath)).toBe(runnerTemp);
+      expect(fs.existsSync(receiptPath)).toBe(true);
+    }
+    expect(fs.readFileSync(firstPath, "utf8")).not.toBe(fs.readFileSync(secondPath, "utf8"));
+    expect(uploadReceiptMock).toHaveBeenCalledWith(firstPath);
+    expect(uploadReceiptMock).toHaveBeenCalledWith(secondPath);
   });
 
   // Negative testing from the issue: a failed receipt upload is auxiliary —
@@ -450,5 +646,784 @@ describe("run", () => {
     expect(setOutputMock).not.toHaveBeenCalledWith("receipt-path", expect.anything());
     expect(uploadReceiptMock).not.toHaveBeenCalled();
   });
-});
+  // #415: artifact retention input and artifact outputs
+  it("uploads report, sets artifact outputs, and links artifact in summary when uploadReport is true (#415)", async () => {
+    getInputsMock.mockReturnValue({
+      ...INPUTS,
+      uploadReport: true,
+      reportRetentionDays: 7,
+    });
+    uploadReportMock.mockResolvedValueOnce({
+      uploaded: true,
+      name: "stellar-protocol-canary-report",
+      id: 1234,
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
 
+    await run();
+
+    expect(uploadReportMock).toHaveBeenCalledWith(
+      expect.stringContaining("stellar-canary-report"),
+      "protocol-28-network-testnet",
+      7,
+      [],
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "stellar-protocol-canary-report");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "1234");
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+      PASS_REPORT,
+      expect.objectContaining({ engineVersion: "0.1.0" }),
+      { id: 1234, name: "stellar-protocol-canary-report" },
+    );
+  });
+
+  it("sets artifact-name to the fallback name used after collision (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+    uploadReportMock.mockResolvedValueOnce({
+      uploaded: true,
+      name: "stellar-protocol-canary-report-protocol-28-network-testnet",
+      id: 5678,
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith(
+      "artifact-name",
+      "stellar-protocol-canary-report-protocol-28-network-testnet",
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "5678");
+  });
+
+  it("sets empty artifact outputs when uploadReport is disabled (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: false });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(uploadReportMock).not.toHaveBeenCalled();
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+      PASS_REPORT,
+      expect.objectContaining({ engineVersion: "0.1.0" }),
+    );
+  });
+
+  it("sets empty artifact outputs when uploadReport fails (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+    uploadReportMock.mockResolvedValueOnce({
+      uploaded: false,
+      reason: "service unavailable",
+    });
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
+    expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+      PASS_REPORT,
+      expect.objectContaining({ engineVersion: "0.1.0" }),
+    );
+  });
+
+  it("sets empty artifact outputs and logs warning when uploadReport throws (#415)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+    uploadReportMock.mockRejectedValueOnce(new Error("unexpected upload failure"));
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 0,
+      signal: null,
+      stdout: JSON.stringify(PASS_REPORT),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(warningMock).toHaveBeenCalledWith(
+      expect.stringContaining("unexpected upload failure"),
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-name", "");
+    expect(setOutputMock).toHaveBeenCalledWith("artifact-id", "");
+  });
+
+  // #333: the coverage-state output is what a downstream promotion job reads,
+  // so run() has to derive it from the parsed report on every successful run —
+  // including one whose fixtures were only partially exercised.
+  it("sets coverage-state from the parsed report on the success path", async () => {
+    const partiallySkipped = {
+      ...PASS_REPORT,
+      status: "fail" as const,
+      results: [result({ testId: "a", surface: "xdr", status: "fail", summary: "mismatch", fixtureId: "a" })],
+      skipped: [{ fixtureId: "b", surface: "xdr", reason: "fixture targets protocol 27" }],
+      counts: { total: 1, passed: 0, failed: 1, warnings: 0, errors: 0, skipped: 1 },
+    };
+    runCheckMock.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      stdout: JSON.stringify(partiallySkipped),
+      stderr: "",
+    });
+
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "partial");
+    expect(infoMock).toHaveBeenCalledWith("Coverage: partial");
+  });
+
+  it("sets coverage-state to `full` for a report with no skips and `none` for an empty report", async () => {
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    await run();
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "full");
+
+    setOutputMock.mockClear();
+    infoMock.mockClear();
+
+    const emptyReport = {
+      ...PASS_REPORT,
+      results: [],
+      counts: { total: 0, passed: 0, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+    };
+    runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(emptyReport), stderr: "" });
+    await run();
+
+    expect(setOutputMock).toHaveBeenCalledWith("coverage-state", "none");
+    expect(infoMock).toHaveBeenCalledWith("Coverage: none");
+  });
+
+  describe("issue #414: engine-version, total, skipped and observed-protocol outputs", () => {
+    it("sets engine-version, total, skipped and observed-protocol on success", async () => {
+      ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
+      const testReport = report({
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0, skipped: 1 },
+        network: { name: "testnet", observedProtocol: 28 },
+        results: ["a", "b", "c", "d"].map((testId) => result({ testId, fixtureId: testId })),
+        skipped: [{ fixtureId: "e", surface: "soroban", reason: "disabled" }],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "4");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "1");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
+    });
+
+    it("sets engine-version, total, skipped and observed-protocol on compatibility failure", async () => {
+      ensureCanaryInstalledMock.mockResolvedValueOnce({ binaryPath: BINARY_PATH, version: "0.1.2" });
+      const testReport = report({
+        status: "fail",
+        counts: { total: 3, passed: 1, failed: 2, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet", observedProtocol: 28 },
+        results: [
+          result({ testId: "a", status: "pass", fixtureId: "a" }),
+          result({ testId: "b", status: "fail", fixtureId: "b" }),
+          result({ testId: "c", status: "fail", fixtureId: "c" }),
+        ],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 1, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.2");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "3");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "28");
+    });
+
+    it("sets observed-protocol to empty string for an offline run (no network object)", async () => {
+      const testReport = report({
+        status: "pass",
+        counts: { total: 2, passed: 2, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+    });
+
+    it("sets observed-protocol to empty string when network is present but observedProtocol is missing or NaN", async () => {
+      const missingObserved = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet" },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(missingObserved), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+
+      setOutputMock.mockClear();
+      const nanObserved = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        network: { name: "testnet", observedProtocol: Number.NaN },
+        results: [result({ testId: "a", fixtureId: "a" })],
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(nanObserved), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+    });
+
+    it("sets total and skipped when counts.skipped is absent in older engine report", async () => {
+      const rawJson = {
+        schemaVersion: 1,
+        toolVersion: "0.1.0",
+        targetProtocol: 28,
+        project: { name: "mock-project", type: "soroban" },
+        status: "pass",
+        counts: { total: 4, passed: 4, failed: 0, warnings: 0, errors: 0 },
+        results: [
+          {
+            testId: "p28-xdr-1",
+            protocol: 28,
+            surface: "xdr",
+            status: "pass",
+            summary: "ok",
+            durationMs: 1,
+            fixtureId: "p28-xdr-1",
+          },
+        ],
+        git: { commit: "deadbeef", branch: "main", isDirty: false },
+      };
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(rawJson), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("total", "4");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+    });
+
+    it("sets failure outputs with resolved engine-version when execution fails after install succeeded", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, version: "0.1.1" });
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "0.1.1");
+    });
+
+    it("sets failure outputs with empty engine-version when installation fails", async () => {
+      ensureCanaryInstalledMock.mockRejectedValueOnce(
+        new InstallationFailedError("cargo install failed", "error[E0432]: unresolved import\n"),
+      );
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("total", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("skipped", "0");
+      expect(setOutputMock).toHaveBeenCalledWith("observed-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+    });
+  });
+
+  // #400: fixtures-dir is validated after input parsing and before version
+  // resolution or installation. The regression test is the execution-order
+  // one: under the original behavior, a missing fixtures directory went
+  // straight into resolveVersion and ensureCanaryInstalled and failed only
+  // when the engine ran — those spies must now stay untouched.
+  describe("issue #400: fixtures-dir fails fast before installation", () => {
+    it("a missing fixtures directory fails before resolveVersion, installation, and execution", async () => {
+      const missing = path.join(runnerTemp, "no-such-fixtures");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: missing });
+
+      await run();
+
+      // The validation error reaches the failure path verbatim: the input
+      // name, the resolved absolute path, and the reason.
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failed = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failed).toContain("Protocol Canary could not be executed.");
+      expect(failed).toContain('"fixtures-dir"');
+      expect(failed).toContain(path.resolve(missing));
+      expect(failed).toContain("does not exist");
+
+      // Nothing downstream of input validation ran.
+      expect(resolveVersionMock).not.toHaveBeenCalled();
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+
+      // The existing execution-failure reporting receives the error: the
+      // annotation (annotations: true), the summary, and the outputs.
+      expect(errorMock).toHaveBeenCalledTimes(1);
+      expect(String(errorMock.mock.calls[0]?.[0])).toContain('"fixtures-dir"');
+      expect(renderExecutionFailureMarkdownMock).toHaveBeenCalledWith(
+        expect.stringContaining('"fixtures-dir"'),
+        "",
+      );
+      expect(writeSummaryMock).toHaveBeenCalledWith("## Stellar Protocol Canary (execution failure)");
+      expect(setOutputMock).toHaveBeenCalledWith("status", "execution-failed");
+      expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
+      expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+    });
+
+    it("allow-empty: true warns about the missing directory and proceeds to resolution and installation", async () => {
+      const missing = path.join(runnerTemp, "no-such-fixtures");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: missing, allowEmpty: true });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      // The warning names the input and the resolved path, and the run
+      // continues down the normal execution path.
+      expect(warningMock).toHaveBeenCalledTimes(1);
+      const warning = String(warningMock.mock.calls[0]?.[0]);
+      expect(warning).toContain('"fixtures-dir"');
+      expect(warning).toContain(path.resolve(missing));
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(resolveVersionMock).toHaveBeenCalledTimes(1);
+      expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
+      expect(runCheckMock).toHaveBeenCalledTimes(1);
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      // The missing directory is never created behind the user's back.
+      expect(fs.existsSync(missing)).toBe(false);
+    });
+
+    it("a fixtures path that is a regular file is rejected even with allow-empty", async () => {
+      const file = path.join(runnerTemp, "fixtures.toml");
+      fs.writeFileSync(file, "[tests]\n", "utf8");
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesDir: file, allowEmpty: true });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failed = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failed).toContain('"fixtures-dir"');
+      expect(failed).toContain(path.resolve(file));
+      expect(failed).toContain("is not a directory");
+
+      expect(resolveVersionMock).not.toHaveBeenCalled();
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+    });
+
+    it("an existing fixtures directory keeps the original execution path", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(warningMock).not.toHaveBeenCalled();
+      expect(resolveVersionMock).toHaveBeenCalledTimes(1);
+      expect(ensureCanaryInstalledMock).toHaveBeenCalledTimes(1);
+      expect(runCheckMock).toHaveBeenCalledTimes(1);
+      expect(setFailedMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // #399: every invocation writes its report to a uniquely named file
+  // directly inside RUNNER_TEMP, so two Action steps in one job can never
+  // overwrite each other's report. The filename is always a single safe
+  // path component: `stellar-canary-report-<sanitized GITHUB_ACTION>-<hex>.json`.
+  describe("issue #399: unique report path per invocation", () => {
+    const SAFE_NAME = /^stellar-canary-report-[A-Za-z0-9_-]+-[0-9a-f]{16}\.json$/;
+
+    beforeEach(() => {
+      process.env.GITHUB_ACTION = "canary-check";
+      runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    });
+
+    it("generates a different path for every invocation with an identical environment", async () => {
+      await run();
+      const first = reportOutputPath();
+      setOutputMock.mockClear();
+      await run();
+      const second = reportOutputPath();
+
+      expect(first).not.toBe(second);
+      expect(fs.existsSync(first)).toBe(true);
+      expect(fs.existsSync(second)).toBe(true);
+      // The first report is untouched by the second invocation.
+      expect(JSON.parse(fs.readFileSync(first, "utf8"))).toEqual(PASS_REPORT);
+    });
+
+    it("generates only absolute paths", async () => {
+      await run();
+      expect(path.isAbsolute(reportOutputPath())).toBe(true);
+    });
+
+    it("places the report directly inside the configured RUNNER_TEMP", async () => {
+      await run();
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(runnerTemp);
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+    });
+
+    it("falls back to os.tmpdir() when RUNNER_TEMP is unset", async () => {
+      delete process.env.RUNNER_TEMP;
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(os.tmpdir());
+      expect(path.isAbsolute(reportPath)).toBe(true);
+      expect(fs.existsSync(reportPath)).toBe(true);
+      fs.rmSync(reportPath, { force: true });
+    });
+
+    it("embeds a normal GITHUB_ACTION identifier safely in the filename", async () => {
+      process.env.GITHUB_ACTION = "StellarCanary-ProtocolCanary-Action__check";
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.dirname(reportPath)).toBe(runnerTemp);
+      expect(path.basename(reportPath)).toContain("StellarCanary-ProtocolCanary-Action__check");
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+    });
+
+    it("produces different filenames for two invocations with the same GITHUB_ACTION", async () => {
+      await run();
+      const first = reportOutputPath();
+      setOutputMock.mockClear();
+      await run();
+      const second = reportOutputPath();
+
+      expect(path.basename(first)).toContain("canary-check");
+      expect(path.basename(second)).toContain("canary-check");
+      expect(path.basename(first)).not.toBe(path.basename(second));
+    });
+
+    it("cannot escape RUNNER_TEMP via traversal or separator GITHUB_ACTION values", async () => {
+      const malicious = ["../", "../../other", "foo/bar", "foo\\bar", "..\\..\\windows", "a/../../b"];
+
+      for (const value of malicious) {
+        process.env.GITHUB_ACTION = value;
+        setOutputMock.mockReset();
+
+        await run();
+
+        const reportPath = reportOutputPath();
+        expect(path.isAbsolute(reportPath)).toBe(true);
+        // No traversal component survives: the file lands directly in RUNNER_TEMP.
+        expect(path.dirname(reportPath)).toBe(runnerTemp);
+        // The filename is a single path component of safe characters only.
+        expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+        expect(path.basename(reportPath)).not.toContain("/");
+        expect(path.basename(reportPath)).not.toContain("\\");
+      }
+    });
+
+    it("removes spaces and Unicode from the identifier", async () => {
+      process.env.GITHUB_ACTION = "my step \u{1F680} name";
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+      expect(path.basename(reportPath)).toContain("my-step-name");
+    });
+
+    it("produces a valid filename when GITHUB_ACTION is unset, empty, or separator-only", async () => {
+      delete process.env.GITHUB_ACTION;
+      await run();
+      const unset = reportOutputPath();
+      expect(path.basename(unset)).toMatch(SAFE_NAME);
+      expect(path.dirname(unset)).toBe(runnerTemp);
+
+      for (const unusable of ["", "/", "../.."]) {
+        process.env.GITHUB_ACTION = unusable;
+        setOutputMock.mockClear();
+        await run();
+        const reportPath = reportOutputPath();
+        expect(path.basename(reportPath)).toMatch(SAFE_NAME);
+        expect(path.dirname(reportPath)).toBe(runnerTemp);
+      }
+    });
+
+    it("uses the one generated path for the file, the report output, and the artifact upload", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, uploadReport: true });
+      uploadReportMock.mockResolvedValue({ uploaded: true });
+
+      await run();
+
+      const reportPath = reportOutputPath();
+      expect(path.isAbsolute(reportPath)).toBe(true);
+      // The file at the advertised path holds exactly this invocation's report.
+      expect(JSON.parse(fs.readFileSync(reportPath, "utf8"))).toEqual(PASS_REPORT);
+      // The artifact upload received the same single path — the generator
+      // was not called again for the upload.
+      expect(uploadReportMock).toHaveBeenCalledTimes(1);
+      expect(uploadReportMock).toHaveBeenCalledWith(reportPath, expect.any(String), undefined, []);
+    });
+  });
+
+  describe("issue #508: report write failure handling", () => {
+    it("handles EACCES/ENOENT/ENOSPC report file write failure without failing execution", async () => {
+      // Set RUNNER_TEMP to a non-existent or read-only directory
+      process.env.RUNNER_TEMP = path.join(runnerTemp, "nonexistent-dir", "sub");
+
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify(PASS_REPORT),
+        stderr: "",
+      });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to write JSON report to"),
+      );
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringContaining("ENOENT"),
+      );
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(setOutputMock).toHaveBeenCalledWith("passed", "1");
+      expect(setOutputMock).not.toHaveBeenCalledWith("report", expect.anything());
+      expect(renderSummaryMarkdownMock).toHaveBeenCalledWith(
+        PASS_REPORT,
+        expect.objectContaining({ reportWriteError: "ENOENT" }),
+      );
+    });
+
+    it("safe cleanup failures do not abort execution", async () => {
+      // The report path is unique per invocation (#399), so a directory cannot
+      // be planted at it in advance. Point RUNNER_TEMP at a regular file
+      // instead: the write fails with ENOTDIR, a different errno from the
+      // missing-directory case above (Windows reports it as ENOENT).
+      const notADirectory = path.join(runnerTemp, "not-a-directory");
+      fs.writeFileSync(notADirectory, "", "utf8");
+      process.env.RUNNER_TEMP = notADirectory;
+
+      runCheckMock.mockResolvedValueOnce({
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify(PASS_REPORT),
+        stderr: "",
+      });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(warningMock).toHaveBeenCalledWith(
+        expect.stringMatching(/ENOTDIR|ENOENT/),
+      );
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    });
+  });
+
+  describe("issue #340: fixture-pack identity outputs", () => {
+    it("sets pack-protocol, pack-version and pack-digest from the report and inputs", async () => {
+      const digest = `sha256:${"b".repeat(64)}`;
+      const testReport = report({
+        status: "pass",
+        counts: { total: 1, passed: 1, failed: 0, warnings: 0, errors: 0, skipped: 0 },
+        results: [result({ testId: "a", fixtureId: "a" })],
+        fixturePack: { digest, protocol: 28 },
+      });
+      getInputsMock.mockReturnValue({ ...INPUTS, fixturesPackVersion: "v1.2.0", fixturesPackProtocol: 28 });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(testReport), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "28");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "v1.2.0");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", digest);
+    });
+
+    it("sets empty pack outputs when no external pack is in use", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+
+    it("clears pack outputs on an execution failure instead of leaking a stale identity", async () => {
+      runCheckMock.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      await run();
+
+      expect(setOutputMock).toHaveBeenCalledWith("pack-protocol", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-version", "");
+      expect(setOutputMock).toHaveBeenCalledWith("pack-digest", "");
+    });
+  });
+
+  describe("issue #344: baseline report failure modes", () => {
+    function baselineFile(contents: string): string {
+      const file = path.join(runnerTemp, "baseline.json");
+      fs.writeFileSync(file, contents, "utf8");
+      return file;
+    }
+
+    it("fails before installation on an invalid JSON baseline with a parse annotation", async () => {
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baselineFile('{"schemaVersion": 1,') });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(runCheckMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("baseline-report");
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("could not be parsed as JSON");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("baseline validation failed"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+    });
+
+    it("fails before installation when the baseline schemaVersion is unsupported", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ schemaVersion: 99 }))),
+      });
+
+      await run();
+
+      expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("schemaVersion 99");
+    });
+
+    it("halts with an incompatibility diagnostic when the baseline targets another protocol", async () => {
+      getInputsMock.mockReturnValue({
+        ...INPUTS,
+        baselineReport: baselineFile(JSON.stringify(report({ targetProtocol: 27 }))),
+      });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).toHaveBeenCalledTimes(1);
+      const failure = String(setFailedMock.mock.calls[0]?.[0]);
+      expect(failure).toContain("Incompatible baseline report");
+      expect(failure).toContain("targets protocol 27, but this run targets protocol 28");
+      expect(errorMock).toHaveBeenCalledWith(
+        expect.stringContaining("targets protocol 27"),
+        expect.objectContaining({ title: "Stellar Protocol Canary" }),
+      );
+      // No regression claim is made and no compatibility outputs are published.
+      expect(setOutputMock).not.toHaveBeenCalledWith("status", expect.anything());
+    });
+
+    it("validates a matching baseline without claiming a regression verdict", async () => {
+      const baseline = baselineFile(JSON.stringify(report({ targetProtocol: 28 })));
+      getInputsMock.mockReturnValue({ ...INPUTS, baselineReport: baseline });
+      runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+      await run();
+
+      expect(setFailedMock).not.toHaveBeenCalled();
+      expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("validated for protocol 28"));
+      expect(infoMock).toHaveBeenCalledWith(expect.stringContaining("no regression verdict"));
+    });
+  });
+
+  it("fails before any install or engine run when a scoped input the engine cannot honour is set (#458)", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, fixture: "p28-xdr-cap83-empty-tx-set" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"fixture"');
+    expect(message).toContain("Canary 0.1.0");
+    expect(message).toMatch(/no released Protocol-Canary engine supports (it|them) yet/);
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("names every scoped input in the #458 gate failure and still never installs", async () => {
+    getInputsMock.mockReturnValue({ ...INPUTS, surface: "rpc", cacheDir: "cache" });
+
+    await run();
+
+    expect(setFailedMock).toHaveBeenCalledTimes(1);
+    const message = String(setFailedMock.mock.calls[0]?.[0]);
+    expect(message).toContain('"surface"');
+    expect(message).toContain('"cache-dir"');
+    expect(ensureCanaryInstalledMock).not.toHaveBeenCalled();
+    expect(runCheckMock).not.toHaveBeenCalled();
+  });
+
+  it("never starts the JUnit render when junit-report is unset (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+
+    await run();
+
+    expect(runCheckMock).toHaveBeenCalledTimes(1);
+    expect(renderJUnitReportMock).not.toHaveBeenCalled();
+    expect(setOutputMock).not.toHaveBeenCalledWith("junit-report-path", expect.anything());
+  });
+
+  it("renders JUnit, sets junit-report-path, and keeps status when junit-report is true (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    const junitPath = path.join(runnerTemp, "stellar-canary-report.junit.xml");
+    fs.writeFileSync(junitPath, '<?xml version="1.0"?>\n<testsuites></testsuites>\n', "utf8");
+    renderJUnitReportMock.mockResolvedValueOnce({ path: junitPath });
+    getInputsMock.mockReturnValue({ ...INPUTS, junitReport: true });
+
+    await run();
+
+    // The check itself still runs exactly once; the renderer is a second,
+    // separate engine process only when the input is enabled.
+    expect(runCheckMock).toHaveBeenCalledTimes(1);
+    expect(renderJUnitReportMock).toHaveBeenCalledWith(
+      BINARY_PATH,
+      reportOutputPath(),
+      60_000,
+    );
+    expect(setOutputMock).toHaveBeenCalledWith("junit-report-path", junitPath);
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(warningMock).not.toHaveBeenCalled();
+  });
+
+  it("warns without changing status when the JUnit render fails (#423)", async () => {
+    runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
+    renderJUnitReportMock.mockResolvedValueOnce({
+      reason: "the engine's report command exited with code 2: unknown subcommand \"report\"",
+    });
+    getInputsMock.mockReturnValue({ ...INPUTS, junitReport: true });
+
+    await run();
+
+    expect(warningMock).toHaveBeenCalledWith(expect.stringContaining("JUnit report not produced"));
+    expect(warningMock).toHaveBeenCalledWith(expect.stringContaining("status are unchanged"));
+    expect(setOutputMock).not.toHaveBeenCalledWith("junit-report-path", expect.anything());
+    expect(setOutputMock).toHaveBeenCalledWith("status", "pass");
+    expect(setFailedMock).not.toHaveBeenCalled();
+  });
+});

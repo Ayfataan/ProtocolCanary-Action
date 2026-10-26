@@ -27,7 +27,7 @@ permissions:
 jobs:
   canary:
     name: Call the reusable workflow against the sample project
-    uses: ./.github/workflows/reusable-canary-check.yml
+    uses: ./.github/workflows/reusable-canary-check.yml # zizmor: ignore[self-repository] local workspace-relative path used for in-repo testing of the reusable workflow
     with:
       project-root: tests/fixtures/conformance-project
       protocol: 28
@@ -37,6 +37,7 @@ jobs:
     needs: canary
     if: '!cancelled()'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -88,7 +89,7 @@ jobs:
         id: verify-outputs
         shell: bash
         env:
-          CANARY_OUTCOME: ${{ needs.canary.outcome }}
+          CANARY_OUTCOME: ${{ needs.canary.result }}
           CANARY_EXIT_CODE: ${{ needs.canary.outputs.exit-code }}
           CANARY_DIFF_VERDICT: ${{ needs.canary.outputs.diff-verdict }}
           CANARY_REPORT_PATH: ${{ needs.canary.outputs.report-path }}
