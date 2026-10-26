@@ -49,6 +49,8 @@ checksums. This Action installs it from source with `cargo install --git`,
 which:
 
 - always uses HTTPS to reach GitHub;
+- installs into an Action-owned directory under `RUNNER_TEMP` and does not
+  modify the runner's shared Cargo bin directory or `PATH`;
 - pins the exact requested version (the `version` input) — never `main`,
   never an unpinned "latest";
 - resolves that version's tag to the immutable commit it pointed to at run

@@ -1,6 +1,8 @@
 import * as https from "node:https";
 import type { IncomingHttpHeaders } from "node:http";
 
+import { consumeResponse, MAX_API_RESPONSE_BYTES } from "./http-response";
+
 export type GitHubRequestFailureKind = "network" | "timeout" | "server" | "rate-limit" | "http";
 
 export class GitHubRequestError extends Error {
@@ -19,8 +21,6 @@ export class GitHubRequestError extends Error {
 const MAX_ATTEMPTS = 3;
 const REQUEST_TIMEOUT_MS = 10_000;
 const OVERALL_TIMEOUT_MS = 25_000;
-const MAX_RETRY_AFTER_MS = 2_000;
-
 function rateLimitReset(headers: IncomingHttpHeaders | undefined): Date | undefined {
   if (headers === undefined) {
     return undefined;
@@ -48,13 +48,27 @@ function requestOnce(
   url: string,
   token: string | undefined,
   timeoutMs: number,
+  maxResponseBytes: number,
 ): Promise<{ body: string; headers: IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
+    let hostname: string;
+    try {
+      const parsedUrl = new URL(url);
+      if (parsedUrl.protocol !== "https:") {
+        reject(new GitHubRequestError(`refusing non-HTTPS GitHub API URL ${url}`, "http"));
+        return;
+      }
+      hostname = parsedUrl.hostname;
+    } catch (error) {
+      reject(new GitHubRequestError(`invalid GitHub API URL ${url}: ${String(error)}`, "http"));
+      return;
+    }
+
     const headers: Record<string, string> = {
       "User-Agent": "ProtocolCanary-Action",
       Accept: "application/vnd.github+json",
     };
-    if (token !== undefined) {
+    if (token !== undefined && hostname === "api.github.com") {
       headers.Authorization = `Bearer ${token}`;
     }
 
@@ -78,13 +92,21 @@ function requestOnce(
         return;
       }
 
-      let body = "";
-      response.setEncoding("utf8");
-      response.on("data", (chunk: string) => {
-        body += chunk;
-      });
-      response.on("end", () => resolve({ body, headers: response.headers }));
-      response.on("error", reject);
+      const chunks: Buffer[] = [];
+      consumeResponse(response, url, maxResponseBytes, (chunk) => chunks.push(chunk))
+        .then(() => resolve({ body: Buffer.concat(chunks).toString("utf8"), headers: response.headers }))
+        .catch((error: unknown) => {
+          request.destroy();
+          reject(
+            error instanceof GitHubRequestError
+              ? error
+              : new GitHubRequestError(
+                  error instanceof Error ? error.message : String(error),
+                  "http",
+                  response.statusCode,
+                ),
+          );
+        });
     });
 
     request.on("timeout", () => {
@@ -104,19 +126,15 @@ function retryDelay(error: GitHubRequestError, attempt: number): number | undefi
   if (error.kind === "network" || error.kind === "server") {
     return Math.min(250 * 2 ** (attempt - 1), 2_000);
   }
-  if (
-    error.kind === "rate-limit" &&
-    error.statusCode !== undefined &&
-    error.retryAfterMs !== undefined &&
-    error.retryAfterMs <= MAX_RETRY_AFTER_MS
-  ) {
-    return error.retryAfterMs;
-  }
   return undefined;
 }
 
 /** Performs a bounded GitHub HTTPS GET, retrying only transient failures. */
-export async function githubFetch(url: string, token?: string): Promise<{ body: string; headers: IncomingHttpHeaders }> {
+export async function githubFetch(
+  url: string,
+  token?: string,
+  maxResponseBytes = MAX_API_RESPONSE_BYTES,
+): Promise<{ body: string; headers: IncomingHttpHeaders }> {
   const deadline = Date.now() + OVERALL_TIMEOUT_MS;
   let lastError: GitHubRequestError | undefined;
   let attemptsMade = 0;
@@ -128,7 +146,7 @@ export async function githubFetch(url: string, token?: string): Promise<{ body: 
     }
     attemptsMade = attempt;
     try {
-      return await requestOnce(url, token, Math.min(REQUEST_TIMEOUT_MS, remaining));
+      return await requestOnce(url, token, Math.min(REQUEST_TIMEOUT_MS, remaining), maxResponseBytes);
     } catch (error) {
       lastError = error instanceof GitHubRequestError
         ? error

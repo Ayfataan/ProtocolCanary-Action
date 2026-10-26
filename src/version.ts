@@ -1,8 +1,8 @@
 import * as core from "@actions/core";
-import * as https from "node:https";
 
 import { InvalidInputError } from "./errors";
-import { MAX_API_RESPONSE_BYTES, readResponseText } from "./http-response";
+import { MAX_API_RESPONSE_BYTES } from "./http-response";
+import { GitHubRequestError, githubFetch } from "./github";
 import { resolveGithubToken } from "./inputs";
 
 /**
@@ -175,6 +175,22 @@ export async function resolveVersion(
       return undefined;
     }
 
+    if (error instanceof GitHubRequestError && error.kind === "rate-limit") {
+      const resetMessage =
+        error.resetAt === undefined
+          ? "The reset time is unavailable."
+          : `The rate limit resets at ${error.resetAt.toISOString()}.`;
+      core.warning(
+        `GitHub API rate limit prevented resolving ${tag}. ${resetMessage} Falling back to tag-only pinning.`,
+      );
+      return undefined;
+    }
+
+    if (error instanceof GitHubRequestError && error.kind === "server" && message.includes("failed after retries")) {
+      core.warning(`GitHub API lookup for ${tag} failed after retries; falling back to tag-only pinning: ${message}`);
+      return undefined;
+    }
+
     core.debug(`Could not resolve ${tag} to a commit sha, falling back to tag pinning: ${String(error)}`);
     return undefined;
   });
@@ -216,48 +232,14 @@ function parseNextLink(header: string | string[] | undefined): string | undefine
   return undefined;
 }
 
-/** Fetches and parses a single page of the `tags` list endpoint. Rejects on
- * a non-200 response, malformed JSON, or an unexpected response shape. */
-function fetchTagsPage(url: string, token: string | undefined): Promise<TagsPage> {
-  return new Promise((resolve, reject) => {
-    let hostname: string;
-    try {
-      hostname = new URL(url).hostname;
-    } catch (err) {
-      reject(err instanceof Error ? err : new Error(String(err)));
-      return;
-    }
-
-    const headers: Record<string, string> = {
-      "User-Agent": "ProtocolCanary-Action",
-      Accept: "application/vnd.github+json",
-    };
-    if (token !== undefined && hostname === "api.github.com") {
-      headers.Authorization = `Bearer ${token}`;
-    }
-
-    const request = https.get(url, { headers, timeout: 10_000 }, (response) => {
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`GitHub API returned status ${String(response.statusCode)} for ${url}`));
-        return;
-      }
-      readResponseText(response, url, MAX_API_RESPONSE_BYTES).then((body) => {
-        const parsed = JSON.parse(body) as unknown;
-        if (!Array.isArray(parsed)) {
-          throw new Error("unexpected response shape from GitHub API");
-        }
-        resolve({ tags: parsed as GitHubTag[], next: parseNextLink(response.headers.link) });
-      }).catch((error: unknown) => {
-        request.destroy();
-        reject(error);
-      });
-    });
-    request.on("timeout", () => {
-      request.destroy(new Error(`timed out resolving ${url}`));
-    });
-    request.on("error", reject);
-  });
+/** Fetches and parses a single bounded page of the `tags` list endpoint. */
+async function fetchTagsPage(url: string, token: string | undefined): Promise<TagsPage> {
+  const { body, headers } = await githubFetch(url, token, MAX_API_RESPONSE_BYTES);
+  const parsed = JSON.parse(body) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("unexpected response shape from GitHub API");
+  }
+  return { tags: parsed as GitHubTag[], next: parseNextLink(headers.link) };
 }
 
 /**
