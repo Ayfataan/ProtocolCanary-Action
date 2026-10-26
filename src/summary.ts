@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 
+import { formatSafeDiagnosticTail } from "./log-block";
 import { SummaryPublishFailedError } from "./errors";
 import { countReplayed } from "./output";
 import { codeSpan, escapeInline, fencedBlock, maskRpcUrl, quoteForShell } from "./markdown";
@@ -135,6 +136,25 @@ function notablyList(report: CanaryReport, statuses: readonly ("fail" | "error" 
     });
 }
 
+export interface ArtifactSummaryInfo {
+  readonly id?: number | undefined;
+  readonly name?: string | undefined;
+}
+
+/**
+ * Builds the GitHub Actions artifact web URL for a given artifact ID.
+ * Resolves repository and workflow run ID from environment variables when present.
+ */
+export function buildArtifactUrl(artifactId: number): string {
+  const serverUrl = (process.env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+  const repo = process.env.GITHUB_REPOSITORY;
+  const runId = process.env.GITHUB_RUN_ID;
+  if (repo && runId) {
+    return `${serverUrl}/${repo}/actions/runs/${runId}/artifacts/${String(artifactId)}`;
+  }
+  return `${serverUrl}/actions/runs/artifacts/${String(artifactId)}`;
+}
+
 /**
  * Provenance metadata for the "Provenance & Trust" summary section
  * (issue #373). Every field is optional because the upstream pipelines
@@ -156,6 +176,8 @@ export interface SummaryProvenance {
   /** Argument array the engine was invoked with (issue #416). When present,
    * the summary renders a collapsed "Reproduction command" section. */
   readonly engineArgs?: readonly string[] | undefined;
+  /** Code describing a report write persistence failure (issue #508). */
+  readonly reportWriteError?: string | undefined;
 }
 
 const UNVERIFIED_BINARY_ROW =
@@ -198,12 +220,40 @@ function provenanceLines(provenance: SummaryProvenance): string[] {
   ];
 }
 
+/**
+ * Explains an observed-protocol mismatch (#430): the engine checked the
+ * target protocol, but the network reported a different protocol version
+ * during live checks. Returns `undefined` when there is nothing to warn
+ * about — no network, no usable observed protocol, or agreement — so callers
+ * never emit a warning for a report that could not observe a protocol at
+ * all. The message is shared by the job summary and the annotation so both
+ * surfaces say exactly the same thing.
+ */
+export function protocolMismatchMessage(report: CanaryReport): string | undefined {
+  const observed = report.network?.observedProtocol;
+  const target = report.targetProtocol;
+  if (typeof observed !== "number" || !Number.isInteger(observed) || observed <= 0) {
+    return undefined;
+  }
+  if (!Number.isInteger(target) || target <= 0 || observed === target) {
+    return undefined;
+  }
+  return (
+    `Protocol mismatch: the network reported protocol ${String(observed)}, ` +
+    `but this run targets protocol ${String(target)}.`
+  );
+}
+
 /** Pure Markdown rendering, kept separate from `core.summary` so it can be
  * golden/snapshot-tested without a GitHub Actions runtime. `provenance`
  * renders the Provenance & Trust section (issue #373) and the reproduction
  * command (issue #416); omitting it renders no section, keeping every
  * pre-provenance consumer's output identical. */
-export function renderSummaryMarkdown(report: CanaryReport, provenance?: SummaryProvenance): string {
+export function renderSummaryMarkdown(
+  report: CanaryReport,
+  provenance?: SummaryProvenance,
+  artifact?: ArtifactSummaryInfo,
+): string {
   const lines: string[] = [];
   lines.push("## Stellar Protocol Canary", "");
   lines.push(`Protocol: ${escapeInline(String(report.targetProtocol))}`);
@@ -215,7 +265,19 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
         : "";
     lines.push(`Network: ${escapeInline(report.network.name)}${observed}`);
   }
-  lines.push(`Canary version: ${escapeInline(report.toolVersion)}`, "");
+  // A live-check network that reports a different protocol than the target
+  // (#430) is worth surfacing prominently: the checks still describe the
+  // target protocol, not what the network is currently running.
+  const mismatch = protocolMismatchMessage(report);
+  if (mismatch !== undefined) {
+    lines.push(`> ⚠️ ${mismatch}`, "");
+  }
+  lines.push(`Canary version: ${escapeInline(report.toolVersion)}`);
+  if (artifact?.id !== undefined) {
+    const name = artifact.name || "stellar-protocol-canary-report";
+    lines.push(`Report artifact: [${name}](${buildArtifactUrl(artifact.id)})`);
+  }
+  lines.push("");
 
   const rows = SURFACE_ORDER.map((surface) => surfaceRowLabel(report.results, surface)).filter(
     (row): row is string => row !== undefined,
@@ -238,6 +300,13 @@ export function renderSummaryMarkdown(report: CanaryReport, provenance?: Summary
     const percent = total > 0 ? Math.round((replayed / total) * 100) : 0;
     lines.push(
       `> ♻️ **Replayed from cache:** ${String(replayed)}/${String(total)} checks (${String(percent)}%) came from the engine's result cache rather than being executed in this run.`,
+      "",
+    );
+  }
+
+  if (provenance?.reportWriteError !== undefined) {
+    lines.push(
+      `> ⚠️ **Report persistence warning:** Could not write the JSON report to disk (${escapeInline(provenance.reportWriteError)}). The report artifact was not uploaded.`,
       "",
     );
   }
@@ -331,7 +400,11 @@ const MAX_EMBEDDED_FENCE_LENGTH = 20;
  * Markdown rendering of an execution failure — the "Canary could not run
  * at all" case, distinct from a compatibility failure the report describes.
  *
- * The diagnostic is embedded verbatim inside a fenced code block, but it is
+ * Reasons and diagnostic blocks each retain at most 40 tail lines plus
+ * the truncation notice, within 8 KiB UTF-8 including that notice (#499).
+ * Markdown scaffolding is outside this content budget.
+ *
+ * The sanitized diagnostic is embedded inside a fenced code block, but it is
  * raw text from an external process (stderr, a timeout notice), so it may
  * itself contain ``` (e.g. a compiler/panic message quoting a code block).
  * A fixed fence would be closed early by that sequence, and the rest of the
@@ -340,8 +413,12 @@ const MAX_EMBEDDED_FENCE_LENGTH = 20;
  * strategy CommonMark §Fenced code blocks specifies for embedding such
  * content.
  */
-export function renderExecutionFailureMarkdown(reason: string, diagnostic: string): string {
-  const trimmed = diagnostic.trim();
+export function renderExecutionFailureMarkdown(
+  reason: string,
+  diagnostic: string,
+  artifact?: ArtifactSummaryInfo,
+): string {
+  const trimmed = formatSafeDiagnosticTail(diagnostic).trim();
   // Longest run of backticks anywhere in the diagnostic, in characters.
   // Also covers the closing fence the diagnostic text may already contain,
   // because a closing fence of length n is itself a run of n backticks.
@@ -351,7 +428,7 @@ export function renderExecutionFailureMarkdown(reason: string, diagnostic: strin
   // gives nested embedding (a summary quoted inside another code block) room.
   const fenceLength = Math.max(3, longestRun + 1, MAX_EMBEDDED_FENCE_LENGTH);
   const fence = "`".repeat(fenceLength);
-  return [
+  const lines = [
     "## Stellar Protocol Canary",
     "",
     "### Result",
@@ -360,12 +437,14 @@ export function renderExecutionFailureMarkdown(reason: string, diagnostic: strin
     "",
     "Protocol Canary could not be executed.",
     "",
-    `Reason: ${reason}`,
-    "",
-    fence + "text",
-    trimmed === "" ? "(no diagnostic output)" : trimmed,
-    fence,
-  ].join("\n");
+    `Reason: ${formatSafeDiagnosticTail(reason)}`,
+  ];
+  if (artifact?.id !== undefined) {
+    const name = artifact.name || "stellar-protocol-canary-report";
+    lines.push("", `Report artifact: [${name}](${buildArtifactUrl(artifact.id)})`);
+  }
+  lines.push("", fence + "text", trimmed === "" ? "(no diagnostic output)" : trimmed, fence);
+  return lines.join("\n");
 }
 
 /**

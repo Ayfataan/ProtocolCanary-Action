@@ -34,12 +34,55 @@ inputs:
       the CLI reads are always the same.
     required: false
 
+  working-directory:
+    description: >-
+      Directory to treat as the project root of the run, forwarded as
+      `stellar-canary check --project-root` so a monorepo can check one
+      subdirectory or workspace member. Relative paths are resolved against
+      the workspace, and a path that does not exist or is not a directory
+      (for example a regular file) fails the run before Canary is invoked,
+      with the value as written and the resolved path in the error. Defaults
+      to `.` — the workspace itself, which is what Canary already uses — and
+      that default is validated but not forwarded, so runs that never set
+      this input send exactly the arguments they always did. When a value
+      *is* given, relative paths such as `--fixtures-dir` are resolved
+      against it by the engine, and it requires an engine release that
+      supports `--project-root` (Protocol-Canary E-010): older releases such
+      as the default `version` reject the unknown argument with a clear
+      usage error rather than silently checking the wrong directory.
+    required: false
+    default: "."
+
   network:
     description: >-
       Stellar network to run live RPC/Soroban checks against (for example
       `testnet`, `futurenet`, or `mainnet`). Forwarded as `--network`.
       Ignored if the project's configuration disables both RPC and
       Soroban checks.
+    required: false
+
+  network-passphrase:
+    description: >-
+      Expected Stellar network passphrase for RPC identity verification.
+      Forwarded as `--network-passphrase` by Protocol-Canary 0.3.0 and newer.
+      An explicit passphrase overrides the well-known passphrase for `network`;
+      use it for private networks or intentional endpoint overrides. Must not
+      be empty or contain control characters.
+    required: false
+    default: "\u0001"
+
+  rpc-max-retries:
+    description: >-
+      Maximum retries after a failed RPC attempt (`--rpc-max-retries`), from
+      0 to 4294967295. Zero disables retries. Forwarded by Protocol-Canary
+      0.3.0 and newer; otherwise the engine default applies.
+    required: false
+
+  rpc-retry-delay-ms:
+    description: >-
+      Base delay in milliseconds between RPC retries (`--rpc-retry-delay-ms`),
+      from 0 to 9007199254740991. The engine uses linear backoff. Forwarded by
+      Protocol-Canary 0.3.0 and newer; otherwise the engine default applies.
     required: false
 
   rpc-url:
@@ -59,6 +102,48 @@ inputs:
     required: false
     default: fixtures
 
+  fixture:
+    description: >-
+      Run only the fixture with this exact id, forwarded as the single
+      argument `--fixture=<id>` — the usual way to reproduce one failing
+      check in CI. Empty or whitespace-only means unset. Must not contain
+      control characters (C0, DEL, C1); no other characters are restricted,
+      because the engine decides what a fixture id is, and the
+      `--flag=value` form means an id beginning with `-` is still passed
+      safely. Requires a Protocol-Canary release whose `check` accepts
+      `--fixture`: with an older resolved `version` (or while no release
+      supports it) the Action fails before installing or running anything,
+      naming this input, the resolved version, and the minimum supporting
+      release — it never silently runs the whole suite instead.
+    required: false
+
+  surface:
+    description: >-
+      Run only fixtures of this surface, forwarded as the single argument
+      `--surface=<surface>`. Must be exactly one of `xdr`, `rpc`, or
+      `soroban` (lower case, as the engine accepts); anything else fails
+      the run with an input error naming the accepted values. Empty or
+      whitespace-only means unset. Same engine requirement as `fixture`:
+      with an unsupported resolved `version` the Action fails before
+      installing or running anything rather than checking every surface.
+    required: false
+
+  cache-dir:
+    description: >-
+      Directory for cached fixture results, forwarded as the single
+      argument `--cache-dir=<path>` and passed to the engine unchanged.
+      The engine — not the Action — resolves a relative path against
+      `--project-root` when one is given, so the path is deliberately not
+      resolved against `GITHUB_WORKSPACE` or the working directory. Missing
+      directories are created by the engine; a path that is an existing
+      file is rejected by the engine. May be combined with the engine's
+      cache-disabling flag (the engine accepts both). Empty or
+      whitespace-only means unset; control characters are rejected. Same
+      engine requirement as `fixture`: an unsupported resolved `version`
+      fails the run before installing or running anything rather than
+      caching results somewhere the caller did not ask for.
+    required: false
+
   version:
     description: >-
       Protocol Canary version to install and run, without a leading `v`
@@ -66,7 +151,7 @@ inputs:
       `StellarCanary/Protocol-Canary`. Reproducibility matters: this
       Action never tracks `main` or an unpinned "latest" build.
     required: false
-    default: 0.1.1
+    default: 0.2.0
 
   upload-report:
     description: >-
@@ -82,6 +167,13 @@ inputs:
     required: false
     default: "true"
 
+  report-retention-days:
+    description: >-
+      Duration in days (integer from 1 to 90) to retain the uploaded JSON
+      report artifact. If omitted, GitHub's default retention for the
+      repository is used.
+    required: false
+
   annotations:
     description: >-
       Convert compatibility failures, warnings, and execution errors into
@@ -89,6 +181,17 @@ inputs:
       report through the job summary, outputs, and JSON artifact only.
     required: false
     default: "true"
+
+  diagnostics:
+    description: >-
+      Opt in to a best-effort redacted diagnostics log bundle when Canary
+      cannot produce a usable report (for example an install failure, timeout,
+      or unparseable output). Defaults to `false`: diagnostics artifacts are
+      strictly opt-in because they are downloadable by anyone who can read the
+      repository and their redaction is best effort. The process environment
+      is never included in the bundle.
+    required: false
+    default: "false"
 
   timeout-minutes:
     description: >-
@@ -119,6 +222,22 @@ inputs:
       resolved `version` is 0.2.0 or newer. With an older version it has no
       effect, because those versions already pass an empty run and reject the
       flag. Defaults to `false`.
+    required: false
+    default: "false"
+
+  fail-on-warning:
+    description: >-
+      Fail the check when Protocol Canary reports warnings. This input is
+      ignored with a warning until Protocol-Canary releases a version that
+      supports `--fail-on-warning`; it defaults to `false`.
+    required: false
+    default: "false"
+
+  offline:
+    description: >-
+      Run without network fixtures. This input is ignored with a warning
+      until Protocol-Canary releases a version that supports `--offline`;
+      it defaults to `false`.
     required: false
     default: "false"
 
@@ -160,14 +279,13 @@ inputs:
     description: >-
       GitHub token used to authenticate read-only GitHub REST API requests
       to the public `StellarCanary/Protocol-Canary` repository (tag and release
-      lookups). Defaults to the workflow's `github.token`. If set to a non-empty value,
+      lookups). If set to a non-empty value,
       it takes precedence over the `GITHUB_TOKEN` environment variable. If empty
       or unset, the `GITHUB_TOKEN` environment variable is used if present;
       otherwise unauthenticated requests are made. Requires only `contents: read`
       permission, which works even in fork pull requests. Set to an empty string
       (`""`) to disable authentication when `GITHUB_TOKEN` is also unset.
     required: false
-    default: ${{ github.token }}
   strict-integrity:
     description: >-
       Optional fail-closed integrity policy (issue #372). Defaults to `false`,
@@ -183,6 +301,30 @@ inputs:
       endorsement, and release signing is deferred; the download-redirect
       allowlist policy (D-11) remains blocked until verified against real
       release hosts, so no redirect is followed at all today.
+    required: false
+    default: "false"
+
+  pr-comment:
+    description: >-
+      Opt in to a bounded pull request summary comment. Requires pull-requests: write
+      on same-repository pull_request workflows. Fork PRs and other events are skipped.
+      Permission failures are warnings, not failed checks. Defaults to false.
+    required: false
+    default: "false"
+
+  junit-report:
+    description: >-
+      Render the parsed JSON report to JUnit XML using the engine's own
+      command (`stellar-canary report <report.json> --format junit`) and
+      expose the file as the `junit-report-path` output. Written next to the
+      JSON report (same directory), and included in the workflow artifact
+      when `upload-report` is `true`. Requires a Protocol-Canary release
+      whose `report` command supports `--format junit` (Protocol-Canary
+      #434; not in 0.2.0): with an older engine nothing is produced and a
+      warning is logged. Any failure of this step — unsupported engine,
+      non-zero exit, empty output, missing report file — is a warning only:
+      it never changes `status` and never fails the job. Defaults to `false`,
+      so the default behaviour is unchanged.
     required: false
     default: "false"
 
@@ -263,11 +405,38 @@ outputs:
       produced output to parse; empty/unset on an execution failure (when
       status is `execution-failed`), unlike `passed`/`warnings`/`failures`/`errors`,
       which are explicitly set to `0` in that case.
+  coverage-state:
+    description: >-
+      How completely the fixture set was exercised: `full` when every
+      discovered fixture ran and nothing was skipped, `partial` when at
+      least one fixture ran but others were skipped, and `none` when no
+      fixture ran at all (an empty run, or an execution failure). Set on
+      every path, including an execution failure, where it is always
+      `none`. Intended for a downstream job that gates a promotion on
+      coverage rather than on `status` alone; `none` is the conservative
+      default for a run that cannot prove it executed the fixtures.
   receipt-path:
     description: >-
       Absolute path to the generated Execution Receipt JSON. Only set when
       `generate-receipt` is `true` and Canary produced a parseable report;
       unset otherwise, including on an execution failure.
+  junit-report-path:
+    description: >-
+      Absolute path to the generated JUnit XML file. Only set when
+      `junit-report` is `true` and the engine's `report --format junit`
+      command succeeded; unset otherwise (input disabled, engine without
+      the command, or a failed/empty render) and on an execution failure.
+      A failed render is always a warning, never a status change.
+  artifact-name:
+    description: >-
+      Name of the uploaded report artifact. Empty if upload was disabled
+      or failed, or on an execution failure. Reflects the fallback name
+      if a name collision occurred.
+  artifact-id:
+    description: >-
+      GitHub artifact ID of the uploaded report artifact. Empty if upload
+      was disabled or failed, if the client did not return an ID, or on
+      an execution failure.
 
 runs:
   using: node24

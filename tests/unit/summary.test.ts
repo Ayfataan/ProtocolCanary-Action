@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
+import { protocolMismatchMessage, renderExecutionFailureMarkdown, renderSummaryMarkdown } from "../../src/summary";
 import type { CanarySkip } from "../../src/output";
 import { report, result } from "./helpers";
 
@@ -208,6 +208,45 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).not.toContain("Network:");
   });
 
+  describe("observed protocol mismatch (#430)", () => {
+    it("renders a warning when the network reported a different protocol than the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({
+          targetProtocol: 28,
+          network: { name: "testnet", observedProtocol: 27 },
+          results: [result({ testId: "a", surface: "rpc", fixtureId: "a" })],
+        }),
+      );
+
+      expect(markdown).toContain("> ⚠️ Protocol mismatch:");
+      // Both numbers and the direction of the mismatch are stated, so a
+      // reader never has to guess which protocol the results describe.
+      expect(markdown).toContain("reported protocol 27");
+      expect(markdown).toContain("targets protocol 28");
+    });
+
+    it("does not warn when the observed protocol matches the target", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      );
+
+      expect(markdown).toContain("Network: testnet — observed protocol 28");
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no observed protocol to compare", () => {
+      const markdown = renderSummaryMarkdown(
+        report({ targetProtocol: 28, network: { name: "testnet" } }),
+      );
+
+      expect(markdown).not.toContain("Protocol mismatch");
+    });
+
+    it("does not warn when the report has no network at all", () => {
+      expect(renderSummaryMarkdown(report({ targetProtocol: 28 }))).not.toContain("Protocol mismatch");
+    });
+  });
+
   it("never fabricates a result: an empty results array renders as a trivial pass with no surface rows", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }));
     expect(markdown).not.toContain("| XDR |");
@@ -331,6 +370,42 @@ describe("renderSummaryMarkdown", () => {
     expect(markdown).not.toContain("Replayed from cache");
     expect(markdown).toContain("1/1 applicable checks passed.");
   });
+
+  it("links the report artifact when an artifact ID is available", () => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    const originalRunId = process.env.GITHUB_RUN_ID;
+    const originalServerUrl = process.env.GITHUB_SERVER_URL;
+    try {
+      process.env.GITHUB_REPOSITORY = "StellarCanary/ProtocolCanary-Action";
+      process.env.GITHUB_RUN_ID = "123456";
+      delete process.env.GITHUB_SERVER_URL;
+
+      const markdown = renderSummaryMarkdown(
+        report({ status: "pass" }),
+        undefined,
+        { id: 9876, name: "stellar-protocol-canary-report" },
+      );
+
+      expect(markdown).toContain(
+        "Report artifact: [stellar-protocol-canary-report](https://github.com/StellarCanary/ProtocolCanary-Action/actions/runs/123456/artifacts/9876)",
+      );
+    } finally {
+      if (originalRepo !== undefined) process.env.GITHUB_REPOSITORY = originalRepo;
+      else delete process.env.GITHUB_REPOSITORY;
+      if (originalRunId !== undefined) process.env.GITHUB_RUN_ID = originalRunId;
+      else delete process.env.GITHUB_RUN_ID;
+      if (originalServerUrl !== undefined) process.env.GITHUB_SERVER_URL = originalServerUrl;
+      else delete process.env.GITHUB_SERVER_URL;
+    }
+  });
+
+  it("omits the artifact link when no artifact or no ID is provided", () => {
+    const markdown1 = renderSummaryMarkdown(report({ status: "pass" }));
+    expect(markdown1).not.toContain("Report artifact:");
+
+    const markdown2 = renderSummaryMarkdown(report({ status: "pass" }), undefined, { name: "stellar-report" });
+    expect(markdown2).not.toContain("Report artifact:");
+  });
 });
 
 describe("renderExecutionFailureMarkdown", () => {
@@ -344,6 +419,34 @@ describe("renderExecutionFailureMarkdown", () => {
   it("shows a placeholder when there is no diagnostic output", () => {
     const markdown = renderExecutionFailureMarkdown("timed out", "");
     expect(markdown).toContain("(no diagnostic output)");
+  });
+
+  it("omits artifact link from execution failure summary when no artifact was uploaded", () => {
+    const markdown = renderExecutionFailureMarkdown("cargo install failed", "error: could not compile");
+    expect(markdown).not.toContain("Report artifact:");
+  });
+
+  it("links the report artifact in execution failure summary when an artifact with ID is provided", () => {
+    const originalRepo = process.env.GITHUB_REPOSITORY;
+    const originalRunId = process.env.GITHUB_RUN_ID;
+    try {
+      process.env.GITHUB_REPOSITORY = "StellarCanary/ProtocolCanary-Action";
+      process.env.GITHUB_RUN_ID = "123456";
+
+      const markdown = renderExecutionFailureMarkdown(
+        "cargo install failed",
+        "error: could not compile",
+        { id: 54321, name: "stellar-protocol-canary-report" },
+      );
+      expect(markdown).toContain(
+        "Report artifact: [stellar-protocol-canary-report](https://github.com/StellarCanary/ProtocolCanary-Action/actions/runs/123456/artifacts/54321)",
+      );
+    } finally {
+      if (originalRepo !== undefined) process.env.GITHUB_REPOSITORY = originalRepo;
+      else delete process.env.GITHUB_REPOSITORY;
+      if (originalRunId !== undefined) process.env.GITHUB_RUN_ID = originalRunId;
+      else delete process.env.GITHUB_RUN_ID;
+    }
   });
 
   // The diagnostic is raw text from an external process, so it may itself
@@ -384,7 +487,7 @@ describe("renderExecutionFailureMarkdown", () => {
     }
 
     // The verbatim diagnostic content survives inside the single block.
-    expect(markdown).toContain("```rust");
+    expect(markdown).toContain("\\`\\`\\`rust");
     expect(markdown).toContain("// quoted code from the panic message");
     expect(markdown).toContain("stack backtrace:");
   });
@@ -414,9 +517,50 @@ describe("renderExecutionFailureMarkdown", () => {
   });
 });
 
+describe("protocolMismatchMessage (#430)", () => {
+  it("returns a message naming both protocols when they differ", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 27 } }),
+      ),
+    ).toBe("Protocol mismatch: the network reported protocol 27, but this run targets protocol 28.");
+  });
+
+  it("returns undefined when the protocols agree", () => {
+    expect(
+      protocolMismatchMessage(
+        report({ targetProtocol: 28, network: { name: "testnet", observedProtocol: 28 } }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined with no observed protocol, rather than treating it as a mismatch", () => {
+    expect(protocolMismatchMessage(report({ network: { name: "testnet" } }))).toBeUndefined();
+    expect(protocolMismatchMessage(report({}))).toBeUndefined();
+  });
+
+  it("ignores observed values that are not positive integers", () => {
+    for (const observedProtocol of [0, -1, 27.5, Number.NaN]) {
+      expect(
+        protocolMismatchMessage(report({ targetProtocol: 28, network: { name: "testnet", observedProtocol } })),
+      ).toBeUndefined();
+    }
+  });
+});
+
 describe("renderSummaryMarkdown — Provenance & Trust section (#373)", () => {
   const BINARY_SHA = "a".repeat(64);
   const PACK_DIGEST = "b".repeat(64);
+
+  it("renders a report persistence warning callout note when reportWriteError is present (#508)", () => {
+    const markdown = renderSummaryMarkdown(report({ status: "pass" }), {
+      reportWriteError: "EACCES",
+    });
+
+    expect(markdown).toContain("Report persistence warning");
+    expect(markdown).toContain("EACCES");
+    expect(markdown).toContain("report artifact was not uploaded");
+  });
 
   it("renders a provenance table with the binary SHA-256, pack digest, and engine version", () => {
     const markdown = renderSummaryMarkdown(report({ status: "pass" }), {

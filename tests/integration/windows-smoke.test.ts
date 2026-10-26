@@ -72,6 +72,7 @@ const ENV_KEYS = [
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
+  "INPUT_NETWORK-PASSPHRASE",
   "INPUT_RPC-URL",
   "INPUT_FIXTURES-DIR",
   "INPUT_VERSION",
@@ -112,6 +113,7 @@ function setUp(scenario: string, options: { cargoHomeName?: string } = {}): Scen
   fs.writeFileSync(SUMMARY_PATH, "");
 
   for (const key of ENV_KEYS) delete process.env[key];
+  process.env["INPUT_NETWORK-PASSPHRASE"] = "\u0001";
   process.env.CARGO_HOME = cargoHome;
   process.env.RUNNER_TEMP = runnerTemp;
   process.env.GITHUB_OUTPUT = outputPath;
@@ -119,7 +121,12 @@ function setUp(scenario: string, options: { cargoHomeName?: string } = {}): Scen
   process.env.MOCK_CANARY_SCENARIO = scenario;
   process.env.INPUT_VERSION = ENGINE_VERSION;
   process.env.INPUT_PROTOCOL = "28";
-  process.env["INPUT_FIXTURES-DIR"] = path.join(workDir, "fixtures");
+  // #400: run() validates fixtures-dir on disk before version resolution and
+  // installation, so the input must point at an existing directory — an
+  // empty one inside the scratch workDir is enough for the mock engine.
+  const fixturesDir = path.join(workDir, "fixtures");
+  fs.mkdirSync(fixturesDir);
+  process.env["INPUT_FIXTURES-DIR"] = fixturesDir;
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env.INPUT_ANNOTATIONS = "true";
   process.env["INPUT_TIMEOUT-MINUTES"] = "1";
@@ -200,22 +207,25 @@ describe("Action against the Node-copy mock engine (Windows spawn path)", () => 
     expect(infoMock.mock.calls.some((call) => String(call[0]).startsWith("Installing"))).toBe(false);
   });
 
-  // Observed while writing these scenarios: @actions/exec treats the tool as
-  // a command LINE and splits it on whitespace (argStringToArray), so a
-  // CARGO_HOME whose path contains a space cannot be executed on any
-  // platform (real engine builds install to <CARGO_HOME>/bin too). The
-  // Action must still fail cleanly — a clear "cannot be executed" failure
-  // ending the job — rather than hanging or silently falling through to a
-  // cargo install of some unrelated tool path.
-  it("a spaceful CARGO_HOME fails the step cleanly with a clear diagnostic", async () => {
+  // Before #521 the version probe ran through @actions/exec, which treats
+  // the tool as a command LINE and splits it on whitespace
+  // (argStringToArray), so a CARGO_HOME whose path contains a space could
+  // not be executed on any platform (real engine builds install to
+  // <CARGO_HOME>/bin too) and the step failed with "could not be
+  // executed". The probe now runs through the bounded runner
+  // (src/runner.ts), which spawns the path verbatim: the spaceful binary
+  // is probed, its version matches, and the run succeeds without ever
+  // reaching for cargo.
+  it("a spaceful CARGO_HOME is probed verbatim and the run succeeds", async () => {
     scenario = setUp("pass", { cargoHomeName: "cargo home with spaces" });
     const { run } = await import("../../src/main");
     await run();
 
-    expect(setFailedMock).toHaveBeenCalledTimes(1);
-    expect(String(setFailedMock.mock.calls[0]?.[0])).toContain("could not be executed");
-    expect(readOutputs(scenario.outputPath).status).toBe("execution-failed");
-    // No install was attempted for the broken path.
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(readOutputs(scenario.outputPath).status).toBe("pass");
+    expect(
+      infoMock.mock.calls.some((call) => String(call[0]).includes("already installed")),
+    ).toBe(true);
     expect(infoMock.mock.calls.some((call) => String(call[0]).startsWith("Installing"))).toBe(false);
   });
 

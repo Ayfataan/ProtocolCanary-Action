@@ -26,6 +26,7 @@ jobs:
   fork-boundary:
     name: Audit least-privilege boundaries
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -87,7 +88,10 @@ jobs:
             #    .git/config survives across steps and is exfiltrable by any
             #    later step that runs fork code. Absence of the hardening is a
             #    violation; the audit fails closed, never "assume secure".
-            mapfile -t wlines < "$target"
+            wlines=()
+            while IFS= read -r line; do
+              wlines+=("$line")
+            done < "$target"
             i=0
             while [ "$i" -lt "${#wlines[@]}" ]; do
               line="${wlines[$i]}"
