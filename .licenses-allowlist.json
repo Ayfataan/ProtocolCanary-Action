@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Reviewed allow-list of acceptable open source software licenses for production dependencies bundled into dist/index.js",
+  "allowedLicenses": [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "BlueOak-1.0.0",
+    "MIT/X11",
+    "(Apache-2.0 AND BSD-3-Clause)"
+  ],
+  "packageExceptions": {
+    "buffers@0.1.1": {
+      "license": "MIT",
+      "reason": "Substack package licensed under MIT in repository README and source headers, but omitted the top-level license key in its package.json."
+    }
+  }
+}

@@ -21,8 +21,65 @@ All notable changes to this project are documented in this file.
   `InvalidInput` error naming the input. `no-cache: true` together with
   `live-cache-ttl-seconds` is rejected during validation, because the
   engine declares the two flags conflicting (`no-cache: false` with a TTL
-  is accepted) ([#413]).
+  is accepted) ([#413]). The same table now also declares `network-passphrase`,
+  `rpc-max-retries` and `rpc-retry-delay-ms` (first engine release 0.3.0) plus
+  `fail-on-warning` and `offline` (main's placeholder release, 999999999.0.0),
+  so main's separate `engineSupports*` helpers and the `ignoredInputs` warning
+  are gone: every input skipped for an older engine is reported by a `core.info`
+  note in `buildCheckArgs` naming the input and the required version.
 
+- `coverage-state` output (`full`, `partial`, or `none`) reporting how completely the
+  fixture set was exercised: `full` when every discovered fixture ran with nothing
+  skipped, `partial` when some ran and others were skipped, `none` when nothing ran
+  (an empty run, or an execution failure, where it is always set to `none`). It lets a
+  downstream job gate a promotion on coverage rather than on `status` alone — a `pass`
+  with `coverage-state: partial` means only part of the fixture set was exercised. The
+  state is derived from the report's executed results and its skip signals, and a
+  report missing any of those fields classifies as `none` rather than throwing
+  ([#333]).
+- Stamped releases for the reusable workflow (#457): for every release tag,
+  `release.yml` now creates a stamped commit whose `reusable-canary-check.yml`
+  refers to the Action at that release's own commit SHA (a literal 40-hex
+  value marked `# release-stamp: <tag>` — a `uses:` value cannot contain
+  expressions), then moves the release tag and the floating `v1` tag to that
+  stamped commit. A caller who pins the workflow to an exact release tag or
+  to the stamped commit therefore runs the exact Action code that release
+  shipped, instead of whichever commit `v1` happens to point at; pinning to
+  `@v1` or a branch still floats, as documented. Stamping is idempotent (an
+  already-stamped workflow is skipped), needs no change to the reusable
+  workflow's `permissions: contents: read` (only the release job holds
+  `contents: write`, for the tag push), and the guarantee itself is written
+  down in [docs/reusable-workflow.md](docs/reusable-workflow.md#what-your-pin-guarantees-457).
+- `junit-report` input (default `false`) and `junit-report-path` output (#423).
+  When enabled, the Action runs the engine's own renderer
+  (`stellar-canary report <report.json> --format junit`) on the JSON report it
+  just parsed and writes the XML next to it, keeping one definition of the
+  format instead of maintaining an XML writer here; the file is included in
+  the workflow artifact when `upload-report` is `true`. Auxiliary like the
+  artifact and the receipt: an engine release without the command (it is not
+  in `0.2.0`; it arrives with Protocol-Canary #434), a non-zero exit, empty
+  output, or a missing report file each produce a warning only — `status` and
+  the job outcome are untouched, and the output stays unset. With the input
+  at its default, no second engine process is started (behaviour unchanged).
+- `fixture`, `surface`, and `cache-dir` inputs (#458), each forwarded as a
+  single `--flag=value` element in a stable order (a value beginning with `-`
+  can never be read as another option; arguments stay an array passed to
+  `spawn`). `surface` accepts only `xdr`/`rpc`/`soroban` (lower case);
+  `fixture`/`cache-dir` are trimmed, treat empty as unset, and reject control
+  characters (C0, DEL, C1) while otherwise leaving ids and paths untouched.
+  The three require an engine release whose `check` accepts them:
+  `FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION` is `undefined` because no published
+  Protocol-Canary release does yet (the flags exist only on the engine's
+  `main`, Protocol-Canary PRs #568/#564), so setting any of the three fails
+  the run **before** any install or engine process, naming the input, the
+  resolved version, and the missing support. This deliberately differs from
+  `allow-empty` and the 0.3.0 network inputs, which are ignored with a note:
+  a dropped filter would run a different scope than requested. With all three
+  unset, arguments and behaviour are unchanged for every engine version.
+
+- Enforce coverage thresholds in CI on Ubuntu runs and report the text coverage
+  summary to the workflow job summary (`$GITHUB_STEP_SUMMARY`) inside a fenced
+  code block (#410).
 - `fixtures-pack-version` and `fixtures-pack-protocol` inputs, validated when
   set: the version must be a published pack release tag (`v1.2.0` or
   `1.2.0`, with an unpinned value such as `latest`/`main` rejected) and the
@@ -49,6 +106,27 @@ All notable changes to this project are documented in this file.
   execution failure.
 
 ### Fixed
+
+- Each invocation writes its Execution Receipt to its own file under `RUNNER_TEMP`
+  (#493). The path was always `stellar-canary-receipt.json`, so a second Action step in the
+  same job overwrote the first step's receipt and its `receipt-path` output then pointed at
+  the second run's data. The file name now carries a random suffix
+  (`stellar-canary-receipt-<32 hex>.json`); `receipt-path` stays absolute, and nothing changes
+  with `generate-receipt: false`.
+- A rejected `rpc-url` no longer echoes the value it rejected. The error for a
+  URL with the wrong scheme now shows the scheme, host, port and path with
+  userinfo replaced by `[REDACTED]` and any query string or fragment dropped
+  (a recognised token in the path is masked too), and the error for a value
+  that cannot be parsed as a URL reports only its length and whether it
+  contains whitespace. Previously both messages printed the whole value, so a
+  credential in a mistyped endpoint reached the run log and the failure
+  annotation (#510).
+- Redact recognized secrets, strip control characters, and bound engine diagnostics
+  in failure annotations and execution-failure summaries. Sanitize failure reasons
+  as well, and redact before selecting or truncating diagnostic text (#499).
+- Bound HTTP response bodies to 4 MiB for GitHub API JSON, 1 MiB for checksum
+  manifests, and 64 MiB for prebuilt release assets. Reject oversized or incomplete
+  bodies and remove failed downloads before using the existing fallback paths (#500).
 
 - Execution-failure job summaries no longer break when the raw diagnostic
   (Canary's stderr, a timeout notice) itself contains a ``` sequence, e.g.
@@ -85,6 +163,10 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
+- README's tables now document the `generate-receipt` input and the
+  `receipt-path` output — both were declared in `action.yml` and wired
+  through the Action but missing from the Inputs/Outputs tables, so the
+  documented contract lagged the declared one ([#412]).
 - README gains a "Troubleshooting" section mapping the most common
   execution-failure messages (`cargo` not found, `cargo install` exit
   101, timeouts, unparsable reports, unsupported `schemaVersion`, missing
@@ -109,6 +191,14 @@ All notable changes to this project are documented in this file.
   moves (only on a new `ProtocolCanary-Fixtures` pack release), who approves
   the move (the CODEOWNERS maintainer), and how to resolve and update the
   SHA (#419).
+- README documents the early `fixtures-dir` validation (#400): the input
+  must point at an existing directory, relative paths are resolved against
+  the job's working directory, invalid directories are detected before
+  engine installation, a missing directory fails with a clear error by
+  default, `allow-empty: true` allows a missing directory with a warning,
+  and a regular file is never a valid fixtures directory. The Quick Start
+  note and the Troubleshooting table now point at the new
+  `Invalid "fixtures-dir" input` message.
 
 ### Added
 
@@ -138,6 +228,34 @@ All notable changes to this project are documented in this file.
   forwarded to the `stellar-canary` CLI, which failed later with a generic,
   less actionable error. `parseConfig` now requires the resolved path to be
   a regular file (`fs.statSync(...).isFile()`) rather than merely existing.
+- Numeric inputs are strictly validated before any process is started:
+  `protocol` accepts 1 to 4294967295 inclusive (0 is rejected; the engine
+  rejects `--protocol 0` too, so no working configuration changes) and
+  `timeout-minutes` accepts 1 to 35791 minutes — 35,791 * 60,000 ms is the
+  largest delay below Node's 2,147,483,647 ms `setTimeout` limit, above
+  which Node clamps the timer to fire after 1 ms and end the run almost
+  immediately. Loosely formatted values such as "1e3", "5 minutes", "1.9",
+  or "+5" are now rejected with a message that names the input, quotes the
+  value, and states the accepted range, instead of silently becoming a
+  different timeout or an invalid engine argument. The superseded behaviors
+  (fractional `timeout-minutes` truncation, `protocol` "0") are rejected
+  outright; see #456.
+- `fixtures-dir` is now validated against the filesystem **before** version
+  resolution and engine installation (#400): the path is resolved against
+  the working directory and must name an existing directory. A missing
+  directory fails the run immediately with an `InvalidInput` error naming
+  `fixtures-dir` and the resolved absolute path — previously the Action
+  installed the engine first and only then failed with a less actionable
+  error — while `allow-empty: true` downgrades the missing-directory case
+  to a `core.warning` (naming the input and path) and the run continues.
+  A resolved path that exists but is not a directory (e.g. a regular file)
+  is always rejected with a distinct "is not a directory" message, even
+  with `allow-empty: true`, and a dangling symlink follows the
+  missing-path behavior (`statSync` follows links). Invalid paths no longer
+  trigger unnecessary version resolution, engine installation, or engine
+  execution; the error flows through the existing execution-failure
+  annotation, summary, and outputs like any other reason Canary could not
+  run. The directory is never created behind the user's back.
 
 ### Fixed
 
@@ -149,6 +267,16 @@ All notable changes to this project are documented in this file.
 
 ### Testing
 
+- Added `tests/unit/contract-sync.test.ts` (#412): a contract test that
+  keeps `action.yml`, the `getInputs()` parser, the `setOutput` calls in
+  `run()` (success and execution-failure paths), the README Inputs/Outputs
+  tables, every `examples/*.yml`, and the reusable workflow in sync —
+  asserting the declared inputs are exactly the read inputs, the declared
+  outputs exactly the set outputs, README defaults match `action.yml`, and
+  no example step passes an undeclared `with:` key. Every failure message
+  names the offending input/output/file. Adds `yaml` (pinned dev
+  dependency) for parsing the YAML files; the README tables are parsed with
+  plain line logic, no Markdown dependency.
 - Added a `resolveVersion` test pinning that an explicit whitespace-only
   `token` is treated as "no token" — the tag-lookup request carries no
   `Authorization` header at all, matching the documented empty-secret
@@ -208,6 +336,19 @@ All notable changes to this project are documented in this file.
 - Added an `inputs` test pinning that plain `http://` is rejected for the
   IPv6 loopback `http://[::1]`, documenting the current
   `localhost`/`127.0.0.1`-only exemption as a known contract ([#276]).
+- Unit and end-to-end coverage for the early `fixtures-dir` validation
+  (#400): an existing directory is accepted and resolves to an absolute
+  path; a missing directory is rejected with an error naming `fixtures-dir`
+  and the resolved path; a regular file gets the distinct not-a-directory
+  rejection (even with `allow-empty: true`); a dangling symlink follows the
+  missing-path behavior; relative paths and `..` segments are normalized
+  before validation; and `allow-empty: true` warns and continues. The
+  essential regression test spies on `resolveVersion`,
+  `ensureCanaryInstalled`, and `runCheck` and pins that a missing
+  directory (with `allow-empty: false`) fails before any of them run, with
+  the error reaching the existing execution-failure summary and annotation
+  path, while `allow-empty: true` proceeds to normal resolution and
+  installation.
 
 ## [0.1.1]
 
