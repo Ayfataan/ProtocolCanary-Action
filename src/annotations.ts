@@ -74,10 +74,11 @@ export function emitBaselineFailureAnnotation(reason: string): void {
  * exit code into an explicit classification plus the engine's own root
  * diagnostic, instead of a bare "Process exited with code N".
  *
- * Exit code 1 is classified as test assertion failures, exit code 2 as the
- * regression gate (or an invalid configuration), and exit code 3 as an
- * unexpected runtime crash — never as a regression — following
- * {@link describeExitCode}'s contract table.
+ * Exit code 1 is classified as compatibility failure (at least one fixture's
+ * compatibility assertion failed), exit code 2 as configuration error (invocation
+ * unusable or no check applied, so no checks ran), and exit code 3 as execution
+ * error (at least one check could not complete: XDR, RPC, or Soroban problem) —
+ * following {@link describeExitCode}'s contract table.
  *
  * Diagnostics use the same 8 KiB / 40 tail-line budget as execution
  * failures, including the truncation notice in the byte budget (#499).
