@@ -618,11 +618,9 @@ describe("getInputs", () => {
     });
   });
 
-  // Rewritten from main's "warns when unsupported fail-on-warning or offline
-  // inputs are enabled": the engineSupportsFailOnWarningAndOffline helper
-  // and the core.warning it produced are gone — getInputs only parses these
-  // two now, and buildCheckArgs's VERSION_GATED_FLAGS table (#413) emits the
-  // skip note against the resolved engine version instead.
+  // getInputs only parses these inputs; the engine gate and its skip note
+  // live in buildCheckArgs's VERSION_GATED_FLAGS table (#413), which emits
+  // the note against the resolved engine version.
   it("parses fail-on-warning and offline and leaves the engine gate to buildCheckArgs", () => {
     process.env["INPUT_FAIL-ON-WARNING"] = "true";
     process.env.INPUT_OFFLINE = "true";

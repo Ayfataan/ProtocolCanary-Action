@@ -540,13 +540,11 @@ describe("engine check option forwarding (#413)", () => {
   });
 });
 
-// Rewritten from main's "network passphrase and RPC retry version gate"
-// describe: the engineSupports* helper it asserted on no longer exists — the
-// gate moved into VERSION_GATED_FLAGS — so each of the five inputs main used
-// to gate separately is asserted through buildCheckArgs instead: (a)
-// forwarded with the right value on a supporting engine, (b) skipped with a
-// core.info note naming the input and the required version on an older one,
-// (c) absent and silent when unset.
+// The five engine-gated inputs are asserted through buildCheckArgs, the
+// single place every version gate lives (#413): (a) forwarded with the right
+// value on a supporting engine, (b) skipped with a core.info note naming the
+// input and the required version on an older one, (c) absent and silent when
+// unset.
 describe("the five inputs main gated separately are table-driven now (#413)", () => {
   const CASES: ReadonlyArray<{
     readonly input: string;

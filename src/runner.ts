@@ -70,17 +70,17 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
 
   // Version-gated flags (#413): every flag whose acceptance depends on the
   // engine release is declared in VERSION_GATED_FLAGS with the first release
-  // that accepts it — `allow-empty` and the four #413 check options as
-  // before, plus the five inputs main gated separately (`network-passphrase`,
-  // `rpc-max-retries`, `rpc-retry-delay-ms`, `fail-on-warning`, `offline`).
-  // An input that is set but whose resolved engine predates that release is
-  // skipped with a `core.info` note naming the input and the required
-  // version — never passed to an engine that would reject it as an unknown
-  // argument, and never dropped silently. The argv is always an array of
-  // discrete elements; nothing here is ever a shell string. `--fixture`,
-  // `--surface` and `--cache-dir` are deliberately NOT in the table: main.ts
-  // fails the run before install when the engine cannot honour them
-  // (fixtureSurfaceCacheDirGateFailure) instead of skipping them here.
+  // that accepts it (`network-passphrase`, `rpc-max-retries`,
+  // `rpc-retry-delay-ms`, `allow-empty`, `fail-on-warning`, `offline`, and
+  // the four #413 check options). An input that is set but whose resolved
+  // engine predates that release is skipped with a `core.info` note naming
+  // the input and the required version — never passed to an engine that
+  // would reject it as an unknown argument, and never dropped silently. The
+  // argv is always an array of discrete elements; nothing here is ever a
+  // shell string. `--fixture`, `--surface` and `--cache-dir` are
+  // deliberately NOT in the table: main.ts fails the run before install when
+  // the engine cannot honour them (fixtureSurfaceCacheDirGateFailure)
+  // instead of skipping them here.
   for (const gated of VERSION_GATED_FLAGS) {
     const gatedArgv = gated.argv(inputs);
     if (gatedArgv === undefined) {
@@ -167,18 +167,16 @@ const ALLOW_EMPTY_FLAG: VersionGatedFlag = {
 };
 
 /** The first release whose `check` accepts `--network-passphrase`,
- * `--rpc-max-retries` and `--rpc-retry-delay-ms`. Main carried this gate as
- * `engineSupportsNetworkPassphraseAndRpcRetrySettings` with the matching
- * constant; the gate now lives in the table instead. These flags first
- * appear in the Protocol-Canary 0.3.0 development line; older and unknown
- * engines must never receive flags they would reject. */
+ * `--rpc-max-retries` and `--rpc-retry-delay-ms`: these flags first appear
+ * in the Protocol-Canary 0.3.0 development line, so older and unknown
+ * engines must never receive them — buildCheckArgs skips each one on an
+ * older engine and logs the skip note instead. */
 const NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION: readonly [number, number, number] = [0, 3, 0];
 
-/** Placeholder first release for `--fail-on-warning` and `--offline`,
- * carried over verbatim from main's `FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION`
- * (formerly in src/inputs.ts) together with its TODO: no released
- * Protocol-Canary accepts these flags yet, so the value may only change when
- * Protocol-Canary publishes the release containing PRs #567 and #527. */
+/** Placeholder first release for `--fail-on-warning` and `--offline`: no
+ * released Protocol-Canary accepts these flags yet, so the value changes
+ * only when Protocol-Canary publishes the release containing PRs #567 and
+ * #527. */
 // TODO(#421): Replace this placeholder when Protocol-Canary publishes the
 // release containing PRs #567 and #527.
 const FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION: readonly [number, number, number] = [999_999_999, 0, 0];
@@ -274,13 +272,12 @@ const LIVE_CACHE_TTL_FLAG: VersionGatedFlag = {
 };
 
 /**
- * Every version-gated `check` flag, in the order it is appended to argv.
- * The whole table is emitted right after `--fixtures-dir`, before the
- * ungated `--fixture`/`--surface`/`--cache-dir` forwarding. Main's flags
- * keep the relative order main's inline implementation emitted them in
- * (`--network-passphrase`, `--rpc-max-retries`, `--rpc-retry-delay-ms`,
- * `--allow-empty`, `--fail-on-warning`, `--offline`); #413's four options
- * are appended after them in a stable, documented position.
+ * Every version-gated `check` flag, in the order it is appended to argv:
+ * `--network-passphrase`, `--rpc-max-retries`, `--rpc-retry-delay-ms`,
+ * `--allow-empty`, `--fail-on-warning`, `--offline`, then #413's four
+ * options (`--rpc-timeout`, `--max-concurrency`, `--no-cache`,
+ * `--live-cache-ttl`). The table is emitted right after `--fixtures-dir`,
+ * before the ungated `--fixture`/`--surface`/`--cache-dir` forwarding.
  */
 const VERSION_GATED_FLAGS: readonly VersionGatedFlag[] = [
   NETWORK_PASSPHRASE_FLAG,

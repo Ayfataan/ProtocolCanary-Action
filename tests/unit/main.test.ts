@@ -294,10 +294,10 @@ describe("run", () => {
 
     await run();
 
-    // Rewritten from main's `ignoredInputs` core.warning test: the warning
-    // (and the engineSupportsNetworkPassphraseAndRpcRetrySettings helper
-    // behind it) is gone. Each skipped input now gets a core.info note from
-    // buildCheckArgs's table, naming the input and the required version.
+    // Each of these inputs is skipped on this engine by buildCheckArgs's
+    // VERSION_GATED_FLAGS table: assert one core.info note per input naming
+    // it and the required version, and that the passphrase value never
+    // appears in any note or warning.
     const notes = infoMock.mock.calls.map((call) => String(call[0]));
     for (const input of ["network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"]) {
       expect(notes.some((note) => note.includes(`"${input}"`) && note.includes("0.3.0"))).toBe(true);

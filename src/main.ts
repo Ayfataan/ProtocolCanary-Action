@@ -242,15 +242,9 @@ export async function run(): Promise<void> {
     return;
   }
 
-  // The "input has no effect on this engine" notes — for `allow-empty` and
-  // for the five inputs main gated separately in this spot
-  // (`network-passphrase`, `rpc-max-retries`, `rpc-retry-delay-ms`,
-  // `fail-on-warning`, `offline`) — are emitted by buildCheckArgs itself:
-  // the version gate and its skip note for every gated flag (#413) now live
-  // in one place, so an input skipped for an old engine is reported exactly
-  // there, whatever the flag. Main's `ignoredInputs` `core.warning` went
-  // away with it: each skipped input gets a `core.info` note beside the
-  // flag that was not forwarded, naming the input and the required version.
+  // Skip notes for version-gated inputs are emitted by buildCheckArgs, next
+  // to the flag that was not forwarded; each note names the input and the
+  // first engine release that accepts it (#413).
   core.info(`Protocol: ${inputs.protocol !== undefined ? String(inputs.protocol) : "(from configuration)"}`);
   core.info("Running compatibility checks...");
 
