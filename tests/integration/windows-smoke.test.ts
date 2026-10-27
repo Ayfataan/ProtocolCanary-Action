@@ -180,13 +180,13 @@ describe("Action against the Node-copy mock engine (Windows spawn path)", () => 
   let scenario: Scenario | undefined;
 
   afterEach(() => {
-    if (scenario) fs.rmSync(scenario.workDir, { recursive: true, force: true });
+    if (scenario) fs.rmSync(scenario.workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     scenario = undefined;
     for (const key of ENV_KEYS) delete process.env[key];
   });
 
   afterAll(() => {
-    fs.rmSync(SUMMARY_PATH, { force: true });
+    fs.rmSync(SUMMARY_PATH, { force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("pass: succeeds through the real spawn path and never reaches cargo", async () => {
