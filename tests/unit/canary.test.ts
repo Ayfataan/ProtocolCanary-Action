@@ -1138,7 +1138,16 @@ it("falls back to cargo install on cache miss", async () => {
   });
 
   it("warns when a prebuilt asset HTTP 404 is encountered and falls back to cargo install", async () => {
-    // Mock a release with a checksum asset
+    let triple: string;
+    try {
+      triple = prebuiltTargetTriple(process.platform, process.arch);
+    } catch {
+      return;
+    }
+    const assetName = `stellar-canary-${RESOLVED.version}-${triple}.tar.gz`;
+    const downloadUrl = `https://example.test/${assetName}`;
+    const checksumUrl = "https://example.test/SHA256SUMS";
+
     httpsGetMock
       .mockImplementationOnce(
         respond(
@@ -1146,23 +1155,31 @@ it("falls back to cargo install on cache miss", async () => {
           JSON.stringify({
             assets: [
               {
+                name: assetName,
+                browser_download_url: downloadUrl,
+              },
+              {
                 name: "SHA256SUMS",
-                browser_download_url: "https://example.test/SHA256SUMS",
+                browser_download_url: checksumUrl,
               },
             ],
           }),
         ),
       )
+      .mockImplementationOnce(respond(200, `${"0".repeat(64)}  ${assetName}\n`))
       .mockImplementationOnce(respond(404, ""));
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
-    // Installation should succeed (fall back to cargo install)
     expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
-    // The debug message should identify the asset that returned 404
-    expect(coreMocks.debugMock).toHaveBeenCalledWith(
-      expect.stringContaining("SHA256SUMS"),
-    );
+    expect(
+      coreMocks.warningMock.mock.calls.some(
+        (call) =>
+          String(call[0]).includes(assetName) &&
+          String(call[0]).includes("falling back to a source install"),
+      ),
+    ).toBe(true);
+    expect(cargoInstallSpawned()).toBe(true);
   });
 
     it("falls back to cargo install when restored binary is not executable", async () => {
