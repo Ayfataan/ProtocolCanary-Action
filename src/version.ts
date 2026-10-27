@@ -186,8 +186,24 @@ export async function resolveVersion(
       return undefined;
     }
 
+    if (error instanceof GitHubRequestError && (error.kind === "network" || error.kind === "timeout")) {
+      const reason =
+        error.kind === "timeout"
+          ? "commit resolution failed because of a network timeout"
+          : "commit resolution failed because of a network error";
+      core.warning(
+        `GitHub API lookup for ${tag}: ${reason} (${message}). The Action is falling back to tag pinning.`,
+      );
+      return undefined;
+    }
+
     if (error instanceof GitHubRequestError && error.kind === "server" && message.includes("failed after retries")) {
       core.warning(`GitHub API lookup for ${tag} failed after retries; falling back to tag-only pinning: ${message}`);
+      return undefined;
+    }
+
+    if (error instanceof GitHubRequestError && error.kind === "server") {
+      core.warning(`GitHub API lookup for ${tag} failed; falling back to tag-only pinning: ${message}`);
       return undefined;
     }
 

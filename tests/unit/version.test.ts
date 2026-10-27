@@ -273,7 +273,7 @@ describe("resolveVersion", () => {
       tag: "v0.1.0",
       commitSha: undefined,
     });
-    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
   });
 
   it("degrades to commitSha undefined on malformed JSON, never throwing", async () => {

@@ -23,6 +23,7 @@ import {
   InvalidInputError,
   TimeoutError,
 } from "./errors";
+import { githubFetch } from "./github";
 import { resolveGithubToken } from "./inputs";
 import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import type { CheckExecutionResult } from "./runner";
@@ -290,7 +291,7 @@ function parseChecksumManifest(text: string): Map<string, string> {
 async function lookupPublishedChecksums(version: string, explicitToken?: string): Promise<Map<string, string> | undefined> {
   const token = resolveGithubToken(explicitToken);
   try {
-    const releaseBody = await httpsGetText(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, token);
+    const { body: releaseBody } = await githubFetch(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, token);
     const parsed = JSON.parse(releaseBody) as unknown;
     if (typeof parsed !== "object" || parsed === null) {
       return undefined;
@@ -308,7 +309,7 @@ async function lookupPublishedChecksums(version: string, explicitToken?: string)
     if (checksumAsset === undefined) {
       return undefined;
     }
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token, MAX_CHECKSUM_MANIFEST_BYTES);
+    const { body: manifest } = await githubFetch(checksumAsset.browser_download_url as string, token, MAX_CHECKSUM_MANIFEST_BYTES);
     const entries = parseChecksumManifest(manifest);
     return entries.size > 0 ? entries : undefined;
   } catch (error) {
@@ -344,7 +345,7 @@ function selectExpectedChecksum(entries: Map<string, string>, binary: string): s
  * version. Rejects on a non-200 response, malformed JSON, or an unexpected
  * shape; callers decide how to degrade. */
 async function fetchReleaseAssets(version: string, token?: string): Promise<ReleaseAsset[]> {
-  const releaseBody = await httpsGetText(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, resolveGithubToken(token));
+  const { body: releaseBody } = await githubFetch(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, resolveGithubToken(token));
   const parsed = JSON.parse(releaseBody) as unknown;
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`unexpected release response shape for v${version}`);
@@ -531,7 +532,7 @@ function githubApiBase(repo: string): string {
  * archives are verified here) over the authenticated GitHub API.
  */
 async function fetchReleaseAssetsFor(repo: string, version: string, token?: string): Promise<ReleaseAsset[]> {
-  const releaseBody = await httpsGetText(`${githubApiBase(repo)}/releases/tags/v${version}`, resolveGithubToken(token));
+  const { body: releaseBody } = await githubFetch(`${githubApiBase(repo)}/releases/tags/v${version}`, resolveGithubToken(token));
   const parsed = JSON.parse(releaseBody) as unknown;
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`unexpected release response shape for v${version}`);
@@ -557,7 +558,7 @@ async function lookupPublishedChecksumsFor(
 ): Promise<Map<string, string> | undefined> {
   const token = resolveGithubToken(explicitToken);
   try {
-    const releaseBody = await httpsGetText(`${githubApiBase(repo)}/releases/tags/v${version}`, token);
+    const { body: releaseBody } = await githubFetch(`${githubApiBase(repo)}/releases/tags/v${version}`, token);
     const parsed = JSON.parse(releaseBody) as unknown;
     if (typeof parsed !== "object" || parsed === null) {
       return undefined;
@@ -575,7 +576,7 @@ async function lookupPublishedChecksumsFor(
     if (checksumAsset === undefined) {
       return undefined;
     }
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token);
+    const { body: manifest } = await githubFetch(checksumAsset.browser_download_url as string, token);
     const entries = parseChecksumManifest(manifest);
     return entries.size > 0 ? entries : undefined;
   } catch (error) {
@@ -1207,7 +1208,7 @@ export async function installPrebuiltRelease(
   }
   let expectedChecksum: string | undefined;
   try {
-    const manifest = await httpsGetText(
+    const { body: manifest } = await githubFetch(
       checksumAsset.browser_download_url as string,
       resolveGithubToken(token),
       MAX_CHECKSUM_MANIFEST_BYTES,

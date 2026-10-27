@@ -840,12 +840,12 @@ describe("ensureCanaryInstalled", () => {
 
   it("handles checksum lookup request timeouts and logs the target URL", async () => {
     writeInstalledBinary();
-    httpsGetMock.mockImplementationOnce((() => simulateRequestTimeout()) as never);
+    httpsGetMock.mockImplementation((() => simulateRequestTimeout()) as never);
 
     const installed = await ensureCanaryInstalled(RESOLVED);
 
     expect(installed.binaryPath).toBe(binaryPath());
-    expect(httpsGetMock).toHaveBeenCalledOnce();
+    expect(httpsGetMock).toHaveBeenCalledTimes(3);
     expect(coreMocks.debugMock).toHaveBeenCalledWith(
       expect.stringContaining("timed out fetching https://api.github.com/repos/StellarCanary/Protocol-Canary/releases/tags/v0.1.0"),
     );
