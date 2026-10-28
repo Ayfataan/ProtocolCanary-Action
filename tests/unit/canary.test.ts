@@ -1159,13 +1159,25 @@ describe("ensureCanaryInstalled", () => {
 
     it("falls back to cargo install on cache miss", async () => {
       cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-      cacheMocks.restoreCacheMock.mockResolvedValue(undefined);
+      cacheMocks.restoreCacheMock.mockResolvedValueOnce(undefined);
 
       const installed = await ensureCanaryInstalled(RESOLVED);
 
       expect(installed.version).toBe("0.1.0");
       expect(cacheMocks.restoreCacheMock).toHaveBeenCalledTimes(1);
       expect(cacheMocks.saveCacheMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock).toHaveBeenCalled();
+    });
+
+    it("warns but succeeds when saving an installed binary to cache fails", async () => {
+      cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
+      cacheMocks.saveCacheMock.mockRejectedValueOnce(new Error("cache quota exceeded"));
+
+      const installed = await ensureCanaryInstalled(RESOLVED);
+
+      expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
+      expect(cacheMocks.saveCacheMock).toHaveBeenCalledOnce();
+      expect(coreMocks.warningMock).toHaveBeenCalledWith("Cache save failed, ignoring: Error: cache quota exceeded");
       expect(spawnMock).toHaveBeenCalled();
     });
 
@@ -1728,6 +1740,39 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(
         expect.stringContaining("no prebuilt stellar-canary asset for target x86_64-unknown-linux-gnu"),
       );
+      expect(spawnMock).toHaveBeenCalled();
+    });
+
+    it("falls back to cargo install when the prebuilt asset download returns HTTP 404", async () => {
+      const assetName = LINUX_X64_ASSET;
+      const downloadUrl = "https://example.test/missing-prebuilt-asset";
+
+      httpsGetMock
+        .mockImplementationOnce(
+          respond(
+            200,
+            JSON.stringify({
+              assets: [
+                { name: assetName, browser_download_url: downloadUrl },
+                { name: "SHA256SUMS", browser_download_url: MANIFEST_URL },
+              ],
+            }),
+          ),
+        )
+        .mockImplementationOnce(respond(200, `${"0".repeat(64)}  ${assetName}\n`))
+        .mockImplementationOnce(respond(404, ""));
+
+      const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+      expect(installed.version).toBe("0.1.0");
+      expect(
+        coreMocks.warningMock.mock.calls.some(
+          (call) =>
+            String(call[0]).includes(assetName) &&
+            String(call[0]).includes("returned status 404") &&
+            String(call[0]).includes("falling back to a source install"),
+        ),
+      ).toBe(true);
       expect(spawnMock).toHaveBeenCalled();
     });
 

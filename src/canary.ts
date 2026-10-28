@@ -822,10 +822,10 @@ async function restoreFromCache(resolved: ResolvedVersion): Promise<InstalledCan
  *
  * The cache key comes from {@link cacheKeyFor}, which embeds the platform,
  * architecture and immutable pin. This is strictly a performance
- * optimization and is deliberately silent about failure: every error —
- * including `@actions/cache` throwing when a save conflicts with an existing
- * entry — is swallowed after a `core.debug` log, so a cache outage never
- * turns a successful install into a failed run. Restored binaries are still
+ * optimization and never fails the run: every error — including
+ * `@actions/cache` throwing when a save conflicts with an existing entry — is
+ * swallowed after a `core.warning` log, so a cache outage never turns a
+ * successful install into a failed run. Restored binaries are still
  * re-verified by {@link verifyInstalledBinary} in
  * {@link restoreFromCache}'s caller, so a bad cache entry cannot be trusted.
  *
@@ -846,7 +846,7 @@ async function saveToCache(resolved: ResolvedVersion, binaryPath: string): Promi
     await cache.saveCache([binaryPath, digestSidecarPath(binaryPath)], cacheKeyFor(resolved));
   } catch (error) {
     // Caching is a pure optimization; correctness never depends on it.
-    core.debug(`Cache save failed, ignoring: ${String(error)}`);
+    core.warning(`Cache save failed, ignoring: ${String(error)}`);
   }
 }
 
