@@ -288,14 +288,14 @@ function summaryPreamble(
     );
   }
 
-  if (provenance?.engineArgs !== undefined && provenance.engineArgs.length > 0) {
-    lines.push(renderReproductionCommand(provenance.engineArgs, provenance.engineVersion));
-  }
-
   if (provenance !== undefined) {
     for (const line of provenanceLines(provenance)) {
       lines.push(line);
     }
+  }
+
+  if (provenance?.engineArgs !== undefined && provenance.engineArgs.length > 0) {
+    lines.push(renderReproductionCommand(provenance.engineArgs, provenance.engineVersion));
   }
   return lines;
 }
@@ -346,7 +346,9 @@ function renderTruncatedSummary(
   push(summaryPreamble(report, provenance, artifact));
 
   if (bodyBytes + noticeCost >= SUMMARY_BYTE_LIMIT) {
-    return clipToLimit(body, SUMMARY_BYTE_LIMIT);
+    const roomForBody = SUMMARY_BYTE_LIMIT - byteLength(TRUNCATION_NOTICE) - 2;
+    const clipped = clipToLimit(body, roomForBody);
+    return clipped === "" ? TRUNCATION_NOTICE : `${clipped}\n${TRUNCATION_NOTICE}`;
   }
 
   for (const section of summarySections(report)) {
