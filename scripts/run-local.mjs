@@ -4,7 +4,7 @@
  *
  * Trying a change today means pushing a branch and waiting for a workflow, or
  * hand-building the runner environment the Action reads (INPUT_* variables,
- * GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, RUNNER_TEMP, CARGO_HOME). This script
+ * GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, RUNNER_TEMP). This script
  * builds that environment in a temporary directory, runs the Action's real
  * compiled entry point, and prints what it produced: the outputs it wrote,
  * the job summary, and the annotations it emitted.
@@ -24,6 +24,7 @@
 "use strict";
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -40,10 +41,11 @@ Usage:
   node scripts/run-local.mjs --engine <path> [options]
 
 Required:
-  --engine <path>          Path to a stellar-canary binary. It is copied into a
-                           temporary <CARGO_HOME>/bin, so the Action looks it up
-                           exactly as it does on a runner. Never installed; if
-                           the option is missing the script exits non-zero.
+  --engine <path>          Path to a stellar-canary binary. It is copied into
+                           the temporary Action-owned install root (with its
+                           SHA-256 sidecar), so the Action finds it exactly as
+                           it does on a runner. Never installed; if the option
+                           is missing the script exits non-zero.
 
 Options:
   --fixtures-dir <dir>     Values for the Action's fixtures-dir input
@@ -58,8 +60,8 @@ Options:
 
 Behaviour:
   * Builds a runner-like environment in a temporary directory:
-    GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, GITHUB_ENV, RUNNER_TEMP and
-    CARGO_HOME/bin containing the given engine. Everything is removed
+    GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, GITHUB_ENV, and RUNNER_TEMP with the
+    given engine in the Action-owned install root. Everything is removed
     afterwards, including on failure and interrupt.
   * Runs the Action's real 'dist/index.js' (build it first with
     'npm run build').
@@ -142,13 +144,16 @@ function buildEnvironment(enginePath, fixes) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-run-local-"));
   const env = { ...process.env };
 
-  env.CARGO_HOME = path.join(tempDir, "cargo-home");
-  fs.mkdirSync(path.join(env.CARGO_HOME, "bin"), { recursive: true });
-  const engineName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
-  fs.copyFileSync(enginePath, path.join(env.CARGO_HOME, "bin", engineName));
-  fs.chmodSync(path.join(env.CARGO_HOME, "bin", engineName), 0o755);
-
   env.RUNNER_TEMP = path.join(tempDir, "runner-temp");
+  const binaryDir = path.join(env.RUNNER_TEMP, "stellar-canary-action", "bin");
+  fs.mkdirSync(binaryDir, { recursive: true });
+  const engineName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
+  const binaryPath = path.join(binaryDir, engineName);
+  fs.copyFileSync(enginePath, binaryPath);
+  fs.chmodSync(binaryPath, 0o755);
+  const digest = createHash("sha256").update(fs.readFileSync(binaryPath)).digest("hex");
+  fs.writeFileSync(path.join(binaryDir, "stellar-canary.sha256"), `${digest}\n`, { mode: 0o600 });
+
   fs.mkdirSync(env.RUNNER_TEMP, { recursive: true });
 
   env.GITHUB_OUTPUT = path.join(tempDir, "github-output");

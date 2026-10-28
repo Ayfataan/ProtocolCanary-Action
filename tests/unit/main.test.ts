@@ -499,9 +499,11 @@ describe("run", () => {
   it("fails the run when writeSummary rejects on the success path, after outputs are set", async () => {
     runCheckMock.mockResolvedValueOnce({ exitCode: 0, signal: null, stdout: `${JSON.stringify(PASS_REPORT)}\n`, stderr: "" });
     writeSummaryMock.mockRejectedValueOnce(new SummaryPublishFailedError("Failed to publish Canary summary: HTTP 502"));
+    resolveVersionMock.mockResolvedValueOnce({ version: "0.1.0", tag: "v0.1.0", commitSha: "abc123" });
 
     await run();
 
+    expect(resolveVersionMock).toHaveBeenCalledWith("0.1.0", { token: undefined });
     expect(setFailedMock).toHaveBeenCalledTimes(1);
     expect(setFailedMock).toHaveBeenCalledWith("Failed to publish Canary summary: HTTP 502");
 
@@ -1014,7 +1016,6 @@ describe("run", () => {
       expect(setOutputMock).toHaveBeenCalledWith("engine-version", "");
     });
   });
-
   // #400: fixtures-dir is validated after input parsing and before version
   // resolution or installation. The regression test is the execution-order
   // one: under the original behavior, a missing fixtures directory went

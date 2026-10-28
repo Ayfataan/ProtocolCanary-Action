@@ -165,6 +165,7 @@ async function withArch<T>(arch: string, run: () => Promise<T> | T): Promise<T> 
 describe("prebuilt release install failure paths (#495)", () => {
   let tempCargoHome: string;
   let originalCargoHome: string | undefined;
+  let originalRunnerTemp: string | undefined;
   let tempToolCache: string;
   let originalToolCache: string | undefined;
 
@@ -174,6 +175,10 @@ describe("prebuilt release install failure paths (#495)", () => {
   const MANIFEST_URL = "https://example.test/SHA256SUMS";
   const archiveBytes = Buffer.from("test-archive-payload");
   const manifest = `${crypto.createHash("sha256").update(archiveBytes).digest("hex")}  ${LINUX_X64_ASSET}\n`;
+
+  function installedBinaryPath(): string {
+    return path.join(tempCargoHome, "stellar-canary-action", "bin", "stellar-canary");
+  }
 
   function releaseBody(): string {
     return JSON.stringify({
@@ -276,7 +281,9 @@ describe("prebuilt release install failure paths (#495)", () => {
     tempCargoHome = fs.mkdtempSync(path.join(os.tmpdir(), "canary-failures-cargo-home-"));
     fs.mkdirSync(path.join(tempCargoHome, "bin"), { recursive: true });
     originalCargoHome = process.env.CARGO_HOME;
+    originalRunnerTemp = process.env.RUNNER_TEMP;
     process.env.CARGO_HOME = tempCargoHome;
+    process.env.RUNNER_TEMP = tempCargoHome;
 
     tempToolCache = fs.mkdtempSync(path.join(os.tmpdir(), "canary-failures-toolcache-"));
     originalToolCache = process.env.RUNNER_TOOL_CACHE;
@@ -304,8 +311,9 @@ describe("prebuilt release install failure paths (#495)", () => {
         return new ImmediateChild(0, "cargo 1.0.0\n") as unknown as ChildProcess;
       }
       if (command === "cargo" && args[0] === "install") {
-        const binName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
-        fs.writeFileSync(path.join(tempCargoHome, "bin", binName), "cargo-installed-binary", { mode: 0o755 });
+        const binary = installedBinaryPath();
+        fs.mkdirSync(path.dirname(binary), { recursive: true });
+        fs.writeFileSync(binary, "cargo-installed-binary", { mode: 0o755 });
         return new ImmediateChild(0) as unknown as ChildProcess;
       }
       if (command === "tar") {
@@ -337,6 +345,11 @@ describe("prebuilt release install failure paths (#495)", () => {
     } else {
       process.env.CARGO_HOME = originalCargoHome;
     }
+    if (originalRunnerTemp === undefined) {
+      delete process.env.RUNNER_TEMP;
+    } else {
+      process.env.RUNNER_TEMP = originalRunnerTemp;
+    }
     if (originalToolCache === undefined) {
       delete process.env.RUNNER_TOOL_CACHE;
     } else {
@@ -365,7 +378,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Failed to download the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -387,7 +400,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Failed to download the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -411,7 +424,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Failed to download the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -431,7 +444,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Failed to download the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -453,7 +466,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Failed to download the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -474,7 +487,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Failed to download the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -492,7 +505,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Could not extract the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -508,7 +521,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Could not extract the prebuilt Protocol-Canary asset ${LINUX_X64_ASSET}`)),
       );
@@ -531,7 +544,8 @@ describe("prebuilt release install failure paths (#495)", () => {
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
       expect(installed.version).toBe("0.1.0");
-      expect(installed.binaryPath).toContain("nested-sub");
+      expect(installed.binaryPath).toBe(installedBinaryPath());
+      expect(fs.readFileSync(installed.binaryPath, "utf8")).toBe("nested-binary");
       expect(cargoInstallSpawned()).toBe(false);
     });
 
@@ -553,7 +567,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.debugMock).toHaveBeenCalledWith(
         expect.stringContaining(`Could not fetch the checksum manifest for ${LINUX_X64_ASSET}`),
       );
@@ -567,7 +581,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringContaining(`has no entry for ${LINUX_X64_ASSET}`),
       );
@@ -588,7 +602,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`Could not hash the downloaded asset ${LINUX_X64_ASSET}`)),
       );
@@ -608,7 +622,7 @@ describe("prebuilt release install failure paths (#495)", () => {
 
       const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
 
-      expect(installed.binaryPath).toBe(path.join(tempCargoHome, "bin", "stellar-canary"));
+      expect(installed.binaryPath).toBe(installedBinaryPath());
       expect(coreMocks.warningMock).toHaveBeenCalledWith(
         expect.stringMatching(new RegExp(`contains no stellar-canary executable`)),
       );

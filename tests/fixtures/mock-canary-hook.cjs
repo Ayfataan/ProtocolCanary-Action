@@ -4,8 +4,9 @@
  * Windows cannot execute a plain Node script as `stellar-canary.exe`: the
  * Action looks for a real executable there, and a `.cjs` file is not one.
  * The workaround this file enables: the test copies the Node executable
- * itself (`process.execPath`) to `<CARGO_HOME>/bin/stellar-canary.exe` and
- * points `NODE_OPTIONS=--require <this file>` at this hook, so the copied
+ * itself (`process.execPath`) to
+ * `<RUNNER_TEMP>/stellar-canary-action/bin/stellar-canary.exe` and points
+ * `NODE_OPTIONS=--require <this file>` at this hook, so the copied
  * binary becomes a Node runtime that executes the mock engine the moment it
  * starts. Nothing is compiled and no real engine is needed on any platform.
  *

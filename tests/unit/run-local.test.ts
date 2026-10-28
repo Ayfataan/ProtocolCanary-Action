@@ -120,7 +120,7 @@ describe("scripts/run-local.mjs (local runner script)", () => {
       "GITHUB_STEP_SUMMARY",
       "GITHUB_ENV",
       "RUNNER_TEMP",
-      "CARGO_HOME",
+      "Action-owned install root",
       "npm run build",
     ];
     for (const token of expected) {

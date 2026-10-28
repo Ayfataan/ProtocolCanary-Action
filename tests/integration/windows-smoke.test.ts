@@ -1,4 +1,5 @@
 import type * as actionsCore from "@actions/core";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,10 +9,9 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
  * Issue #436: Windows coverage for the Action's real spawn path.
  *
  * tests/integration/end-to-end.test.ts copies `mock-canary.cjs` (a Node
- * script) to `<CARGO_HOME>/bin/stellar-canary` and skips its whole suite on
- * Windows, because the Action looks for `stellar-canary.exe` there and a
- * script cannot be one. These scenarios close that gap by copying the Node
- * executable itself (process.execPath) to `<CARGO_HOME>/bin/stellar-canary.exe`
+ * script) to the Action-owned install root and skips its suite on Windows.
+ * These scenarios close that gap by copying the Node executable itself
+ * (process.execPath) to `RUNNER_TEMP/stellar-canary-action/bin/stellar-canary.exe`
  * (ending in `.exe` only on Windows) and pointing NODE_OPTIONS at
  * tests/fixtures/mock-canary-hook.cjs, so the copy runs the existing mock
  * engine the moment it starts. The Action's real binary lookup, path
@@ -93,22 +93,22 @@ interface Scenario {
   readonly outputPath: string;
 }
 
-function setUp(scenario: string, options: { cargoHomeName?: string } = {}): Scenario {
+function setUp(scenario: string, options: { cargoHomeName?: string; runnerTempName?: string } = {}): Scenario {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-win-smoke-"));
-  // A deliberately spaceful CARGO_HOME exercises the Windows path-handling
-  // the mock-engine suite previously covered only with unit-test mocks.
   const cargoHome = path.join(workDir, options.cargoHomeName ?? "cargo-home");
-  fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
+  fs.mkdirSync(cargoHome, { recursive: true });
 
+  const runnerTemp = path.join(workDir, options.runnerTempName ?? "runner-temp");
+  const binaryDir = path.join(runnerTemp, "stellar-canary-action", "bin");
+  fs.mkdirSync(binaryDir, { recursive: true });
   const binaryName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
-  const binaryPath = path.join(cargoHome, "bin", binaryName);
+  const binaryPath = path.join(binaryDir, binaryName);
   // Copy the Node executable itself; the preload hook below makes it run the
   // mock engine on startup.
   fs.copyFileSync(process.execPath, binaryPath);
   fs.chmodSync(binaryPath, 0o755);
-
-  const runnerTemp = path.join(workDir, "runner-temp");
-  fs.mkdirSync(runnerTemp, { recursive: true });
+  const digest = crypto.createHash("sha256").update(fs.readFileSync(binaryPath)).digest("hex");
+  fs.writeFileSync(path.join(binaryDir, "stellar-canary.sha256"), `${digest}\n`, { mode: 0o600 });
   const outputPath = path.join(workDir, "github-output");
   fs.writeFileSync(outputPath, "");
   fs.writeFileSync(SUMMARY_PATH, "");
@@ -146,8 +146,8 @@ function setUp(scenario: string, options: { cargoHomeName?: string } = {}): Scen
   // would use — which also proves the allow-list leaves everything else
   // behind.
   process.env["INPUT_ENGINE-ENV-PASSTHROUGH"] = "NODE_OPTIONS,MOCK_CANARY_SCENARIO";
-  // Make cargo unfindable: with the exact-version binary already in
-  // CARGO_HOME/bin, ensureCanaryInstalled must short-circuit to it and never
+  // Make cargo unfindable: with the exact-version binary already in the
+  // Action-owned root, ensureCanaryInstalled must reuse it and never
   // attempt an install. If some code path ever reached for cargo here, the
   // scenario would fail loudly instead of installing anything.
   process.env.PATH = path.join(workDir, "cargo-nowhere");
@@ -188,13 +188,13 @@ describe("Action against the Node-copy mock engine (Windows spawn path)", () => 
   let scenario: Scenario | undefined;
 
   afterEach(() => {
-    if (scenario) fs.rmSync(scenario.workDir, { recursive: true, force: true });
+    if (scenario) fs.rmSync(scenario.workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     scenario = undefined;
     for (const key of ENV_KEYS) delete process.env[key];
   });
 
   afterAll(() => {
-    fs.rmSync(SUMMARY_PATH, { force: true });
+    fs.rmSync(SUMMARY_PATH, { force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("pass: succeeds through the real spawn path and never reaches cargo", async () => {
@@ -206,9 +206,8 @@ describe("Action against the Node-copy mock engine (Windows spawn path)", () => 
     expect(readOutputs(scenario.outputPath).status).toBe("pass");
     expect(fs.readFileSync(SUMMARY_PATH, "utf8")).toContain("✅ **PASS**");
 
-    // The matching binary in CARGO_HOME/bin was used directly; the install
-    // chain (and therefore cargo, which PATH above cannot find) was never
-    // invoked.
+    // The matching binary in the Action-owned root was used directly; cargo
+    // (which PATH above cannot find) was never invoked.
     expect(
       infoMock.mock.calls.some((call) => String(call[0]).includes("already installed")),
     ).toBe(true);
@@ -217,15 +216,14 @@ describe("Action against the Node-copy mock engine (Windows spawn path)", () => 
 
   // Before #521 the version probe ran through @actions/exec, which treats
   // the tool as a command LINE and splits it on whitespace
-  // (argStringToArray), so a CARGO_HOME whose path contains a space could
-  // not be executed on any platform (real engine builds install to
-  // <CARGO_HOME>/bin too) and the step failed with "could not be
-  // executed". The probe now runs through the bounded runner
+  // (argStringToArray), so an Action-owned binary path containing a space
+  // could not be executed on any platform and the step failed with "could
+  // not be executed". The probe now runs through the bounded runner
   // (src/runner.ts), which spawns the path verbatim: the spaceful binary
   // is probed, its version matches, and the run succeeds without ever
   // reaching for cargo.
-  it("a spaceful CARGO_HOME is probed verbatim and the run succeeds", async () => {
-    scenario = setUp("pass", { cargoHomeName: "cargo home with spaces" });
+  it("a spaceful RUNNER_TEMP is probed verbatim and the run succeeds", async () => {
+    scenario = setUp("pass", { runnerTempName: "runner temp with spaces" });
     const { run } = await import("../../src/main");
     await run();
 

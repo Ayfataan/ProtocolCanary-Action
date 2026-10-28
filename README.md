@@ -557,12 +557,19 @@ runner needs an
 enough to bundle Node 24 (v2.328.0 or later), or the step fails to start
 with an opaque runtime error before Canary is ever installed or run.
 
+The actual `stellar-canary` binary is installed into a private sandbox under
+`$RUNNER_TEMP/stellar-canary-action/bin` (or the equivalent temporary directory on
+non-GitHub hosts) and executed by absolute path. The Action does not modify
+`PATH`, does not install into the shared Cargo home, and does not rely on a
+user-visible `cargo` bin directory on the runner.
+
 ## Engine environment
 
-This Action starts two kinds of child process: `cargo` (the `--version` probe
-and `cargo install`) and the Protocol Canary engine itself. Compiling a
+This Action starts three kinds of child process: `cargo` (the `--version` probe
+and `cargo install`), the system `tar` that extracts a verified release or
+fixture-pack archive, and the Protocol Canary engine itself. Compiling a
 dependency tree runs arbitrary code from every crate in it — build scripts and
-procedural macros included — so neither child inherits the job environment.
+procedural macros included — so none of them inherits the job environment.
 Each one receives an explicit allow-list built at run time from the runner's
 environment, plus the names opted into with `engine-env-passthrough`. The
 Action process itself keeps its full environment, because it needs `INPUT_*`,
