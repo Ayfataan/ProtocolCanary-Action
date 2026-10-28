@@ -192,7 +192,7 @@ export async function resolveVersion(
           ? "commit resolution failed because of a network timeout"
           : "commit resolution failed because of a network error";
       core.warning(
-        `GitHub API lookup for ${tag}: ${reason} (${message}). The Action is falling back to tag pinning.`,
+        `GitHub API lookup for ${tag}: ${reason} (${message}). The Action is falling back to tag-only pinning.`,
       );
       return undefined;
     }

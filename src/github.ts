@@ -186,8 +186,9 @@ export async function githubFetch(
       if (attempt >= MAX_ATTEMPTS) {
         break;
       }
+      const remainingAfter = deadline - Date.now();
       const delay = retryDelay(lastError, attempt);
-      if (delay === undefined || delay >= remaining) {
+      if (delay === undefined || delay >= remainingAfter) {
         break;
       }
       await new Promise<void>((resolve) => setTimeout(resolve, delay));

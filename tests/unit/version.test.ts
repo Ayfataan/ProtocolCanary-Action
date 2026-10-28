@@ -276,6 +276,50 @@ describe("resolveVersion", () => {
     expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
   });
 
+  it("warns with tag-only pinning fallback when commit resolution times out", async () => {
+    delete process.env.GITHUB_TOKEN;
+    class TimeoutOnlyRequest extends EventEmitter {
+      destroy(error?: Error): void {
+        if (error !== undefined) {
+          this.emit("error", error);
+        }
+      }
+    }
+    const request = new TimeoutOnlyRequest();
+    vi.mocked(https.get).mockImplementation(() => {
+      queueMicrotask(() => request.emit("timeout"));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return request as any;
+    });
+
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("falling back to tag-only pinning"),
+    );
+  });
+
+  it("warns with tag-only pinning fallback when commit resolution hits a network error", async () => {
+    delete process.env.GITHUB_TOKEN;
+    class NetworkErrorRequest extends EventEmitter {
+      destroy(): void {
+        /* no-op */
+      }
+    }
+    const request = new NetworkErrorRequest();
+    vi.mocked(https.get).mockImplementation(() => {
+      queueMicrotask(() => request.emit("error", new Error("ECONNREFUSED")));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return request as any;
+    });
+
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("falling back to tag-only pinning"),
+    );
+  });
+
   it("degrades to commitSha undefined on malformed JSON, never throwing", async () => {
     mockHttpsPages([{ body: "not json" }]);
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });

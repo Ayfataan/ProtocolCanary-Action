@@ -798,6 +798,45 @@ describe("ensureCanaryInstalled", () => {
     expect(httpsGetMock).toHaveBeenCalledTimes(2);
   });
 
+  it("retries a 503 checksum manifest lookup and still verifies the checksum", async () => {
+    writeInstalledBinary();
+    let manifestCalls = 0;
+    httpsGetMock.mockImplementation((url: string, _options: unknown, callback: (response: FakeResponse) => void) => {
+      const request = new FakeRequest();
+      if (url === `${CANARY_API_REPO_URL}/releases/tags/v${RESOLVED.version}`) {
+        const response = new FakeResponse(200);
+        callback(response);
+        queueMicrotask(() => {
+          response.emit("data", JSON.stringify({
+            assets: [{ name: "SHA256SUMS", browser_download_url: "https://example.test/SHA256SUMS" }],
+          }));
+          response.emit("end");
+        });
+        return request;
+      }
+      manifestCalls += 1;
+      if (manifestCalls === 1) {
+        const response = new FakeResponse(503);
+        queueMicrotask(() => callback(response));
+        return request;
+      }
+      const response = new FakeResponse(200);
+      callback(response);
+      queueMicrotask(() => {
+        response.emit("data", `${sha256(binaryPath())}  stellar-canary\n`);
+        response.emit("end");
+      });
+      return request;
+    });
+
+    const installed = await ensureCanaryInstalled(RESOLVED);
+
+    expect(installed.binaryPath).toBe(binaryPath());
+    expect(httpsGetMock).toHaveBeenCalledTimes(3);
+    expect(manifestCalls).toBe(2);
+    expect(coreMocks.warningMock).not.toHaveBeenCalled();
+  });
+
   it("ignores an oversized checksum manifest rather than verifying its partial prefix (#500)", async () => {
     writeInstalledBinary();
     mockPublishedChecksums(`${"0".repeat(64)}  stellar-canary\n${" ".repeat(MAX_CHECKSUM_MANIFEST_BYTES)}`);
