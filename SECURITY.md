@@ -49,6 +49,8 @@ checksums. This Action installs it from source with `cargo install --git`,
 which:
 
 - always uses HTTPS to reach GitHub;
+- installs into an Action-owned directory under `RUNNER_TEMP` and does not
+  modify the runner's shared Cargo bin directory or `PATH`;
 - pins the exact requested version (the `version` input) — never `main`,
   never an unpinned "latest";
 - resolves that version's tag to the immutable commit it pointed to at run
@@ -87,11 +89,34 @@ A compiled-from-a-pinned-commit build is still a weaker integrity story
 than a checksum published by the artifact's own maintainers, so making
 checksum-verified installs the primary path remains the goal.
 
+### Cached binary integrity
+
+A binary restored from the Actions cache is bound to the SHA-256 digest
+recorded in its `stellar-canary.sha256` sidecar at install time. If the
+sidecar is missing, malformed, or does not match the restored binary, the
+entry is treated as a cache miss: the untrusted files are deleted and the
+Action installs a fresh, verified binary. A cached executable is never run
+on trust alone.
+
 The full integrity model — trust boundaries, the optional
 `strict-integrity` fail-closed policy, the D-07 (checksums are data
 integrity, not author authenticity) and D-11 (redirect policy unresolved,
 so no redirect is followed) decision boundaries, and the threat model — is
 documented in [`docs/integrity-model.md`](docs/integrity-model.md).
+
+## Release provenance
+
+Release tags publish `dist/index.js` and its source map with a build
+provenance attestation. To verify a downloaded release artifact:
+
+```sh
+gh attestation verify dist/index.js --repo StellarCanary/ProtocolCanary-Action
+```
+
+The attestation proves the bundle was built by this repository's release
+workflow from the tagged commit. Note that consumers who pin the Action by
+tag still execute the JavaScript bundle, so verify the artifact if your
+threat model requires provenance beyond the pinned tag and commit.
 
 ## Subprocess isolation
 

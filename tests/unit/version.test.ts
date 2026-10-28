@@ -21,6 +21,7 @@ import {
   MIN_SUPPORTED_ENGINE_VERSION,
   resolveVersion,
 } from "../../src/version";
+import { githubFetch } from "../../src/github";
 
 class FakeResponse extends EventEmitter {
   destroy(): void { this.emit("close"); }
@@ -51,6 +52,7 @@ interface FakePage {
   body: string;
   /** Raw `Link` header value, when the page has a next page. */
   link?: string | string[];
+  headers?: Record<string, string | string[] | undefined>;
 }
 
 interface RecordedCall {
@@ -77,7 +79,10 @@ function mockHttpsPages(pages: FakePage[]): RecordedCall[] {
       string
     >;
     calls.push({ url: String(url), headers });
-    const response = new FakeResponse(page.statusCode ?? 200, page.link !== undefined ? { link: page.link } : {});
+    const response = new FakeResponse(page.statusCode ?? 200, {
+      ...(page.headers ?? {}),
+      ...(page.link !== undefined ? { link: page.link } : {}),
+    });
     const request = new FakeRequest();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (callback as any)(response);
@@ -103,6 +108,7 @@ const originalToken = process.env.GITHUB_TOKEN;
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   if (originalToken === undefined) {
     delete process.env.GITHUB_TOKEN;
   } else {
@@ -160,12 +166,79 @@ describe("resolveVersion", () => {
   });
 
   it("logs at debug level when the GitHub API call itself fails", async () => {
-    mockHttpsPages([{ statusCode: 503, body: "" }]);
+    mockHttpsPages([{ statusCode: 400, body: "" }]);
     await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
     expect(vi.mocked(core.warning)).not.toHaveBeenCalled();
     expect(vi.mocked(core.debug)).toHaveBeenCalledWith(
       expect.stringContaining("Could not resolve v0.1.0 to a commit sha"),
     );
+  });
+
+  it("retries a transient 503 and resolves successfully without warning", async () => {
+    vi.useFakeTimers();
+    const calls = mockHttpsPages([
+      { statusCode: 503, body: "" },
+      { body: tagsBody([{ name: "v0.1.0", sha: "abc123" }]) },
+    ]);
+    const pending = resolveVersion("0.1.0");
+
+    await vi.advanceTimersByTimeAsync(250);
+    await expect(pending).resolves.toMatchObject({ commitSha: "abc123" });
+
+    expect(calls).toHaveLength(2);
+    expect(vi.mocked(core.warning)).not.toHaveBeenCalled();
+  });
+
+  it("warns after three consecutive 503 responses", async () => {
+    vi.useFakeTimers();
+    const calls = mockHttpsPages([{ statusCode: 503, body: "" }]);
+    const pending = resolveVersion("0.1.0");
+
+    await vi.advanceTimersByTimeAsync(750);
+    await expect(pending).resolves.toMatchObject({ commitSha: undefined });
+
+    expect(calls).toHaveLength(3);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("GitHub API lookup for v0.1.0 failed after retries"),
+    );
+  });
+
+  it("does not retry a primary rate limit and warns when it resets", async () => {
+    const resetSeconds = Math.floor((Date.now() + 60_000) / 1000);
+    const calls = mockHttpsPages([
+      {
+        statusCode: 403,
+        body: "",
+        headers: {
+          "x-ratelimit-remaining": "0",
+          "x-ratelimit-reset": String(resetSeconds),
+          "retry-after": "1",
+        },
+      },
+    ]);
+
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+
+    expect(calls).toHaveLength(1);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining(`The rate limit resets at ${new Date(resetSeconds * 1000).toISOString()}`),
+    );
+  });
+
+  it("bounds total retry delay with fake timers", async () => {
+    vi.useFakeTimers();
+    const calls = mockHttpsPages([{ statusCode: 503, body: "" }]);
+    const start = Date.now();
+    const pending = githubFetch("https://api.github.com/repos/StellarCanary/Protocol-Canary/tags");
+    const rejected = expect(pending).rejects.toThrow("failed after retries");
+
+    await vi.advanceTimersByTimeAsync(749);
+    expect(calls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+
+    expect(calls).toHaveLength(3);
+    expect(Date.now() - start).toBe(750);
   });
 
   it("degrades to commitSha undefined on a timed-out tag lookup request, never throwing (#263)", async () => {
@@ -200,7 +273,51 @@ describe("resolveVersion", () => {
       tag: "v0.1.0",
       commitSha: undefined,
     });
-    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
+  });
+
+  it("warns with tag-only pinning fallback when commit resolution times out", async () => {
+    delete process.env.GITHUB_TOKEN;
+    class TimeoutOnlyRequest extends EventEmitter {
+      destroy(error?: Error): void {
+        if (error !== undefined) {
+          this.emit("error", error);
+        }
+      }
+    }
+    const request = new TimeoutOnlyRequest();
+    vi.mocked(https.get).mockImplementation(() => {
+      queueMicrotask(() => request.emit("timeout"));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return request as any;
+    });
+
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("falling back to tag-only pinning"),
+    );
+  });
+
+  it("warns with tag-only pinning fallback when commit resolution hits a network error", async () => {
+    delete process.env.GITHUB_TOKEN;
+    class NetworkErrorRequest extends EventEmitter {
+      destroy(): void {
+        /* no-op */
+      }
+    }
+    const request = new NetworkErrorRequest();
+    vi.mocked(https.get).mockImplementation(() => {
+      queueMicrotask(() => request.emit("error", new Error("ECONNREFUSED")));
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return request as any;
+    });
+
+    await expect(resolveVersion("0.1.0")).resolves.toMatchObject({ commitSha: undefined });
+    expect(vi.mocked(https.get)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(core.warning)).toHaveBeenCalledWith(
+      expect.stringContaining("falling back to tag-only pinning"),
+    );
   });
 
   it("degrades to commitSha undefined on malformed JSON, never throwing", async () => {

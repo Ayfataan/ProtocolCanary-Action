@@ -1,5 +1,6 @@
 import type * as actionsCore from "@actions/core";
 import { execFileSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -99,16 +100,19 @@ function engineVersion(binary: string): string {
 function setUp(binary: string, version: string, inputs: Record<string, string>, omitVersion = false): Run {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-real-"));
   const cargoHome = path.join(workDir, "cargo-home");
-  fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
+  fs.mkdirSync(cargoHome, { recursive: true });
+
+  const runnerTemp = path.join(workDir, "runner-temp");
+  const binaryDir = path.join(runnerTemp, "stellar-canary-action", "bin");
+  fs.mkdirSync(binaryDir, { recursive: true });
   const exeName = process.platform === "win32" ? "stellar-canary.exe" : "stellar-canary";
-  const destPath = path.join(cargoHome, "bin", exeName);
+  const destPath = path.join(binaryDir, exeName);
   fs.copyFileSync(binary, destPath);
   if (process.platform !== "win32") {
     fs.chmodSync(destPath, 0o755);
   }
-
-  const runnerTemp = path.join(workDir, "runner-temp");
-  fs.mkdirSync(runnerTemp, { recursive: true });
+  const digest = crypto.createHash("sha256").update(fs.readFileSync(destPath)).digest("hex");
+  fs.writeFileSync(path.join(binaryDir, "stellar-canary.sha256"), `${digest}\n`, { mode: 0o600 });
   const emptyDir = path.join(workDir, "no-fixtures-here");
   fs.mkdirSync(emptyDir);
   const outputPath = path.join(workDir, "github-output");

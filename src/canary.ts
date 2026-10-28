@@ -23,6 +23,7 @@ import {
   InvalidInputError,
   TimeoutError,
 } from "./errors";
+import { githubFetch } from "./github";
 import { resolveGithubToken } from "./inputs";
 import { formatSafeDiagnosticTail, printLogBlock } from "./log-block";
 import type { CheckExecutionResult } from "./runner";
@@ -45,9 +46,29 @@ export interface InstalledCanary {
   readonly version: string;
 }
 
-function cargoBinDir(): string {
-  const cargoHome = process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo");
-  return path.join(cargoHome, "bin");
+function installRoot(): string {
+  const runnerTemp = process.env.RUNNER_TEMP?.trim();
+  return path.join(runnerTemp === undefined || runnerTemp === "" ? os.tmpdir() : runnerTemp, "stellar-canary-action");
+}
+
+function installedBinaryPath(root = installRoot()): string {
+  return path.join(root, "bin", binaryName());
+}
+
+function digestSidecarPath(binaryPath: string): string {
+  return path.join(path.dirname(binaryPath), "stellar-canary.sha256");
+}
+
+function ensureInstallRoot(): string {
+  const root = installRoot();
+  try {
+    fs.mkdirSync(path.join(root, "bin"), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    throw new InstallationFailedError(
+      `Could not create the Action-owned Protocol-Canary install root at ${root}: ${String(error)}`,
+    );
+  }
+  return root;
 }
 
 function binaryName(): string {
@@ -92,14 +113,6 @@ export function prebuiltTargetTriple(platform: string, arch: string): string {
  * variant accepted for Windows where release tooling commonly emits one. */
 function prebuiltAssetName(version: string, triple: string): string {
   return `stellar-canary-${version}-${triple}.tar.gz`;
-}
-
-/** Root under which prebuilt binaries are kept, mirroring the runner's
- * tool-cache when `RUNNER_TOOL_CACHE` is set and falling back to a stable
- * per-user cache directory on local runs. */
-function toolCacheRoot(): string {
-  const configured = (process.env["RUNNER_TOOL_CACHE"] ?? "").trim();
-  return configured !== "" ? configured : path.join(os.homedir(), ".cache", "protocolcanary-tool-cache");
 }
 
 /** Time bound for one prebuilt-asset download request, and the number of
@@ -278,7 +291,7 @@ function parseChecksumManifest(text: string): Map<string, string> {
 async function lookupPublishedChecksums(version: string, explicitToken?: string): Promise<Map<string, string> | undefined> {
   const token = resolveGithubToken(explicitToken);
   try {
-    const releaseBody = await httpsGetText(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, token);
+    const { body: releaseBody } = await githubFetch(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, token);
     const parsed = JSON.parse(releaseBody) as unknown;
     if (typeof parsed !== "object" || parsed === null) {
       return undefined;
@@ -296,7 +309,7 @@ async function lookupPublishedChecksums(version: string, explicitToken?: string)
     if (checksumAsset === undefined) {
       return undefined;
     }
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token, MAX_CHECKSUM_MANIFEST_BYTES);
+    const { body: manifest } = await githubFetch(checksumAsset.browser_download_url as string, token, MAX_CHECKSUM_MANIFEST_BYTES);
     const entries = parseChecksumManifest(manifest);
     return entries.size > 0 ? entries : undefined;
   } catch (error) {
@@ -328,19 +341,11 @@ function selectExpectedChecksum(entries: Map<string, string>, binary: string): s
   return candidates.length === 1 && only !== undefined ? only[1] : undefined;
 }
 
-/** The `GITHUB_TOKEN` value used to authenticate the GitHub REST calls made
- * during installation, normalized the same way as the checksum lookup: a
- * blank or whitespace-only value counts as "no token". */
-function installApiToken(): string | undefined {
-  const candidate = (process.env.GITHUB_TOKEN ?? "").trim();
-  return candidate === "" ? undefined : candidate;
-}
-
 /** Fetches the asset list of the Protocol-Canary GitHub release for a bare
  * version. Rejects on a non-200 response, malformed JSON, or an unexpected
  * shape; callers decide how to degrade. */
-async function fetchReleaseAssets(version: string): Promise<ReleaseAsset[]> {
-  const releaseBody = await httpsGetText(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, installApiToken());
+async function fetchReleaseAssets(version: string, token?: string): Promise<ReleaseAsset[]> {
+  const { body: releaseBody } = await githubFetch(`${CANARY_API_REPO_URL}/releases/tags/v${version}`, resolveGithubToken(token));
   const parsed = JSON.parse(releaseBody) as unknown;
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`unexpected release response shape for v${version}`);
@@ -526,8 +531,8 @@ function githubApiBase(repo: string): string {
  * this Action installs binaries from, the fixture-pack releases whose
  * archives are verified here) over the authenticated GitHub API.
  */
-async function fetchReleaseAssetsFor(repo: string, version: string): Promise<ReleaseAsset[]> {
-  const releaseBody = await httpsGetText(`${githubApiBase(repo)}/releases/tags/v${version}`, installApiToken());
+async function fetchReleaseAssetsFor(repo: string, version: string, token?: string): Promise<ReleaseAsset[]> {
+  const { body: releaseBody } = await githubFetch(`${githubApiBase(repo)}/releases/tags/v${version}`, resolveGithubToken(token));
   const parsed = JSON.parse(releaseBody) as unknown;
   if (typeof parsed !== "object" || parsed === null) {
     throw new Error(`unexpected release response shape for v${version}`);
@@ -553,7 +558,7 @@ async function lookupPublishedChecksumsFor(
 ): Promise<Map<string, string> | undefined> {
   const token = resolveGithubToken(explicitToken);
   try {
-    const releaseBody = await httpsGetText(`${githubApiBase(repo)}/releases/tags/v${version}`, token);
+    const { body: releaseBody } = await githubFetch(`${githubApiBase(repo)}/releases/tags/v${version}`, token);
     const parsed = JSON.parse(releaseBody) as unknown;
     if (typeof parsed !== "object" || parsed === null) {
       return undefined;
@@ -571,7 +576,7 @@ async function lookupPublishedChecksumsFor(
     if (checksumAsset === undefined) {
       return undefined;
     }
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, token);
+    const { body: manifest } = await githubFetch(checksumAsset.browser_download_url as string, token);
     const entries = parseChecksumManifest(manifest);
     return entries.size > 0 ? entries : undefined;
   } catch (error) {
@@ -603,7 +608,7 @@ export async function downloadVerifiedPack(version: string, protocol: number, to
   const archivePath = path.join(stagingDir, archiveName);
   let keepStaging = false;
   try {
-    const assets = await fetchReleaseAssetsFor(FIXTURE_PACKS_API_REPO, version);
+    const assets = await fetchReleaseAssetsFor(FIXTURE_PACKS_API_REPO, version, token);
     const archive = assets.find(
       (asset) =>
         typeof asset.name === "string" &&
@@ -634,6 +639,14 @@ export async function downloadVerifiedPack(version: string, protocol: number, to
 }
 
 
+async function hasValidInstallDigest(binaryPath: string): Promise<boolean> {
+  try {
+    const expected = fs.readFileSync(digestSidecarPath(binaryPath), "utf8").trim();
+    return /^[0-9a-fA-F]{64}$/.test(expected) && (await sha256File(binaryPath)) === expected.toLowerCase();
+  } catch {
+    return false;
+  }
+}
 /**
  * Verifies an installed or cached binary against the checksum published with
  * its release, when one exists. When Protocol-Canary has not published a
@@ -739,25 +752,6 @@ export async function getInstalledVersion(
 }
 
 /**
- * Looks for an already-installed binary in the cargo bin directory. Only an
- * exact version match counts: a binary reporting any other version returns
- * `undefined` so the caller falls through to the cache/install steps rather
- * than running the wrong Canary.
- */
-async function findExisting(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
-  const candidatePath = path.join(cargoBinDir(), binaryName());
-  if (!fs.existsSync(candidatePath)) {
-    return undefined;
-  }
-  const version = await getInstalledVersion(candidatePath);
-  if (version === resolved.version) {
-    core.info(`Found stellar-canary ${version} already installed at ${candidatePath}.`);
-    return { binaryPath: candidatePath, version };
-  }
-  return undefined;
-}
-
-/**
  * Derives the cache key for a resolved version. The immutable commit SHA is
  * preferred over the tag so a re-pointed tag can never alias a cached build
  * produced from a different commit.
@@ -778,16 +772,40 @@ async function restoreFromCache(resolved: ResolvedVersion): Promise<InstalledCan
   if (!cache.isFeatureAvailable()) {
     return undefined;
   }
-  const binaryPath = path.join(cargoBinDir(), binaryName());
+  const binaryPath = installedBinaryPath();
+  const sidecarPath = digestSidecarPath(binaryPath);
   const key = cacheKeyFor(resolved);
   try {
-    const hit = await cache.restoreCache([binaryPath], key);
+    const hit = await cache.restoreCache([binaryPath, sidecarPath], key);
     if (hit === undefined) {
+      return undefined;
+    }
+    let expectedDigest = "<missing>";
+    try {
+      expectedDigest = fs.readFileSync(sidecarPath, "utf8").trim() || "<empty>";
+    } catch {
+      // A cache entry without an install-time digest is not trusted.
+    }
+    let actualDigest = "<unavailable>";
+    try {
+      actualDigest = await sha256File(binaryPath);
+    } catch {
+      // Missing or unreadable cached binaries are rejected below.
+    }
+    if (!/^[0-9a-fA-F]{64}$/.test(expectedDigest) || actualDigest !== expectedDigest.toLowerCase()) {
+      core.warning(
+        `Discarding cached stellar-canary because its SHA-256 does not match the install-time digest ` +
+          `(sidecar: ${expectedDigest}; binary: ${actualDigest}); installing a fresh copy.`,
+      );
+      fs.rmSync(binaryPath, { force: true });
+      fs.rmSync(sidecarPath, { force: true });
       return undefined;
     }
     const version = await getInstalledVersion(binaryPath);
     if (version !== resolved.version) {
       core.debug(`Cache hit for ${key} did not produce a matching stellar-canary version; ignoring.`);
+      fs.rmSync(binaryPath, { force: true });
+      fs.rmSync(sidecarPath, { force: true });
       return undefined;
     }
     core.info(`Restored stellar-canary ${resolved.version} from cache (key: ${key}).`);
@@ -825,7 +843,7 @@ async function saveToCache(resolved: ResolvedVersion, binaryPath: string): Promi
     return;
   }
   try {
-    await cache.saveCache([binaryPath], cacheKeyFor(resolved));
+    await cache.saveCache([binaryPath, digestSidecarPath(binaryPath)], cacheKeyFor(resolved));
   } catch (error) {
     // Caching is a pure optimization; correctness never depends on it.
     core.warning(`Cache save failed, ignoring: ${String(error)}`);
@@ -1139,11 +1157,13 @@ function discoverExtractedBinary(extractDir: string, targetName: string): Discov
  * being silently replaced (the same posture {@link verifyInstalledBinary}
  * takes, see SECURITY.md).
  *
- * On success the archive is extracted under {@link toolCacheRoot}, the
- * extracted directory is prepended to PATH with `core.addPath`, and the
- * binary's own reported version must equal the requested one.
+ * On success the verified binary is copied into the Action-owned install
+ * root under `RUNNER_TEMP`, without changing the runner's PATH.
  */
-export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise<InstalledCanary | undefined> {
+export async function installPrebuiltRelease(
+  resolved: ResolvedVersion,
+  token?: string,
+): Promise<InstalledCanary | undefined> {
   let triple: string;
   try {
     triple = prebuiltTargetTriple(process.platform, process.arch);
@@ -1154,7 +1174,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
 
   let assets: ReleaseAsset[];
   try {
-    assets = await fetchReleaseAssets(resolved.version);
+    assets = await fetchReleaseAssets(resolved.version, token);
   } catch (error) {
     core.debug(
       `Could not look up prebuilt release assets for Protocol-Canary ${resolved.version}: ${String(error)}`,
@@ -1188,7 +1208,11 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
   }
   let expectedChecksum: string | undefined;
   try {
-    const manifest = await httpsGetText(checksumAsset.browser_download_url as string, installApiToken(), MAX_CHECKSUM_MANIFEST_BYTES);
+    const { body: manifest } = await githubFetch(
+      checksumAsset.browser_download_url as string,
+      resolveGithubToken(token),
+      MAX_CHECKSUM_MANIFEST_BYTES,
+    );
     expectedChecksum = parseChecksumManifest(manifest).get(assetName);
   } catch (error) {
     core.debug(`Could not fetch the checksum manifest for ${assetName}: ${String(error)}`);
@@ -1204,11 +1228,7 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
 
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), "protocolcanary-prebuilt-"));
   const archivePath = path.join(stagingDir, assetName);
-  const installDir = path.join(toolCacheRoot(), "stellar-canary", resolved.version, process.arch);
-  const parentDir = path.dirname(installDir);
-  fs.mkdirSync(parentDir, { recursive: true });
-  const extractTmpDir = fs.mkdtempSync(path.join(parentDir, ".tmp-extract-"));
-
+  const extractTmpDir = path.join(stagingDir, "extracted");
   try {
     try {
       await httpsGetFile(downloadUrl, archivePath, MAX_DOWNLOAD_REDIRECTS);
@@ -1273,23 +1293,25 @@ export async function installPrebuiltRelease(resolved: ResolvedVersion): Promise
       return undefined;
     }
 
-    const relativeBinaryPath = path.relative(extractTmpDir, extracted);
-
+    const binaryPath = installedBinaryPath(ensureInstallRoot());
     try {
-      fs.rmSync(installDir, { recursive: true, force: true });
-      fs.renameSync(extractTmpDir, installDir);
+      fs.copyFileSync(extracted, binaryPath);
+      if (process.platform !== "win32") {
+        fs.chmodSync(binaryPath, 0o755);
+      }
+      const digest = await sha256File(binaryPath);
+      fs.writeFileSync(digestSidecarPath(binaryPath), `${digest}\n`, { mode: 0o600 });
     } catch (error) {
-      core.warning(
-        `Failed to move extracted prebuilt asset into ${installDir}: ` +
-          `${error instanceof Error ? error.message : String(error)}; falling back to a source install.`,
+      fs.rmSync(binaryPath, { force: true });
+      fs.rmSync(digestSidecarPath(binaryPath), { force: true });
+      throw new InstallationFailedError(
+        `Could not install the verified prebuilt stellar-canary binary into the Action-owned install root: ${String(error)}`,
       );
-      return undefined;
     }
-
-    const finalBinaryPath = path.join(installDir, relativeBinaryPath);
-    core.addPath(path.dirname(finalBinaryPath));
-    core.info(`Installed stellar-canary ${version} from the prebuilt release asset ${assetName} into ${installDir}.`);
-    return { binaryPath: finalBinaryPath, version };
+    core.info(
+      `Installed stellar-canary ${version} from prebuilt release asset ${assetName} into ${path.dirname(binaryPath)}.`,
+    );
+    return { binaryPath, version };
   } finally {
     fs.rmSync(extractTmpDir, { recursive: true, force: true });
     fs.rmSync(stagingDir, { recursive: true, force: true });
@@ -1331,8 +1353,9 @@ export async function ensureCargoAvailable(timeoutMs: number = CARGO_PROBE_TIMEO
 }
 
 /** Builds the `cargo install` argument array for the resolved version. */
-function buildInstallArgs(resolved: ResolvedVersion): string[] {
+function buildInstallArgs(resolved: ResolvedVersion, root: string): string[] {
   const args = ["install", "--git", CANARY_REPO_URL, "--locked"];
+  args.push("--root", root);
   if (resolved.commitSha !== undefined) {
     args.push("--rev", resolved.commitSha);
   } else {
@@ -1394,8 +1417,8 @@ export function cargoInstallTimeoutMs(timeoutMinutes: number): number {
  * blocking the job. Throws an {@link InstallationFailedError} on a non-zero
  * exit code, a timeout, or a `cargo` that cannot be started.
  */
-async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promise<void> {
-  const args = buildInstallArgs(resolved);
+async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number, root: string): Promise<void> {
+  const args = buildInstallArgs(resolved, root);
 
   core.info(`Installing stellar-canary ${resolved.version} with: cargo ${args.join(" ")}`);
   // The install is executed through the same bounded runner as
@@ -1427,10 +1450,10 @@ async function cargoInstall(resolved: ResolvedVersion, timeoutMs: number): Promi
 
 /**
  * Ensures a `stellar-canary` binary matching `resolved.version` is
- * available, in order: an already-installed matching binary, a cached
- * build, an official prebuilt release asset downloaded and checksum-verified
- * into the tool cache (issue #359), or — only when none of those produced a
- * usable binary — a fresh `cargo install` pinned to the resolved commit
+ * available, in order: a digest-verified cached build, an official prebuilt
+ * release asset downloaded and checksum-verified into the Action-owned
+ * install root, or — only when none of those produced a usable binary — a
+ * fresh `cargo install` pinned to the resolved commit
  * (falling back to the tag if the commit could not be resolved). Never
  * silently falls back to a different version.
  *
@@ -1455,10 +1478,21 @@ export async function ensureCanaryInstalled(
     core.warning(compatibility.warning);
   }
 
-  const existing = await findExisting(resolved);
-  if (existing !== undefined) {
-    await verifyInstalledBinary(existing.binaryPath, resolved, token, strictIntegrity);
-    return existing;
+  const root = ensureInstallRoot();
+  const existingPath = installedBinaryPath(root);
+  if (fs.existsSync(existingPath)) {
+    const version = (await hasValidInstallDigest(existingPath)) ? await getInstalledVersion(existingPath) : undefined;
+    if (version === resolved.version) {
+      await verifyInstalledBinary(existingPath, resolved, token, strictIntegrity);
+      core.info(`Found stellar-canary ${version} already installed in the Action-owned root.`);
+      return { binaryPath: existingPath, version };
+    }
+    core.warning(
+      `Ignoring the existing Action-owned stellar-canary at ${existingPath}: its install-time digest or version ` +
+        "does not match; installing a fresh copy.",
+    );
+    fs.rmSync(existingPath, { force: true });
+    fs.rmSync(digestSidecarPath(existingPath), { force: true });
   }
 
   const cached = await restoreFromCache(resolved);
@@ -1467,15 +1501,15 @@ export async function ensureCanaryInstalled(
     return cached;
   }
 
-  const prebuilt = await installPrebuiltRelease(resolved);
+  const prebuilt = await installPrebuiltRelease(resolved, token);
   if (prebuilt !== undefined) {
     return prebuilt;
   }
 
   await ensureCargoAvailable();
-  await cargoInstall(resolved, installTimeoutMs);
+  await cargoInstall(resolved, installTimeoutMs, root);
 
-  const binaryPath = path.join(cargoBinDir(), binaryName());
+  const binaryPath = installedBinaryPath(root);
   const version = await getInstalledVersion(binaryPath);
   if (version === undefined) {
     throw new CanaryNotFoundError(
@@ -1489,6 +1523,15 @@ export async function ensureCanaryInstalled(
   }
 
   await verifyInstalledBinary(binaryPath, resolved, token, strictIntegrity);
+  try {
+    const digest = await sha256File(binaryPath);
+    fs.writeFileSync(digestSidecarPath(binaryPath), `${digest}\n`, { mode: 0o600 });
+  } catch (error) {
+    throw new InstallationFailedError(
+      `Could not write the install-time SHA-256 sidecar for stellar-canary at ${digestSidecarPath(binaryPath)}: ` +
+        String(error),
+    );
+  }
   await saveToCache(resolved, binaryPath);
   return { binaryPath, version };
 }
