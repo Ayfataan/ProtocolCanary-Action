@@ -1643,6 +1643,7 @@ describe("prebuilt release install (issue #359)", () => {
         coreMocks.warningMock.mock.calls.some(
           (call) =>
             String(call[0]).includes(assetName) &&
+            String(call[0]).includes("returned status 404") &&
             String(call[0]).includes("falling back to a source install"),
         ),
       ).toBe(true);
