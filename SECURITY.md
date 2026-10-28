@@ -134,6 +134,71 @@ Pull request source code is treated as untrusted. This Action:
   64 MiB (terminating the process if exceeded) and stderr capture to 1 MiB
   (retaining the tail with a notice).
 
+### Child process environment
+
+Compiling a dependency tree executes arbitrary code from every crate in it —
+build scripts and procedural macros included. `cargo` (both the `--version`
+probe and `cargo install`) and the Protocol Canary engine therefore **do not
+inherit the job environment**: each is started with an explicit allow-list
+built from the runner environment (`src/child-env.ts`), and nothing else. The
+Action process itself keeps its environment because it needs `INPUT_*`,
+`GITHUB_*`, and `ACTIONS_*`.
+
+**Default allow-list** (exact names; case-insensitive matching only on
+Windows):
+
+- Process and locale: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`,
+  `TEMP`, `TMP`, `LANG`, `LANGUAGE`, `TZ`, `TERM`, `NO_COLOR`, `CI`.
+- Windows system: `SystemRoot`, `SYSTEMROOT`, `windir`, `ComSpec`, `PATHEXT`,
+  `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, `ProgramFiles`,
+  `ProgramFiles(x86)`, `ProgramW6432`, `NUMBER_OF_PROCESSORS`,
+  `PROCESSOR_ARCHITECTURE`, `OS`.
+- Rust and Cargo: `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`,
+  `RUSTFLAGS`, `RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`,
+  `RUSTDOCFLAGS`, `RUST_BACKTRACE`, `RUST_LOG`.
+- Native build toolchain: `CC`, `CXX`, `AR`, `LD`, `CFLAGS`, `CXXFLAGS`,
+  `LDFLAGS`, `CPPFLAGS`, `PKG_CONFIG`, `PKG_CONFIG_PATH`,
+  `PKG_CONFIG_SYSROOT_DIR`, plus the MSVC toolchain's `INCLUDE`, `LIB`,
+  `LIBPATH`, `VCINSTALLDIR`, `VCToolsInstallDir`, `VSINSTALLDIR`,
+  `WindowsSdkDir`, `WindowsSDKVersion`, `UCRTVersion`, `Platform`.
+- Network and certificates: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY` (and their lower-case forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`.
+- Prefixes: `LC_*`, `RUSTUP_*`, `CARGO_*`, `CMAKE_*`.
+
+**Deny rules** — never passed, even when a prefix above matches:
+
+- `GITHUB_*`, `ACTIONS_*`, `INPUT_*`, `RUNNER_*`;
+- `CARGO_REGISTRY_TOKEN`, `CARGO_REGISTRIES_*` (registry/mirror credentials);
+- `GIT_ASKPASS`, `SSH_AUTH_SOCK` (credential agents);
+- `AWS_*`, `AZURE_*`, `GCP_*`, `GOOGLE_*`, `NPM_*`, `NODE_AUTH_TOKEN`;
+- any name containing `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`,
+  `PRIVATE_KEY`, `API_KEY`, `ACCESS_KEY`, or `SESSION` (case-insensitive
+  substring). This is the backstop that stops an allow-listed prefix such as
+  `CARGO_*` from forwarding a credential nobody enumerated.
+
+**Opt-in passthrough (`engine-env-passthrough`)** — a comma- or
+newline-separated list of exact names forwarded in addition to the list
+above:
+
+- names only: each must match `^[A-Za-z_][A-Za-z0-9_]*$` — no wildcards, no
+  values;
+- at most 16 names; duplicates are rejected;
+- a denied name is rejected with an input error that names the variable and
+  never prints a value. The passthrough cannot restore `GITHUB_TOKEN`, the
+  runtime tokens, cloud credentials, Cargo registry tokens, or anything else
+  denied by default;
+- each forwarded name is logged once at info level (names only, never
+  values), so the job log records exactly what left the Action.
+
+**Trade-offs.** The list is a maintained compromise, not a proof: a missing
+variable can break an unusual toolchain, which is why the opt-in exists. The
+Action cannot make a malicious dependency safe — it only deprives it of the
+job's secrets, tokens, and credentials; that code still runs with the
+allow-listed environment and the runner's filesystem and network access. A
+credential that a build genuinely needs cannot be supplied through this
+input; use a different mechanism and accept the risk.
+
 ## External diagnostics and output safety
 
 Diagnostics printed by external tools (`cargo install` build errors and
@@ -173,7 +238,9 @@ manifest lookup) to raise API rate limits. It is:
 
 - strictly restricted to `api.github.com` — the `Authorization` header is never
   sent to arbitrary hosts or to release asset download URLs (such as `github.com`);
-- never forwarded to child processes or echoed to logs, outputs, or summaries;
+- never forwarded to child processes (the children receive only the
+  allow-listed environment above, in which every `GITHUB_*` and `ACTIONS_*`
+  name is denied) or echoed to logs, outputs, or summaries;
 - operable with minimal read-only permissions (`contents: read`), making it safe
   for pull requests from forks without granting write access.
 

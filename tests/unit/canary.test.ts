@@ -80,6 +80,7 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import {
+  ENGINE_ENV_PASSTHROUGH_HINT,
   httpsGetText,
   httpsGetFile,
   installPrebuiltRelease,
@@ -484,6 +485,30 @@ describe("ensureCanaryInstalled", () => {
     expect(coreMocks.warningMock).not.toHaveBeenCalled();
   });
 
+  // #433: both cargo children (the `--version` probe and the source build)
+  // run with exactly the filtered environment the caller supplies — never
+  // `process.env`. `runCheck`'s own process-level proof lives in
+  // runner.test.ts; this pins the wiring from ensureCanaryInstalled.
+  it("runs the cargo version probe and cargo install with the supplied child environment", async () => {
+    const childEnv = {
+      PATH: process.env.PATH ?? "/usr/bin",
+      CARGO_HOME: tempCargoHome,
+      LD_LIBRARY_PATH: "/opt/lib",
+    };
+
+    await ensureCanaryInstalled(RESOLVED, 60_000, undefined, false, childEnv);
+
+    const probe = spawnMock.mock.calls.find(
+      (call) => call[0] === "cargo" && (call[1] as string[])[0] === "--version",
+    );
+    expect(probe?.[2]).toMatchObject({ env: childEnv });
+
+    const install = spawnMock.mock.calls.find(
+      (call) => call[0] === "cargo" && (call[1] as string[])[0] === "install",
+    );
+    expect(install?.[2]).toMatchObject({ env: childEnv });
+  });
+
   it("installs with `--tag <tag>` and warns when the commit could not be resolved", async () => {
     await ensureCanaryInstalled({ ...RESOLVED, commitSha: undefined });
 
@@ -702,7 +727,8 @@ describe("ensureCanaryInstalled", () => {
       const expectedTail = `${NOTICE}${lines.slice(-40).join("\n")}`;
       expect(error.diagnostic).toBe(expectedTail);
       expect(error.message).toBe(
-        `\`cargo install\` exited with code 101 while installing Protocol-Canary ${RESOLVED.version}.\n\n${expectedTail}`,
+        `\`cargo install\` exited with code 101 while installing Protocol-Canary ${RESOLVED.version}. ` +
+          `${ENGINE_ENV_PASSTHROUGH_HINT}\n\n${expectedTail}`,
       );
       expect(error.diagnostic).toContain("cargo error line 100");
       expect(error.diagnostic).toContain("cargo error line 061");
