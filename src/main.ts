@@ -24,8 +24,6 @@ import { buildReceipt, serializeReceipt } from "./receipt";
 import {
   assertBaselineProtocol,
   buildCheckArgs,
-  engineSupportsAllowEmpty,
-  engineSupportsNetworkPassphraseAndRpcRetrySettings,
   extractDiagnostic,
   fixtureSurfaceCacheDirGateFailure,
   loadBaselineReport,
@@ -247,25 +245,9 @@ export async function run(): Promise<void> {
     return;
   }
 
-  if (inputs.allowEmpty && !engineSupportsAllowEmpty(resolved.version)) {
-    core.info(
-      `"allow-empty" has no effect with Canary ${resolved.version}: that version already passes a run that executes nothing.`,
-    );
-  }
-  if (!engineSupportsNetworkPassphraseAndRpcRetrySettings(resolved.version)) {
-    const ignoredInputs = [
-      inputs.networkPassphrase === undefined ? undefined : "network-passphrase",
-      inputs.rpcMaxRetries === undefined ? undefined : "rpc-max-retries",
-      inputs.rpcRetryDelayMs === undefined ? undefined : "rpc-retry-delay-ms",
-    ].filter((input): input is string => input !== undefined);
-    if (ignoredInputs.length > 0) {
-      core.warning(
-        `The ${ignoredInputs.map((input) => `"${input}"`).join(", ")} input(s) are not supported by Canary ` +
-          `${resolved.version} and were ignored. Use Canary 0.3.0 or newer.`,
-      );
-    }
-  }
-
+  // Skip notes for version-gated inputs are emitted by buildCheckArgs, next
+  // to the flag that was not forwarded; each note names the input and the
+  // first engine release that accepts it (#413).
   core.info(`Protocol: ${inputs.protocol !== undefined ? String(inputs.protocol) : "(from configuration)"}`);
   core.info("Running compatibility checks...");
 

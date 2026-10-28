@@ -152,6 +152,10 @@ const INPUTS: ActionInputs = {
   diagnostics: false,
   timeoutMinutes: 1,
   allowEmpty: false,
+  rpcTimeoutSeconds: undefined,
+  maxConcurrency: undefined,
+  noCache: undefined,
+  liveCacheTtlSeconds: undefined,
   failOnWarning: false,
   offline: false,
   fixturesPackVersion: undefined,
@@ -283,7 +287,7 @@ describe("run", () => {
     expect(infoMock).toHaveBeenCalledWith(expect.stringContaining('"allow-empty" has no effect with Canary 0.1.1'));
   });
 
-  it("warns about each new setting ignored by an older engine without exposing the passphrase", async () => {
+  it("logs a skip note per setting an older engine cannot accept, without exposing the passphrase", async () => {
     runCheckMock.mockResolvedValue({ exitCode: 0, signal: null, stdout: JSON.stringify(PASS_REPORT), stderr: "" });
     getInputsMock.mockReturnValue({
       ...INPUTS,
@@ -295,10 +299,17 @@ describe("run", () => {
 
     await run();
 
-    expect(warningMock).toHaveBeenCalledWith(
-      expect.stringContaining('"network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"'),
-    );
+    // Each of these inputs is skipped on this engine by buildCheckArgs's
+    // VERSION_GATED_FLAGS table: assert one core.info note per input naming
+    // it and the required version, and that the passphrase value never
+    // appears in any note or warning.
+    const notes = infoMock.mock.calls.map((call) => String(call[0]));
+    for (const input of ["network-passphrase", "rpc-max-retries", "rpc-retry-delay-ms"]) {
+      expect(notes.some((note) => note.includes(`"${input}"`) && note.includes("0.3.0"))).toBe(true);
+    }
+    expect(notes.join(" ")).not.toContain("secret value");
     expect(warningMock.mock.calls.flat().join(" ")).not.toContain("secret value");
+    expect(warningMock.mock.calls.flat().join(" ")).not.toContain("network-passphrase");
     expect(runCheckMock.mock.calls[0]?.[1]).not.toContain("--network-passphrase");
   });
 

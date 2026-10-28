@@ -1,8 +1,8 @@
+import * as core from "@actions/core";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
-import { engineSupportsFailOnWarningAndOffline } from "./inputs";
 import { sanitizeLogText, truncateLogTail } from "./log-block";
 import type { ActionInputs } from "./inputs";
 import { CanaryExecutionFailedError, InvalidInputError, TimeoutError, describeError } from "./errors";
@@ -47,17 +47,8 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   if (inputs.network !== undefined) {
     args.push("--network", inputs.network);
   }
-  if (inputs.networkPassphrase !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
-    args.push("--network-passphrase", inputs.networkPassphrase);
-  }
   if (inputs.rpcUrl !== undefined) {
     args.push("--rpc-url", inputs.rpcUrl);
-  }
-  if (inputs.rpcMaxRetries !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
-    args.push("--rpc-max-retries", String(inputs.rpcMaxRetries));
-  }
-  if (inputs.rpcRetryDelayMs !== undefined && engineSupportsNetworkPassphraseAndRpcRetrySettings(engineVersion)) {
-    args.push("--rpc-retry-delay-ms", String(inputs.rpcRetryDelayMs));
   }
   if (inputs.config !== undefined) {
     args.push("--config", inputs.config);
@@ -76,16 +67,30 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
     args.push("--project-root", inputs.workingDirectory);
   }
   args.push("--fixtures-dir", inputs.fixturesDir);
-  if (inputs.allowEmpty && engineSupportsAllowEmpty(engineVersion)) {
-    args.push("--allow-empty");
-  }
-  if (engineSupportsFailOnWarningAndOffline(engineVersion)) {
-    if (inputs.failOnWarning) {
-      args.push("--fail-on-warning");
+
+  // Version-gated flags (#413): every flag whose acceptance depends on the
+  // engine release is declared in VERSION_GATED_FLAGS with the first release
+  // that accepts it (`network-passphrase`, `rpc-max-retries`,
+  // `rpc-retry-delay-ms`, `allow-empty`, `fail-on-warning`, `offline`, and
+  // the four #413 check options). An input that is set but whose resolved
+  // engine predates that release is skipped with a `core.info` note naming
+  // the input and the required version — never passed to an engine that
+  // would reject it as an unknown argument, and never dropped silently. The
+  // argv is always an array of discrete elements; nothing here is ever a
+  // shell string. `--fixture`, `--surface` and `--cache-dir` are
+  // deliberately NOT in the table: main.ts fails the run before install when
+  // the engine cannot honour them (fixtureSurfaceCacheDirGateFailure)
+  // instead of skipping them here.
+  for (const gated of VERSION_GATED_FLAGS) {
+    const gatedArgv = gated.argv(inputs);
+    if (gatedArgv === undefined) {
+      continue;
     }
-    if (inputs.offline) {
-      args.push("--offline");
+    if (!engineAtLeast(engineVersion, gated.minVersion)) {
+      core.info(gated.skipNote(engineVersion));
+      continue;
     }
+    args.push(...gatedArgv);
   }
   // #458 scope/cache options. Single `--flag=value` elements, in a stable
   // order, so a value beginning with `-` (e.g. a fixture id `--weird`) can
@@ -107,39 +112,212 @@ export function buildCheckArgs(inputs: ActionInputs, engineVersion?: string): st
   return args;
 }
 
+/**
+ * A `stellar-canary check` flag whose acceptance depends on the engine
+ * version (#413): the Action input that sets it, the flag exactly as the
+ * engine's CLI spells it, and the first engine release whose `check`
+ * accepts it.
+ */
+interface VersionGatedFlag {
+  /** Action input name, as spelled in `action.yml`; used in the skip note. */
+  readonly input: string;
+  /** The CLI flag exactly as Protocol-Canary's `CheckArgs` spells it. */
+  readonly flag: string;
+  /** First engine release whose `check` accepts {@link VersionGatedFlag.flag}. */
+  readonly minVersion: readonly [number, number, number];
+  /** The exact argv to append when the input applies, or `undefined` when
+   * it is unset (or `no-cache: false`, which means "engine default"). */
+  readonly argv: (inputs: ActionInputs) => readonly string[] | undefined;
+  /** What to `core.info` instead of pushing the flag when the resolved
+   * engine predates `minVersion`: must name the input and the required
+   * version, so a set-but-skipped input is never a silent no-op. */
+  readonly skipNote: (engineVersion: string | undefined) => string;
+}
+
+/** Builds the uniform skip note: names the input, the engine actually
+ * resolved, the flag, and the first engine release that accepts it. */
+function requiresNote(
+  input: string,
+  flag: string,
+  minVersion: readonly [number, number, number],
+): (engineVersion: string | undefined) => string {
+  const required = `${flag} requires Canary ${minVersion.join(".")} or newer.`;
+  return (engineVersion) =>
+    engineVersion === undefined
+      ? `"${input}" has no effect: the engine version could not be resolved; ${required}`
+      : `"${input}" has no effect with Canary ${engineVersion}: ${required}`;
+}
+
 /** The first engine release whose `check` accepts `--allow-empty`. Earlier
  * releases already exit 0 on a run that executes nothing, so the flag is not
  * needed there and would be rejected as an unknown argument. */
-const ALLOW_EMPTY_MIN_VERSION: readonly [number, number, number] = [0, 2, 0];
+const ALLOW_EMPTY_FLAG: VersionGatedFlag = {
+  input: "allow-empty",
+  flag: "--allow-empty",
+  minVersion: [0, 2, 0],
+  argv: (inputs) => (inputs.allowEmpty ? ["--allow-empty"] : undefined),
+  // The note keeps the wording it has had since `allow-empty` was the only
+  // gated input — existing tests assert this exact frame, and it is the
+  // accurate one here: older engines already pass an empty run.
+  skipNote: (engineVersion) =>
+    engineVersion === undefined
+      ? `"allow-empty" was not passed: the engine version could not be resolved.`
+      : `"allow-empty" has no effect with Canary ${engineVersion}: ` +
+        "that version already passes a run that executes nothing.",
+};
+
+/** The first release whose `check` accepts `--network-passphrase`,
+ * `--rpc-max-retries` and `--rpc-retry-delay-ms`: these flags first appear
+ * in the Protocol-Canary 0.3.0 development line, so older and unknown
+ * engines must never receive them — buildCheckArgs skips each one on an
+ * older engine and logs the skip note instead. */
 const NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION: readonly [number, number, number] = [0, 3, 0];
 
-function engineAtLeastVersion(version: string | undefined, minimum: readonly [number, number, number]): boolean {
+/** Placeholder first release for `--fail-on-warning` and `--offline`: no
+ * released Protocol-Canary accepts these flags yet, so the value changes
+ * only when Protocol-Canary publishes the release containing PRs #567 and
+ * #527. */
+// TODO(#421): Replace this placeholder when Protocol-Canary publishes the
+// release containing PRs #567 and #527.
+const FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION: readonly [number, number, number] = [999_999_999, 0, 0];
+
+const NETWORK_PASSPHRASE_FLAG: VersionGatedFlag = {
+  input: "network-passphrase",
+  flag: "--network-passphrase",
+  minVersion: NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION,
+  argv: (inputs) =>
+    inputs.networkPassphrase !== undefined ? ["--network-passphrase", inputs.networkPassphrase] : undefined,
+  skipNote: requiresNote(
+    "network-passphrase",
+    "--network-passphrase",
+    NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION,
+  ),
+};
+
+const RPC_MAX_RETRIES_FLAG: VersionGatedFlag = {
+  input: "rpc-max-retries",
+  flag: "--rpc-max-retries",
+  minVersion: NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION,
+  argv: (inputs) =>
+    inputs.rpcMaxRetries !== undefined ? ["--rpc-max-retries", String(inputs.rpcMaxRetries)] : undefined,
+  skipNote: requiresNote("rpc-max-retries", "--rpc-max-retries", NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION),
+};
+
+const RPC_RETRY_DELAY_MS_FLAG: VersionGatedFlag = {
+  input: "rpc-retry-delay-ms",
+  flag: "--rpc-retry-delay-ms",
+  minVersion: NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION,
+  argv: (inputs) =>
+    inputs.rpcRetryDelayMs !== undefined ? ["--rpc-retry-delay-ms", String(inputs.rpcRetryDelayMs)] : undefined,
+  skipNote: requiresNote("rpc-retry-delay-ms", "--rpc-retry-delay-ms", NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION),
+};
+
+const FAIL_ON_WARNING_FLAG: VersionGatedFlag = {
+  input: "fail-on-warning",
+  flag: "--fail-on-warning",
+  minVersion: FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION,
+  argv: (inputs) => (inputs.failOnWarning ? ["--fail-on-warning"] : undefined),
+  skipNote: requiresNote("fail-on-warning", "--fail-on-warning", FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION),
+};
+
+const OFFLINE_FLAG: VersionGatedFlag = {
+  input: "offline",
+  flag: "--offline",
+  minVersion: FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION,
+  argv: (inputs) => (inputs.offline ? ["--offline"] : undefined),
+  skipNote: requiresNote("offline", "--offline", FAIL_ON_WARNING_AND_OFFLINE_MIN_VERSION),
+};
+
+/** The four check options Protocol-Canary 0.2.0 released alongside
+ * `--allow-empty` (#413); all are gated on that same first release. */
+const ENGINE_CHECK_OPTIONS_MIN_VERSION: readonly [number, number, number] = [0, 2, 0];
+
+const RPC_TIMEOUT_FLAG: VersionGatedFlag = {
+  input: "rpc-timeout-seconds",
+  flag: "--rpc-timeout",
+  minVersion: ENGINE_CHECK_OPTIONS_MIN_VERSION,
+  argv: (inputs) =>
+    inputs.rpcTimeoutSeconds !== undefined ? ["--rpc-timeout", String(inputs.rpcTimeoutSeconds)] : undefined,
+  skipNote: requiresNote("rpc-timeout-seconds", "--rpc-timeout", ENGINE_CHECK_OPTIONS_MIN_VERSION),
+};
+
+const MAX_CONCURRENCY_FLAG: VersionGatedFlag = {
+  input: "max-concurrency",
+  flag: "--max-concurrency",
+  minVersion: ENGINE_CHECK_OPTIONS_MIN_VERSION,
+  argv: (inputs) =>
+    inputs.maxConcurrency !== undefined ? ["--max-concurrency", String(inputs.maxConcurrency)] : undefined,
+  skipNote: requiresNote("max-concurrency", "--max-concurrency", ENGINE_CHECK_OPTIONS_MIN_VERSION),
+};
+
+const NO_CACHE_FLAG: VersionGatedFlag = {
+  input: "no-cache",
+  flag: "--no-cache",
+  minVersion: ENGINE_CHECK_OPTIONS_MIN_VERSION,
+  // `no-cache: false` is the engine default (cache enabled) — no flag to
+  // forward, and no skip note: the run behaves as the input asked.
+  argv: (inputs) => (inputs.noCache === true ? ["--no-cache"] : undefined),
+  skipNote: requiresNote("no-cache", "--no-cache", ENGINE_CHECK_OPTIONS_MIN_VERSION),
+};
+
+const LIVE_CACHE_TTL_FLAG: VersionGatedFlag = {
+  input: "live-cache-ttl-seconds",
+  flag: "--live-cache-ttl",
+  minVersion: ENGINE_CHECK_OPTIONS_MIN_VERSION,
+  argv: (inputs) =>
+    inputs.liveCacheTtlSeconds !== undefined
+      ? ["--live-cache-ttl", String(inputs.liveCacheTtlSeconds)]
+      : undefined,
+  skipNote: requiresNote("live-cache-ttl-seconds", "--live-cache-ttl", ENGINE_CHECK_OPTIONS_MIN_VERSION),
+};
+
+/**
+ * Every version-gated `check` flag, in the order it is appended to argv:
+ * `--network-passphrase`, `--rpc-max-retries`, `--rpc-retry-delay-ms`,
+ * `--allow-empty`, `--fail-on-warning`, `--offline`, then #413's four
+ * options (`--rpc-timeout`, `--max-concurrency`, `--no-cache`,
+ * `--live-cache-ttl`). The table is emitted right after `--fixtures-dir`,
+ * before the ungated `--fixture`/`--surface`/`--cache-dir` forwarding.
+ */
+const VERSION_GATED_FLAGS: readonly VersionGatedFlag[] = [
+  NETWORK_PASSPHRASE_FLAG,
+  RPC_MAX_RETRIES_FLAG,
+  RPC_RETRY_DELAY_MS_FLAG,
+  ALLOW_EMPTY_FLAG,
+  FAIL_ON_WARNING_FLAG,
+  OFFLINE_FLAG,
+  RPC_TIMEOUT_FLAG,
+  MAX_CONCURRENCY_FLAG,
+  NO_CACHE_FLAG,
+  LIVE_CACHE_TTL_FLAG,
+];
+
+/** True when `version` (a bare `x.y.z`) is at least `min`. An unknown or
+ * unparseable version compares as older than every release, so a gate never
+ * opens for an engine whose vintage is unknown — the Action never passes an
+ * argument an older engine would reject. */
+function engineAtLeast(version: string | undefined, min: readonly [number, number, number]): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? "");
   if (match === null) {
     return false;
   }
   const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
-  for (let index = 0; index < minimum.length; index += 1) {
-    const part = parts[index] as number;
-    const minimumPart = minimum[index] as number;
-    if (part !== minimumPart) {
-      return part > minimumPart;
+  for (let i = 0; i < 3; i++) {
+    const minPart = min[i] as number;
+    const part = parts[i] as number;
+    if (part !== minPart) {
+      return part > minPart;
     }
   }
   return true;
 }
 
-/** True when `version` (a bare `x.y.z`) is `0.2.0` or newer. An unknown or
- * unparseable version is treated as not supporting the flag, so the Action
- * never passes an argument an older engine would reject. */
+/** True when `version` (a bare `x.y.z`) is `0.2.0` or newer — that is, when
+ * the engine accepts `--allow-empty`. Kept as the named gate the
+ * `allow-empty` tests have always used; it is now simply {@link engineAtLeast}
+ * over {@link ALLOW_EMPTY_FLAG}'s minimum. */
 export function engineSupportsAllowEmpty(version: string | undefined): boolean {
-  return engineAtLeastVersion(version, ALLOW_EMPTY_MIN_VERSION);
-}
-
-/** These flags first appear in the Protocol-Canary 0.3.0 development line;
- * older and unknown engines must never receive flags they would reject. */
-export function engineSupportsNetworkPassphraseAndRpcRetrySettings(version: string | undefined): boolean {
-  return engineAtLeastVersion(version, NETWORK_PASSPHRASE_AND_RPC_RETRIES_MIN_VERSION);
+  return engineAtLeast(version, ALLOW_EMPTY_FLAG.minVersion);
 }
 
 /**
@@ -165,7 +343,7 @@ export function engineSupportsFixtureSurfaceCacheDir(version: string | undefined
   if (FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION === undefined) {
     return false;
   }
-  return engineAtLeastVersion(version, FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION);
+  return engineAtLeast(version, FIXTURE_SURFACE_CACHE_DIR_MIN_VERSION);
 }
 
 /**
