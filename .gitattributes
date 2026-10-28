@@ -5,5 +5,11 @@
 # diffs for these minified multi-MB files.
 *.ts text eol=lf
 *.tsx text eol=lf
-dist/index.js linguist-generated=true -diff
-dist/index.js.map linguist-generated=true -diff
+tests/golden/*.md text eol=lf
+dist/index.js text eol=lf linguist-generated=true -diff
+dist/index.js.map text eol=lf linguist-generated=true -diff
+
+# The #447 differential test hashes these bytes against the SHA-256 in the PIN
+# record, so they must not be rewritten to CRLF by a Windows checkout.
+tests/fixtures/report-v1.schema.json text eol=lf
+tests/fixtures/report-v1.schema.PIN.md text eol=lf

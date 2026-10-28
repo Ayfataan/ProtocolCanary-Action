@@ -19,6 +19,7 @@ await build({
   minify: true,
   sourcemap: true,
   legalComments: "linked",
+  preserveSymlinks: true,
 });
 
 console.log("Built dist/index.js");
