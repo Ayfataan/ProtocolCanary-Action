@@ -225,6 +225,49 @@ inputs:
     required: false
     default: "false"
 
+  rpc-timeout-seconds:
+    description: >-
+      Request timeout for the engine's RPC client, in seconds (forwarded as
+      `stellar-canary check --rpc-timeout`). Requires Protocol Canary 0.2.0
+      or newer; with an older `version` the flag is not forwarded and the
+      Action logs a note naming this input. Must be a positive integer
+      between 1 and 600. Omitted, the engine uses its own default (10
+      seconds).
+    required: false
+
+  max-concurrency:
+    description: >-
+      Maximum number of concurrent live RPC/Soroban requests (forwarded as
+      `stellar-canary check --max-concurrency`). Requires Protocol Canary
+      0.2.0 or newer; with an older `version` the flag is not forwarded and
+      the Action logs a note naming this input. Must be a positive integer
+      between 1 and 64. Omitted, the engine uses its own default (4).
+    required: false
+
+  no-cache:
+    description: >-
+      Set to `true` to disable the engine's local result cache, so every
+      fixture runs fresh (forwarded as `stellar-canary check --no-cache`).
+      Requires Protocol Canary 0.2.0 or newer; with an older `version` the
+      flag is not forwarded and the Action logs a note naming this input.
+      Conflicts with `live-cache-ttl-seconds`: the engine declares the two
+      flags incompatible, so `no-cache: true` together with a
+      `live-cache-ttl-seconds` value is rejected during input validation,
+      before Canary runs. `no-cache: false` (or omitting it) with a TTL is
+      accepted. Omitted, the engine's default applies (cache enabled).
+    required: false
+
+  live-cache-ttl-seconds:
+    description: >-
+      How long, in seconds, RPC and Soroban results from the local cache may
+      be replayed (forwarded as `stellar-canary check --live-cache-ttl`).
+      Requires Protocol Canary 0.2.0 or newer; with an older `version` the
+      flag is not forwarded and the Action logs a note naming this input.
+      Must be a positive integer between 1 and 604800 (7 days). Cannot be
+      combined with `no-cache: true` (see `no-cache`). Omitted, the engine's
+      default applies (cached live results are not replayed).
+    required: false
+
   fail-on-warning:
     description: >-
       Fail the check when Protocol Canary reports warnings. This input is
