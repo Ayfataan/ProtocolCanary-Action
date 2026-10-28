@@ -76,7 +76,7 @@ All notable changes to this project are documented in this file.
   `allow-empty` and the 0.3.0 network inputs, which are ignored with a note:
   a dropped filter would run a different scope than requested. With all three
   unset, arguments and behaviour are unchanged for every engine version.
-
+- Comprehensive regression tests for prebuilt release download, extraction, and discovery failure paths covering redirect limits, stream errors, timeouts, extraction failures, and manifest mismatches in `tests/unit/prebuilt-install-failures.test.ts` (#495).
 - Enforce coverage thresholds in CI on Ubuntu runs and report the text coverage
   summary to the workflow job summary (`$GITHUB_STEP_SUMMARY`) inside a fenced
   code block (#410).
@@ -127,7 +127,9 @@ All notable changes to this project are documented in this file.
 - Bound HTTP response bodies to 4 MiB for GitHub API JSON, 1 MiB for checksum
   manifests, and 64 MiB for prebuilt release assets. Reject oversized or incomplete
   bodies and remove failed downloads before using the existing fallback paths (#500).
-
+- Describe engine exit codes according to the engine contract: exit code 2 as configuration error (invocation unusable or no check applied, so no checks ran) and exit code 3 as execution error (a check could not complete: XDR, RPC, or Soroban problem), removing inaccurate regression-gate and crash wording (#502).
+- Retain all report artifacts when multiple invocations share an artifact-name differentiator by bounding collisions and retrying with unique suffixes (#494).
+- Clean up all temporary directories left behind by the fork-boundary and reusable-workflow conformance tests with cross-platform retry options, ensuring no leftover temporary files in `os.tmpdir()` (#501).
 - Execution-failure job summaries no longer break when the raw diagnostic
   (Canary's stderr, a timeout notice) itself contains a ``` sequence, e.g.
   a compiler or panic message quoting a code block: the diagnostic fence is

@@ -415,7 +415,11 @@ describe("run", () => {
     expect(setOutputMock).toHaveBeenCalledWith("status", "fail");
     const messages = errorMock.mock.calls.map((call) => String(call[0]));
     expect(messages.some((message) => message.includes("exit code 1"))).toBe(true);
-    expect(messages.some((message) => message.includes("Test failures detected"))).toBe(true);
+    expect(
+      messages.some((message) =>
+        message.includes("At least one fixture's compatibility assertion failed"),
+      ),
+    ).toBe(true);
     expect(messages.some((message) => message.includes("assertion failed at byte 12"))).toBe(true);
   });
 
