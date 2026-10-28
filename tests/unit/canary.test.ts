@@ -1113,74 +1113,29 @@ describe("ensureCanaryInstalled", () => {
       }
     });
 
-it("falls back to cargo install on cache miss", async () => {
-    cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-    cacheMocks.restoreCacheMock.mockResolvedValue(undefined);
+    it("falls back to cargo install on cache miss", async () => {
+      cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
+      cacheMocks.restoreCacheMock.mockResolvedValueOnce(undefined);
 
-    const installed = await ensureCanaryInstalled(RESOLVED);
+      const installed = await ensureCanaryInstalled(RESOLVED);
 
-    expect(installed.version).toBe("0.1.0");
-    expect(cacheMocks.restoreCacheMock).toHaveBeenCalledTimes(1);
-    expect(cacheMocks.saveCacheMock).toHaveBeenCalledTimes(1);
-    expect(spawnMock).toHaveBeenCalled();
-  });
+      expect(installed.version).toBe("0.1.0");
+      expect(cacheMocks.restoreCacheMock).toHaveBeenCalledTimes(1);
+      expect(cacheMocks.saveCacheMock).toHaveBeenCalledTimes(1);
+      expect(spawnMock).toHaveBeenCalled();
+    });
 
-  it("warns but succeeds when saving an installed binary to cache fails", async () => {
-    cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
-    cacheMocks.saveCacheMock.mockRejectedValue(new Error("cache quota exceeded"));
+    it("warns but succeeds when saving an installed binary to cache fails", async () => {
+      cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
+      cacheMocks.saveCacheMock.mockRejectedValueOnce(new Error("cache quota exceeded"));
 
-    const installed = await ensureCanaryInstalled(RESOLVED);
+      const installed = await ensureCanaryInstalled(RESOLVED);
 
-    expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
-    expect(cacheMocks.saveCacheMock).toHaveBeenCalledOnce();
-    expect(coreMocks.warningMock).toHaveBeenCalledWith("Cache save failed, ignoring: Error: cache quota exceeded");
-    expect(spawnMock).toHaveBeenCalled();
-  });
-
-  it("warns when a prebuilt asset HTTP 404 is encountered and falls back to cargo install", async () => {
-    let triple: string;
-    try {
-      triple = prebuiltTargetTriple(process.platform, process.arch);
-    } catch {
-      return;
-    }
-    const assetName = `stellar-canary-${RESOLVED.version}-${triple}.tar.gz`;
-    const downloadUrl = `https://example.test/${assetName}`;
-    const checksumUrl = "https://example.test/SHA256SUMS";
-
-    httpsGetMock
-      .mockImplementationOnce(
-        respond(
-          200,
-          JSON.stringify({
-            assets: [
-              {
-                name: assetName,
-                browser_download_url: downloadUrl,
-              },
-              {
-                name: "SHA256SUMS",
-                browser_download_url: checksumUrl,
-              },
-            ],
-          }),
-        ),
-      )
-      .mockImplementationOnce(respond(200, `${"0".repeat(64)}  ${assetName}\n`))
-      .mockImplementationOnce(respond(404, ""));
-
-    const installed = await ensureCanaryInstalled(RESOLVED);
-
-    expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
-    expect(
-      coreMocks.warningMock.mock.calls.some(
-        (call) =>
-          String(call[0]).includes(assetName) &&
-          String(call[0]).includes("falling back to a source install"),
-      ),
-    ).toBe(true);
-    expect(cargoInstallSpawned()).toBe(true);
-  });
+      expect(installed).toEqual({ binaryPath: binaryPath(), version: RESOLVED.version });
+      expect(cacheMocks.saveCacheMock).toHaveBeenCalledOnce();
+      expect(coreMocks.warningMock).toHaveBeenCalledWith("Cache save failed, ignoring: Error: cache quota exceeded");
+      expect(spawnMock).toHaveBeenCalled();
+    });
 
     it("falls back to cargo install when restored binary is not executable", async () => {
       cacheMocks.isFeatureAvailableMock.mockReturnValue(true);
@@ -1659,6 +1614,38 @@ describe("prebuilt release install (issue #359)", () => {
       expect(coreMocks.debugMock).toHaveBeenCalledWith(
         expect.stringContaining("no prebuilt stellar-canary asset for target x86_64-unknown-linux-gnu"),
       );
+      expect(spawnMock).toHaveBeenCalled();
+    });
+
+    it("falls back to cargo install when the prebuilt asset download returns HTTP 404", async () => {
+      const assetName = LINUX_X64_ASSET;
+      const downloadUrl = "https://example.test/missing-prebuilt-asset";
+
+      httpsGetMock
+        .mockImplementationOnce(
+          respond(
+            200,
+            JSON.stringify({
+              assets: [
+                { name: assetName, browser_download_url: downloadUrl },
+                { name: "SHA256SUMS", browser_download_url: MANIFEST_URL },
+              ],
+            }),
+          ),
+        )
+        .mockImplementationOnce(respond(200, `${"0".repeat(64)}  ${assetName}\n`))
+        .mockImplementationOnce(respond(404, ""));
+
+      const installed = await withPlatform("linux", () => withArch("x64", () => ensureCanaryInstalled(RESOLVED)));
+
+      expect(installed.version).toBe("0.1.0");
+      expect(
+        coreMocks.warningMock.mock.calls.some(
+          (call) =>
+            String(call[0]).includes(assetName) &&
+            String(call[0]).includes("falling back to a source install"),
+        ),
+      ).toBe(true);
       expect(spawnMock).toHaveBeenCalled();
     });
 
