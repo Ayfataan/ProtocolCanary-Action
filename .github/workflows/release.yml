@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout
         # zizmor: ignore[artipacked] release job must push floating major tag with repository credentials
@@ -112,11 +114,21 @@ jobs:
           git push origin "refs/tags/${RELEASE_TAG}" --force
           echo "::notice::Stamped ${RELEASE_TAG}: its reusable workflow now uses Action@${RELEASE_COMMIT}; tag moved to ${stamped}."
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: |
+            dist/index.js
+            dist/index.js.map
+
       - name: Create GitHub Release
         # zizmor: ignore[superfluous-actions] action-gh-release handles asset uploads and automatic release notes cleanly
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
+          files: |
+            dist/index.js
+            dist/index.js.map
 
       # Keep the floating major tag (v1) pointing at the latest release in
       # that major line. This used to be a manual step maintainers had to

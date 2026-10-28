@@ -49,6 +49,8 @@ checksums. This Action installs it from source with `cargo install --git`,
 which:
 
 - always uses HTTPS to reach GitHub;
+- installs into an Action-owned directory under `RUNNER_TEMP` and does not
+  modify the runner's shared Cargo bin directory or `PATH`;
 - pins the exact requested version (the `version` input) — never `main`,
   never an unpinned "latest";
 - resolves that version's tag to the immutable commit it pointed to at run
@@ -87,11 +89,54 @@ A compiled-from-a-pinned-commit build is still a weaker integrity story
 than a checksum published by the artifact's own maintainers, so making
 checksum-verified installs the primary path remains the goal.
 
+### Cached binary integrity
+
+A binary restored from the Actions cache is bound to the SHA-256 digest
+recorded in its `stellar-canary.sha256` sidecar at install time. If the
+sidecar is missing, malformed, or does not match the restored binary, the
+entry is treated as a cache miss: the untrusted files are deleted and the
+Action installs a fresh, verified binary. A cached executable is never run
+on trust alone.
+
 The full integrity model — trust boundaries, the optional
 `strict-integrity` fail-closed policy, the D-07 (checksums are data
 integrity, not author authenticity) and D-11 (redirect policy unresolved,
 so no redirect is followed) decision boundaries, and the threat model — is
 documented in [`docs/integrity-model.md`](docs/integrity-model.md).
+
+## Release provenance
+
+Release tags publish `dist/index.js` and its source map with a build
+provenance attestation. To verify a downloaded release artifact:
+
+```sh
+gh attestation verify dist/index.js --repo StellarCanary/ProtocolCanary-Action
+```
+
+The attestation proves the bundle was built by this repository's release
+workflow from the tagged commit. Note that consumers who pin the Action by
+tag still execute the JavaScript bundle, so verify the artifact if your
+threat model requires provenance beyond the pinned tag and commit.
+
+## Pre-installed engine discovery (issue #342)
+
+The Action may discover an existing `stellar-canary` executable in
+`CARGO_HOME/bin`, the Actions tool cache (`@actions/tool-cache`), or
+`PATH`. A candidate is never used on existence alone: it must be a regular,
+non-symlinked file in a trusted, non-world-writable directory; its SHA-256
+must match the checksum published with the requested release; and its
+`stellar-canary version` output must exactly match the requested version.
+Candidates that fail any of these checks are warned about and skipped, and
+installation falls back to the verified prebuilt release asset or a source
+build pinned to the requested commit/tag.
+
+Because `Protocol-Canary` does not yet publish checksums, this path is
+effectively inactive today and the safe download/source fallback remains the
+production path. Enabling pre-installed discovery as a default, trusted
+fast path requires maintainer security review and approval; until that
+approval is recorded, the implementation remains subject to that review
+and does not bypass the existing checksum, release-metadata, archive, or
+provenance checks for downloaded binaries.
 
 ## Subprocess isolation
 

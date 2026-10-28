@@ -4,6 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
+import type * as canaryModule from "../../src/canary";
+import type * as versionModule from "../../src/version";
+
 const { setFailedMock, errorMock, warningMock, infoMock } = vi.hoisted(() => ({
   setFailedMock: vi.fn(),
   errorMock: vi.fn(),
@@ -14,6 +17,40 @@ const { setFailedMock, errorMock, warningMock, infoMock } = vi.hoisted(() => ({
 vi.mock("@actions/core", async (importOriginal) => {
   const actual = await importOriginal<typeof actionsCore>();
   return { ...actual, setFailed: setFailedMock, error: errorMock, warning: warningMock, info: infoMock };
+});
+
+// Mock ensureCanaryInstalled to use the fixture's mock binary without
+// making real network calls. The fixture places it in the Action-owned
+// RUNNER_TEMP root, bypassing the real install chain.
+vi.mock("../../src/canary", async (importOriginal) => {
+  const actual = await importOriginal<typeof canaryModule>();
+  return {
+    ...actual,
+    ensureCanaryInstalled: vi.fn().mockImplementation((resolved: { version: string }) => {
+      const runnerTemp = process.env.RUNNER_TEMP ?? "";
+      const binaryDir = path.join(runnerTemp, "stellar-canary-action", "bin");
+      const binaryPath = path.join(binaryDir, "stellar-canary");
+
+      fs.mkdirSync(binaryDir, { recursive: true });
+      // The fixture copies the mock binary; ensure it exists for the test.
+      if (!fs.existsSync(binaryPath)) {
+        const mockSource = path.join(__dirname, "..", "fixtures", "mock-canary.cjs");
+        fs.copyFileSync(mockSource, binaryPath);
+        fs.chmodSync(binaryPath, 0o755);
+      }
+
+      return {
+        binaryPath,
+        version: resolved.version,
+      };
+    }),
+  };
+});
+
+const { resolveVersionMock } = vi.hoisted(() => ({ resolveVersionMock: vi.fn() }));
+vi.mock("../../src/version", async (importOriginal) => {
+  const actual = await importOriginal<typeof versionModule>();
+  return { ...actual, resolveVersion: resolveVersionMock };
 });
 
 // #278: the upload-report=true scenario asserts against the artifact client's
@@ -80,12 +117,14 @@ const SUMMARY_PATH = path.join(os.tmpdir(), `canary-e2e-summary-${String(process
 function setUp(scenario: string, version = "0.1.0", omitVersion = false): Fixture {
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "canary-e2e-"));
   const cargoHome = path.join(workDir, "cargo-home");
-  fs.mkdirSync(path.join(cargoHome, "bin"), { recursive: true });
-  fs.copyFileSync(MOCK_CANARY_SOURCE, path.join(cargoHome, "bin", "stellar-canary"));
-  fs.chmodSync(path.join(cargoHome, "bin", "stellar-canary"), 0o755);
+  fs.mkdirSync(cargoHome, { recursive: true });
 
   const runnerTemp = path.join(workDir, "runner-temp");
   fs.mkdirSync(runnerTemp, { recursive: true });
+  const binaryDir = path.join(runnerTemp, "stellar-canary-action", "bin");
+  fs.mkdirSync(binaryDir, { recursive: true });
+  fs.copyFileSync(MOCK_CANARY_SOURCE, path.join(binaryDir, "stellar-canary"));
+  fs.chmodSync(path.join(binaryDir, "stellar-canary"), 0o755);
   const outputPath = path.join(workDir, "github-output");
   const summaryPath = SUMMARY_PATH;
   fs.writeFileSync(outputPath, "");
@@ -117,6 +156,11 @@ function setUp(scenario: string, version = "0.1.0", omitVersion = false): Fixtur
   errorMock.mockClear();
   warningMock.mockClear();
   infoMock.mockClear();
+  resolveVersionMock.mockReset().mockImplementation(async (requestedVersion: string) => ({
+    version: requestedVersion,
+    tag: `v${requestedVersion}`,
+    commitSha: undefined,
+  }));
   uploadArtifactMock.mockReset();
   uploadArtifactMock.mockResolvedValue({ id: 1, size: 100 });
 

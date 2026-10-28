@@ -147,7 +147,7 @@ inputs:
   version:
     description: >-
       Protocol Canary version to install and run, without a leading `v`
-      (for example `0.1.1`). This must match a real release tag on
+      (for example `0.2.0`). This must match a real release tag on
       `StellarCanary/Protocol-Canary`. Reproducibility matters: this
       Action never tracks `main` or an unpinned "latest" build.
     required: false
