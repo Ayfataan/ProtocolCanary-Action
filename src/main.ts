@@ -14,6 +14,7 @@ import {
   emitExitFailureAnnotation,
 } from "./annotations";
 import { cargoInstallTimeoutMs, ensureCanaryInstalled, sha256File } from "./canary";
+import { buildChildEnvironment } from "./child-env";
 import { InstallationFailedError, TimeoutError, describeError, isCanaryActionError } from "./errors";
 import type { ActionInputs } from "./inputs";
 import { getInputs, validateFixturesDir } from "./inputs";
@@ -177,6 +178,24 @@ export async function run(): Promise<void> {
     return;
   }
 
+  // Both `cargo` and the engine run with an explicit allow-list instead of
+  // the job environment: building a dependency tree executes arbitrary code
+  // from every crate, and the job may hold write permissions and secrets.
+  // `engine-env-passthrough` names are the only additions. Log the *names*
+  // that were forwarded (never their values) so the job log shows what left
+  // the Action.
+  const childEnvironment = buildChildEnvironment(
+    process.env,
+    process.platform,
+    inputs.engineEnvPassthrough,
+  );
+  if (childEnvironment.forwarded.length > 0) {
+    core.info(
+      `engine-env-passthrough: forwarding ${childEnvironment.forwarded.join(", ")} to cargo and ` +
+        "Protocol Canary (names only; values are never logged).",
+    );
+  }
+
   // #400: fail fast when `fixtures-dir` does not name an existing directory
   // — after input parsing, before any version resolution or installation
   // work — so a mistyped path costs milliseconds, not a full `cargo
@@ -238,6 +257,7 @@ export async function run(): Promise<void> {
       cargoInstallTimeoutMs(inputs.timeoutMinutes),
       inputs.githubToken,
       inputs.strictIntegrity,
+      childEnvironment.env,
     );
   } catch (error) {
     const diagnostic = error instanceof InstallationFailedError && error.diagnostic ? error.diagnostic : "";
@@ -256,7 +276,9 @@ export async function run(): Promise<void> {
 
   let execution;
   try {
-    execution = await runCheck(installed.binaryPath, engineArgs, inputs.timeoutMinutes * 60_000);
+    execution = await runCheck(installed.binaryPath, engineArgs, inputs.timeoutMinutes * 60_000, {
+      env: childEnvironment.env,
+    });
   } catch (error) {
     const diagnostic = error instanceof TimeoutError && error.stderr ? error.stderr : "";
     if (error instanceof TimeoutError && error.stderr.trim() !== "") {
@@ -367,7 +389,13 @@ export async function run(): Promise<void> {
   // job.
   let junitPath: string | undefined;
   if (inputs.junitReport && reportWritten) {
-    const junit = await renderJUnitReport(installed.binaryPath, reportPath, inputs.timeoutMinutes * 60_000);
+    const junit = await renderJUnitReport(
+      installed.binaryPath,
+      reportPath,
+      inputs.timeoutMinutes * 60_000,
+      [],
+      { env: childEnvironment.env },
+    );
     if (junit.path !== undefined) {
       junitPath = junit.path;
       core.setOutput("junit-report-path", junit.path);

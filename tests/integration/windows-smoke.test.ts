@@ -69,6 +69,7 @@ const ENV_KEYS = [
   "GITHUB_STEP_SUMMARY",
   "MOCK_CANARY_SCENARIO",
   "NODE_OPTIONS",
+  "INPUT_ENGINE-ENV-PASSTHROUGH",
   "INPUT_PROTOCOL",
   "INPUT_CONFIG",
   "INPUT_NETWORK",
@@ -138,6 +139,13 @@ function setUp(scenario: string, options: { cargoHomeName?: string; runnerTempNa
   // `C:\\path\\to\\hook.cjs` arrives as `C:pathtohook.cjs` and the preload
   // silently fails (observed on windows-latest). Node accepts `/` on Windows.
   process.env.NODE_OPTIONS = `--require "${toNodeOptionsPath(HOOK_PATH)}"`;
+  // #433: the engine and cargo now run with an explicit allow-list instead of
+  // the job environment. The NODE_OPTIONS preload and the scenario switch are
+  // the test harness's controls rather than Action inputs, so they are
+  // forwarded through the same `engine-env-passthrough` mechanism a workflow
+  // would use — which also proves the allow-list leaves everything else
+  // behind.
+  process.env["INPUT_ENGINE-ENV-PASSTHROUGH"] = "NODE_OPTIONS,MOCK_CANARY_SCENARIO";
   // Make cargo unfindable: with the exact-version binary already in the
   // Action-owned root, ensureCanaryInstalled must reuse it and never
   // attempt an install. If some code path ever reached for cargo here, the

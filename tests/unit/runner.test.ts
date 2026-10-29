@@ -8,6 +8,8 @@ import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ChildProcessEnvironment } from "../../src/child-env";
+import { buildChildEnvironment } from "../../src/child-env";
 import { CanaryExecutionFailedError, InvalidInputError, TimeoutError } from "../../src/errors";
 import type { ActionInputs } from "../../src/inputs";
 import {
@@ -77,6 +79,19 @@ const MOCK_CANARY = path.join(__dirname, "..", "fixtures", "mock-canary.cjs");
 const MOCK_CANARY_COMMAND = process.platform === "win32" ? process.execPath : MOCK_CANARY;
 const MOCK_CANARY_PREFIX = process.platform === "win32" ? [MOCK_CANARY] : [];
 
+/**
+ * The filtered child environment the fixture needs. `MOCK_CANARY_SCENARIO` and
+ * `MOCK_CANARY_VERSION` are test-only controls rather than Action inputs, so
+ * they reach the fixture through the same passthrough mechanism a workflow
+ * would use — proving the child never sees the rest of `process.env`.
+ */
+function mockCanaryEnv(): ChildProcessEnvironment {
+  return buildChildEnvironment(process.env, process.platform, [
+    "MOCK_CANARY_SCENARIO",
+    "MOCK_CANARY_VERSION",
+  ]).env;
+}
+
 const BASE_INPUTS: ActionInputs = {
   protocol: 28,
   config: undefined,
@@ -105,6 +120,7 @@ const BASE_INPUTS: ActionInputs = {
   fixturesPackProtocol: undefined,
   baselineReport: undefined,
   githubToken: undefined,
+  engineEnvPassthrough: [],
   generateReceipt: false,
   reportRetentionDays: undefined,
   junitReport: false,
@@ -722,7 +738,9 @@ describe("junit-report rendering through the engine (#423)", () => {
   });
 
   function render(): ReturnType<typeof renderJUnitReport> {
-    return renderJUnitReport(MOCK_CANARY_COMMAND, reportPath, 10_000, MOCK_CANARY_PREFIX);
+    return renderJUnitReport(MOCK_CANARY_COMMAND, reportPath, 10_000, MOCK_CANARY_PREFIX, {
+      env: mockCanaryEnv(),
+    });
   }
 
   it("derives the JUnit path from the report path", () => {
@@ -787,7 +805,9 @@ describe("runCheck", () => {
   const itWithUnixSignals = process.platform === "win32" ? it.skip : it;
 
   function run(timeoutMs = 5000) {
-    return runCheck(MOCK_CANARY_COMMAND, [...MOCK_CANARY_PREFIX, "check"], timeoutMs);
+    return runCheck(MOCK_CANARY_COMMAND, [...MOCK_CANARY_PREFIX, "check"], timeoutMs, {
+      env: mockCanaryEnv(),
+    });
   }
 
   it("captures stdout and a zero exit code on pass", async () => {
@@ -815,7 +835,7 @@ describe("runCheck", () => {
   itWithUnixSignals("rejects with TimeoutError and kills the process when it runs too long", async () => {
     process.env.MOCK_CANARY_SCENARIO = "timeout";
     await expect(
-      runCheck(MOCK_CANARY_COMMAND, [...MOCK_CANARY_PREFIX, "check"], 200),
+      runCheck(MOCK_CANARY_COMMAND, [...MOCK_CANARY_PREFIX, "check"], 200, { env: mockCanaryEnv() }),
     ).rejects.toThrow(TimeoutError);
   });
 
@@ -915,7 +935,9 @@ describe("runCheck", () => {
       process.env.MOCK_CANARY_SCENARIO = "timeout";
       const before = snapshotListenerCounts();
 
-      const pending = runCheck(MOCK_CANARY_COMMAND, [...MOCK_CANARY_PREFIX, "check"], 200);
+      const pending = runCheck(MOCK_CANARY_COMMAND, [...MOCK_CANARY_PREFIX, "check"], 200, {
+        env: mockCanaryEnv(),
+      });
 
       for (const signal of SIGNALS) {
         expect(process.listenerCount(signal)).toBe(before[signal] + 1);
@@ -961,7 +983,7 @@ describe("runCheck signal handling", () => {
 
     // runCheck registers its signal-forwarding listeners synchronously
     // inside the promise executor, so they are present the moment it returns.
-    const pending = runCheck(MOCK_CANARY, ["check"], 8000);
+    const pending = runCheck(MOCK_CANARY, ["check"], 8000, { env: mockCanaryEnv() });
     expect(process.listenerCount("SIGINT")).toBe(baselineInt + 1);
     expect(process.listenerCount("SIGTERM")).toBe(baselineTerm + 1);
 
@@ -996,7 +1018,7 @@ describe("runCheck timeout escalation", () => {
     const child = new FakeChild(false);
     fakeSpawn(child);
 
-    await expect(runCheck("fake-canary", ["check"], 10, 20)).rejects.toThrow(TimeoutError);
+    await expect(runCheck("fake-canary", ["check"], 10, { sigkillGraceMs: 20 })).rejects.toThrow(TimeoutError);
     expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
@@ -1004,7 +1026,7 @@ describe("runCheck timeout escalation", () => {
     const child = new FakeChild(true);
     fakeSpawn(child);
 
-    await expect(runCheck("fake-canary", ["check"], 10, 20)).rejects.toThrow(TimeoutError);
+    await expect(runCheck("fake-canary", ["check"], 10, { sigkillGraceMs: 20 })).rejects.toThrow(TimeoutError);
     // Wait beyond the grace period: the escalation timer must have been
     // cleared when the process closed, or SIGKILL would appear here.
     await new Promise((resolve) => setTimeout(resolve, 60));
@@ -1161,6 +1183,108 @@ describe("UTF-8 stream decoding and bounded capture (issue #427)", () => {
     expect(result.stderr.startsWith(STDERR_DROPPED_NOTICE)).toBe(true);
     expect(result.stderr).toContain("FINAL ROOT DIAGNOSTIC ERROR");
     expect(Buffer.byteLength(result.stderr, "utf8")).toBeLessThanOrEqual(MAX_STDERR_CAPTURE_BYTES);
+  });
+});
+
+describe("runCheck child environment (issue #433)", () => {
+  const PRINT_ENV = "process.stdout.write(JSON.stringify(process.env))";
+
+  /** Looks a variable up regardless of the spelling Windows preserved. */
+  function envValue(env: Record<string, string>, name: string): string | undefined {
+    const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name.toUpperCase());
+    return key === undefined ? undefined : env[key];
+  }
+
+  /** A job environment with every kind of variable the allow-list must sort. */
+  function jobEnvironment(): NodeJS.ProcessEnv {
+    return {
+      PATH: process.env.PATH ?? "/usr/bin",
+      HOME: "/home/runner",
+      CARGO_HOME: "/home/runner/.cargo",
+      RUSTUP_HOME: "/home/runner/.rustup",
+      RUSTFLAGS: "-C target-cpu=native",
+      HTTPS_PROXY: "http://proxy.internal:3128",
+      NO_PROXY: "localhost,127.0.0.1",
+      SSL_CERT_FILE: "/etc/ssl/certs/ca.pem",
+      LC_ALL: "C.UTF-8",
+      GITHUB_TOKEN: "ghp_jobsecret",
+      ACTIONS_RUNTIME_TOKEN: "runtime-secret",
+      MY_SERVICE_TOKEN: "service-secret",
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+      NPM_TOKEN: "npm-secret",
+      FOO: "bar",
+    };
+  }
+
+  it("passes legitimate configuration and none of the job's secrets to the child", async () => {
+    const env = buildChildEnvironment(jobEnvironment(), process.platform).env;
+
+    const result = await runCheck(process.execPath, ["-e", PRINT_ENV], 5000, { env });
+    expect(result.exitCode).toBe(0);
+    const child = JSON.parse(result.stdout) as Record<string, string>;
+
+    for (const kept of [
+      "PATH",
+      "HOME",
+      "CARGO_HOME",
+      "RUSTUP_HOME",
+      "RUSTFLAGS",
+      "HTTPS_PROXY",
+      "NO_PROXY",
+      "SSL_CERT_FILE",
+      "LC_ALL",
+    ]) {
+      expect(envValue(child, kept)).toBe(envValue(env, kept));
+    }
+    for (const dropped of [
+      "GITHUB_TOKEN",
+      "ACTIONS_RUNTIME_TOKEN",
+      "MY_SERVICE_TOKEN",
+      "AWS_SECRET_ACCESS_KEY",
+      "NPM_TOKEN",
+      "FOO",
+    ]) {
+      expect(envValue(child, dropped)).toBeUndefined();
+    }
+    // Nothing from the denied values leaked through stdout either.
+    expect(result.stdout).not.toContain("ghp_jobsecret");
+    expect(result.stdout).not.toContain("service-secret");
+  });
+
+  it("forwards a passthrough name and preserves a value containing a newline", async () => {
+    const source = { ...jobEnvironment(), LD_LIBRARY_PATH: "/opt/lib\n/opt/lib2" };
+    const built = buildChildEnvironment(source, process.platform, ["LD_LIBRARY_PATH"]);
+    expect(built.forwarded).toEqual(["LD_LIBRARY_PATH"]);
+
+    const result = await runCheck(process.execPath, ["-e", PRINT_ENV], 5000, { env: built.env });
+    const child = JSON.parse(result.stdout) as Record<string, string>;
+    expect(envValue(child, "LD_LIBRARY_PATH")).toBe("/opt/lib\n/opt/lib2");
+  });
+
+  it("never inherits process.env when no environment is given", async () => {
+    const previous = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = "ghp_should_not_reach_child";
+    try {
+      const result = await runCheck(process.execPath, ["-e", PRINT_ENV], 5000);
+      const child = JSON.parse(result.stdout) as Record<string, string>;
+      expect(envValue(child, "GITHUB_TOKEN")).toBeUndefined();
+      expect(envValue(child, "PATH")).toBe(process.env.PATH ?? process.env.Path);
+      expect(result.stdout).not.toContain("ghp_should_not_reach_child");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.GITHUB_TOKEN;
+      } else {
+        process.env.GITHUB_TOKEN = previous;
+      }
+    }
+  });
+
+  it("still surfaces the existing error when the binary cannot be started with a supplied environment", async () => {
+    await expect(
+      runCheck(path.join(__dirname, "does-not-exist"), ["check"], 5000, {
+        env: { PATH: process.env.PATH ?? "" },
+      }),
+    ).rejects.toThrow(CanaryExecutionFailedError);
   });
 });
 

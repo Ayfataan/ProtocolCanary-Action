@@ -96,6 +96,7 @@ const ENV_KEYS = [
   "INPUT_UPLOAD-REPORT",
   "INPUT_ANNOTATIONS",
   "INPUT_TIMEOUT-MINUTES",
+  "INPUT_ENGINE-ENV-PASSTHROUGH",
   "INPUT_REPORT-RETENTION-DAYS",
   "INPUT_ALLOW-EMPTY",
 ];
@@ -151,6 +152,10 @@ function setUp(scenario: string, version = "0.1.0", omitVersion = false): Fixtur
   process.env["INPUT_UPLOAD-REPORT"] = "false";
   process.env["INPUT_ANNOTATIONS"] = "true";
   process.env["INPUT_TIMEOUT-MINUTES"] = "1";
+  // #433: the engine now runs with the default allow-list instead of the job
+  // environment, so the fixture's own scenario selectors have to be opted in
+  // through the same passthrough input a workflow would use.
+  process.env["INPUT_ENGINE-ENV-PASSTHROUGH"] = "MOCK_CANARY_SCENARIO,MOCK_CANARY_VERSION";
 
   setFailedMock.mockClear();
   errorMock.mockClear();
@@ -205,6 +210,28 @@ describe.skipIf(process.platform === "win32")("Action end-to-end (via mock-canar
 
   afterAll(() => {
     fs.rmSync(SUMMARY_PATH, { force: true });
+  });
+
+  // #433: with no passthrough configured, the engine still runs under the
+  // default allow-list (the fixture's default scenario is "pass") and its
+  // report and outputs are exactly what they were before the allow-list.
+  it("pass with no engine-env-passthrough: the engine run and its report are unchanged", async () => {
+    fixture = setUp("pass");
+    delete process.env["INPUT_ENGINE-ENV-PASSTHROUGH"];
+    delete process.env.MOCK_CANARY_SCENARIO;
+    const { run } = await import("../../src/main");
+    await run();
+
+    expect(setFailedMock).not.toHaveBeenCalled();
+    expect(errorMock).not.toHaveBeenCalled();
+    const outputs = readOutputs(fixture.outputPath);
+    expect(outputs.status).toBe("pass");
+    expect(outputs.passed).toBe("1");
+    expect(outputs.failures).toBe("0");
+    expect(typeof outputs.report).toBe("string");
+    const report = outputs.report as string;
+    expect(JSON.parse(fs.readFileSync(report, "utf8"))).toMatchObject({ status: "pass" });
+    expect(fs.readFileSync(fixture.summaryPath, "utf8")).toContain("✅ **PASS**");
   });
 
   it("uses Protocol-Canary 0.2.0 when the version input is omitted", async () => {

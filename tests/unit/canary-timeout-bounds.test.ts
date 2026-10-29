@@ -31,11 +31,27 @@ import {
   extractPrebuiltArchive,
   getInstalledVersion,
 } from "../../src/canary";
+import type { ChildProcessEnvironment } from "../../src/child-env";
+import { buildChildEnvironment } from "../../src/child-env";
 import { InstallationFailedError } from "../../src/errors";
 
 /** Injected bound so a hanging stand-in resolves fast; every assertion
  * below tolerates at most a couple of seconds of wall time. */
 const SHORT_BOUND_MS = 600;
+
+/**
+ * The filtered child environment these probes run with (#433). The two
+ * stand-in controls are test-only variables rather than Action inputs, so
+ * they are forwarded through the same `engine-env-passthrough` mechanism a
+ * workflow would use; PATH is picked up from `process.env` when this is
+ * called, after {@link installShim} has prepended its directory.
+ */
+function childEnv(): ChildProcessEnvironment {
+  return buildChildEnvironment(process.env, process.platform, [
+    "STANDIN_MODE",
+    "STANDIN_PID_FILE",
+  ]).env;
+}
 
 /** Stand-in child body: records its PID (so the test can assert the child
  * is gone after the timeout) and then either answers and exits, or hangs
@@ -142,7 +158,7 @@ describe("getInstalledVersion bounds (#521)", () => {
     // leading argv element (the renderJUnitReport pattern), so the exact
     // same test runs on the Windows, macOS and Linux runners.
     const started = Date.now();
-    const version = await getInstalledVersion(process.execPath, SHORT_BOUND_MS, [standinPath]);
+    const version = await getInstalledVersion(process.execPath, SHORT_BOUND_MS, [standinPath], childEnv());
 
     expect(version).toBeUndefined();
     expect(Date.now() - started).toBeLessThan(2_000);
@@ -160,7 +176,7 @@ describe("getInstalledVersion bounds (#521)", () => {
   it("still yields the reported version when the probe prints and exits 0", async () => {
     process.env.STANDIN_MODE = "print";
 
-    const version = await getInstalledVersion(process.execPath, SHORT_BOUND_MS, [standinPath]);
+    const version = await getInstalledVersion(process.execPath, SHORT_BOUND_MS, [standinPath], childEnv());
 
     expect(version).toBe("0.1.0");
     expect(warningMock).not.toHaveBeenCalled();
@@ -169,7 +185,7 @@ describe("getInstalledVersion bounds (#521)", () => {
   it("still returns undefined when the probe exits non-zero", async () => {
     process.env.STANDIN_MODE = "fail";
 
-    const version = await getInstalledVersion(process.execPath, SHORT_BOUND_MS, [standinPath]);
+    const version = await getInstalledVersion(process.execPath, SHORT_BOUND_MS, [standinPath], childEnv());
 
     expect(version).toBeUndefined();
     expect(warningMock).not.toHaveBeenCalled();
@@ -183,7 +199,7 @@ describe("extractPrebuiltArchive bounds (#521)", () => {
     fs.writeFileSync(archivePath, "not really an archive");
     const destDir = path.join(tempDir, "extracted");
 
-    const error = await captureError(extractPrebuiltArchive(archivePath, destDir, SHORT_BOUND_MS));
+    const error = await captureError(extractPrebuiltArchive(archivePath, destDir, SHORT_BOUND_MS, childEnv()));
 
     expect(error).toBeInstanceOf(InstallationFailedError);
     expect((error as InstallationFailedError).message).toContain("did not finish within");
@@ -199,7 +215,7 @@ describe("ensureCargoAvailable bounds (#521)", () => {
   itShim("fails with the cargo-not-available error when the probe never exits, naming the bound", async () => {
     installShim("cargo");
 
-    const error = await captureError(ensureCargoAvailable(SHORT_BOUND_MS));
+    const error = await captureError(ensureCargoAvailable(SHORT_BOUND_MS, childEnv()));
 
     expect(error).toBeInstanceOf(InstallationFailedError);
     const message = (error as InstallationFailedError).message;
@@ -214,7 +230,7 @@ describe("ensureCargoAvailable bounds (#521)", () => {
     installShim("cargo");
     process.env.STANDIN_MODE = "fail";
 
-    const error = await captureError(ensureCargoAvailable(SHORT_BOUND_MS));
+    const error = await captureError(ensureCargoAvailable(SHORT_BOUND_MS, childEnv()));
 
     expect(error).toBeInstanceOf(InstallationFailedError);
     expect((error as InstallationFailedError).message).toContain("exited with code 1");

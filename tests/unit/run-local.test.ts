@@ -71,6 +71,11 @@ function commonActionArgs(tmpDir: string): string[] {
     "upload-report=false",
     "--input",
     "timeout-minutes=1",
+    // #433: the engine runs with an explicit allow-list, so the mock's
+    // scenario switch travels through the same `engine-env-passthrough`
+    // input a workflow would use.
+    "--input",
+    "engine-env-passthrough=MOCK_CANARY_SCENARIO",
   ];
 }
 
@@ -228,6 +233,8 @@ describe("scripts/run-local.mjs negative cases", () => {
         "version=0.1.0",
         "--input",
         "upload-report=false",
+        "--input",
+        "engine-env-passthrough=MOCK_CANARY_SCENARIO",
       ],
       // The mock's "timeout" scenario keeps the engine alive ~10s (and the
       // Action's own timeout-minutes=1 floor would end it at a minute); a

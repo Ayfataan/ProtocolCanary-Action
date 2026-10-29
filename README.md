@@ -20,6 +20,7 @@ protocol compatibility testing a normal part of GitHub CI.
 - [How failures appear](#how-failures-appear)
 - [Artifacts](#artifacts)
 - [Installation & integrity](#installation--integrity)
+- [Engine environment](#engine-environment)
 - [Versioning](#versioning)
 - [Limitations](#limitations)
 - [Security](#security)
@@ -168,6 +169,7 @@ jobs:
 | `junit-report` | Render the JSON report to JUnit XML using the engine's own `stellar-canary report <file> --format junit` command and expose the file as the `junit-report-path` output. Written next to the JSON report and included in the artifact when `upload-report` is `true`. **Minimum engine version:** the release that adds `report --format junit` (Protocol-Canary #434; not in `0.2.0`) — with an older engine nothing is produced and a warning is logged. Any failure (unsupported engine, non-zero exit, empty output, missing report file) is a warning only: it never changes `status` and never fails the job. | `false` |
 | `timeout-minutes` | Maximum time to let Canary run before it is terminated. Must be a whole number from 1 to 35791 minutes: larger values would overflow Node's 32-bit timer (2,147,483,647 ms) and fire immediately, so they are rejected up front. Also bounds the `cargo install` step (floored at one minute) — see [Timeouts](#timeouts). | `15` |
 | `github-token` | Optional token for read-only requests to `api.github.com` for version resolution and checksum discovery. Set it to `${{ github.token }}` to authenticate (requires `contents: read`); otherwise requests are unauthenticated unless `GITHUB_TOKEN` is present in the environment. Pass an empty string (`""`) to disable authentication. | (none) |
+| `engine-env-passthrough` | Comma- or newline-separated exact environment variable names to forward to `cargo` and the engine in addition to the default allow-list (for example `LD_LIBRARY_PATH,OPENSSL_DIR`). Names only, at most 16, and denied names are rejected. See [Engine environment](#engine-environment). | (none) |
 | `fixtures-pack-version` | Release tag of the fixture pack to run against, e.g. `v1.2.0` (leading `v` optional); unpinned values like `latest` are rejected. **Accepted and validated, but not forwarded to Canary** — it has no fixture-pack flag, so the run still reads whatever `fixtures-dir` points at. Pin the pack by checking out its tag into `fixtures-dir`. | (none) |
 | `fixtures-pack-protocol` | Protocol version the pack is pinned to, as a positive integer (`0` is rejected, as with `protocol`). **Accepted and validated, but not forwarded to Canary** — see above. The protocol a run checks is `protocol`. | (none) |
 | `baseline-report` | Path to a previous Protocol Canary JSON report. The file must exist and be a schemaVersion 1 report for the same target protocol as this run. **Validated only**: the engine's `diff` command is not released yet (#335), so no regression verdict is produced. A missing, malformed, or protocol-incompatible baseline fails the run with an actionable annotation. | (none) |
@@ -416,7 +418,7 @@ what to do about each.
 | Message (step log / job summary) | Meaning | What to do |
 |---|---|---|
 | ``The `cargo` command was not found on this runner. …`` | This Action prefers a prebuilt Protocol-Canary release binary when one exists for this platform and version and falls back to building from source only when no usable prebuilt asset was found — so this error means neither path is available: no usable prebuilt release (or no checksum manifest for one) and no Rust toolchain. | On a self-hosted or non-Ubuntu runner, install a toolchain first — e.g. a `dtolnay/rust-toolchain` step ahead of this Action; [`examples/self-hosted.yml`](examples/self-hosted.yml) shows a complete workflow. GitHub-hosted Ubuntu runners include one by default; seeing this there usually means an earlier step removed it from `PATH`. |
-| ``` `cargo install` exited with code 101 while installing Protocol-Canary … ``` | The source build failed — most often a Rust toolchain too old for Canary's `Cargo.toml`, a corrupted build cache, or a transient network failure while fetching crates. | Re-run the job once to rule out a transient failure. If it persists, update the runner's Rust toolchain. Cargo's own error output appears in the log above this message; `ACTIONS_STEP_DEBUG: true` adds more detail. |
+| ``` `cargo install` exited with code 101 while installing Protocol-Canary … ``` | The source build failed — most often a Rust toolchain too old for Canary's `Cargo.toml`, a corrupted build cache, a transient network failure while fetching crates, or (since the child-environment allow-list) a custom toolchain variable that is not passed by default. | Re-run the job once to rule out a transient failure. If it persists, update the runner's Rust toolchain. Cargo's own error output appears in the log above this message; `ACTIONS_STEP_DEBUG: true` adds more detail. If the build needs an environment variable the Action does not pass by default, name it in `engine-env-passthrough` — see [Engine environment](#engine-environment). |
 | `Stellar Protocol Canary timed out after Ns and was terminated.` | Canary ran longer than `timeout-minutes` (default 15; it bounds only the Canary process, not the whole job) and was killed. | Raise `timeout-minutes` if your fixture set legitimately needs longer. Otherwise check whether a live-RPC check is hanging on an unreachable `rpc-url`. |
 | `` `cargo install` … timed out after Ns and was terminated. `` | The `cargo install` step ran longer than `timeout-minutes` (floored at one minute — see [Timeouts](#timeouts)) and was killed. | Re-run the job; this is usually a stalled network fetch. Raise `timeout-minutes` if a build of this size legitimately needs longer. Cargo's own progress output appears in the log above this message. |
 | `Failed to start …: spawn … ENOENT` | The installed Canary binary could not be launched at all. | Typical on a self-hosted runner with an incompatible architecture or libc. Verify the runner can execute binaries built by its own toolchain, then re-run the job to force a fresh install. |
@@ -568,6 +570,114 @@ The actual `stellar-canary` binary is installed into a private sandbox under
 non-GitHub hosts) and executed by absolute path. The Action does not modify
 `PATH`, does not install into the shared Cargo home, and does not rely on a
 user-visible `cargo` bin directory on the runner.
+
+## Engine environment
+
+This Action starts three kinds of child process: `cargo` (the `--version` probe
+and `cargo install`), the system `tar` that extracts a verified release or
+fixture-pack archive, and the Protocol Canary engine itself. Compiling a
+dependency tree runs arbitrary code from every crate in it — build scripts and
+procedural macros included — so none of them inherits the job environment.
+Each one receives an explicit allow-list built at run time from the runner's
+environment, plus the names opted into with `engine-env-passthrough`. The
+Action process itself keeps its full environment, because it needs `INPUT_*`,
+`GITHUB_*`, and `ACTIONS_*`. This keeps the Rust, proxy, and certificate
+configuration real runners use while removing the rest by default, so a
+compromised dependency cannot read `GITHUB_TOKEN`, the Actions runtime tokens,
+or a secret a workflow exported with `env:` while the job holds write
+permissions.
+
+### Default allow-list
+
+Exact names (matching is case-insensitive on Windows only):
+
+- **Process and locale:** `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+  `TMPDIR`, `TEMP`, `TMP`, `LANG`, `LANGUAGE`, `TZ`, `TERM`, `NO_COLOR`, `CI`.
+- **Windows system:** `SystemRoot`, `SYSTEMROOT`, `windir`, `ComSpec`,
+  `PATHEXT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`,
+  `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432`,
+  `NUMBER_OF_PROCESSORS`, `PROCESSOR_ARCHITECTURE`, `OS`.
+- **Rust and Cargo:** `CARGO_HOME`, `RUSTUP_HOME`, `RUSTUP_TOOLCHAIN`,
+  `RUSTFLAGS`, `RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`,
+  `RUSTDOCFLAGS`, `RUST_BACKTRACE`, `RUST_LOG`.
+- **Native build toolchain:** `CC`, `CXX`, `AR`, `LD`, `CFLAGS`, `CXXFLAGS`,
+  `LDFLAGS`, `CPPFLAGS`, `PKG_CONFIG`, `PKG_CONFIG_PATH`,
+  `PKG_CONFIG_SYSROOT_DIR`, and the MSVC toolchain's `INCLUDE`, `LIB`,
+  `LIBPATH`, `VCINSTALLDIR`, `VCToolsInstallDir`, `VSINSTALLDIR`,
+  `WindowsSdkDir`, `WindowsSDKVersion`, `UCRTVersion`, `Platform`.
+- **Network and certificates:** `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY` (and their lower-case forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`.
+
+Prefixes (every name starting with one is kept, unless denied below):
+`LC_*`, `RUSTUP_*`, `CARGO_*`, `CMAKE_*`.
+
+### Deny rules
+
+A denied name is never passed, even when one of the prefixes above would match
+it:
+
+- `GITHUB_*`, `ACTIONS_*`, `INPUT_*`, `RUNNER_*` — the Action's own runtime
+  and the job's exported variables.
+- `CARGO_REGISTRY_TOKEN`, `CARGO_REGISTRIES_*` — Cargo registry and mirror
+  credentials.
+- `GIT_ASKPASS`, `SSH_AUTH_SOCK` — live credential agents.
+- `AWS_*`, `AZURE_*`, `GCP_*`, `GOOGLE_*`, `NPM_*`, `NODE_AUTH_TOKEN` — cloud
+  and npm credential families.
+- Any name containing `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`,
+  `PRIVATE_KEY`, `API_KEY`, `ACCESS_KEY`, or `SESSION`, compared
+  case-insensitively. This is the backstop that keeps a `CARGO_*` prefix from
+  smuggling a credential through a name nobody enumerated.
+
+### Opt-in passthrough: `engine-env-passthrough`
+
+`engine-env-passthrough` is a comma- or newline-separated list of **exact
+environment variable names** to forward on top of the allow-list:
+
+```yaml
+- uses: StellarCanary/ProtocolCanary-Action@v1
+  with:
+    protocol: "28"
+    engine-env-passthrough: LD_LIBRARY_PATH,OPENSSL_DIR
+```
+
+Rules:
+
+- each name must match `^[A-Za-z_][A-Za-z0-9_]*$` — no wildcards, no
+  `NAME=value` pairs, no values of any kind;
+- at most 16 names, and a name listed twice is rejected;
+- a name in the deny list, or containing one of the sensitive substrings
+  above, is rejected with an input error that names the variable (never its
+  value). The passthrough cannot restore `GITHUB_TOKEN`, the runtime tokens,
+  cloud credentials, or anything else denied by default;
+- each name that is actually forwarded is logged once at info level, so the
+  job log shows what left the Action. Values are never logged.
+
+Typical legitimate uses are toolchain settings that are not secrets, such as
+`LD_LIBRARY_PATH`, `OPENSSL_DIR`, `RUSTUP_DIST_SERVER`, or a private mirror
+setting. If the build genuinely needs a credential, use a different mechanism
+and accept the documented risk — this input is not that mechanism.
+
+### What changes for existing workflows
+
+A custom toolchain variable that is not in the allow-list no longer reaches
+`cargo`. The failure appears as a normal `cargo install` build error, and
+cargo's own output will not say the variable was missing; the Action's
+cargo-failure message names `engine-env-passthrough` as the remedy. Add the
+variable there if it is not a secret.
+
+### Compatibility and security trade-offs
+
+- The list is a **maintained compromise**, not a complete description of
+every toolchain. A missing variable can break an unusual toolchain, which is
+why `engine-env-passthrough` exists.
+- The Action **cannot make a malicious dependency safe**. It only deprives
+  the build of the job's secrets, tokens, and credentials. A dependency still
+  runs arbitrary code with whatever the allow-listed environment reveals and
+  with the runner's filesystem and network access.
+- Deny rules are matched case-insensitively on every platform; the
+  allow-list itself is case-sensitive except on Windows, where environment
+  names are case-insensitive.
 
 ## Versioning
 
